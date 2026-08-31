@@ -54,7 +54,9 @@ export async function getConversations(): Promise<Conversation[]> {
     await delay(300);
     return MOCK_CONVERSATIONS;
   }
-  return apiClient.get<Conversation[]>("/api/conversations");
+  // Conversations aren't persisted on the backend yet (no database).
+  // Sidebar history starts empty until that slice is built.
+  return [];
 }
 
 export async function getMessages(conversationId: string): Promise<Message[]> {
@@ -75,17 +77,16 @@ export async function sendMessage(req: SendMessageRequest): Promise<Message> {
 }
 
 export async function createConversation(title?: string): Promise<Conversation> {
-  if (MOCK_MODE) {
-    await delay(200);
-    return {
-      id: crypto.randomUUID(),
-      title: title ?? "New conversation",
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      messageCount: 0,
-    };
-  }
-  return apiClient.post<Conversation>("/api/conversations", { title });
+  // Conversations aren't persisted on the backend yet, so we mint one on the
+  // client. The generated id is what we pass to /api/chat — the backend keys
+  // its in-memory history by it, which is enough for multi-turn chat today.
+  return {
+    id: crypto.randomUUID(),
+    title: title ?? "New conversation",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    messageCount: 0,
+  };
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

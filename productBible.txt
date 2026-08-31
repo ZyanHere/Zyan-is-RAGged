@@ -1,0 +1,472 @@
+# Product Bible — OmniRAG (Universal RAG Platform)
+
+**Current stage:** Phase 0 — Benchmark
+**Then:** Step 1 — RAG Product/Engine (milestone-based) → Step 2 — RAG Infrastructure Platform
+**Core philosophy:** Build the RAG engine first, on evidence, in small measurable increments. Productize only after the engine is proven.
+
+**Central engineering rule of this project:**
+> Nothing ships beyond the current milestone's scope without the benchmark showing the current approach has a real gap.
+
+**The development loop this project follows, always:**
+
+```text
+Benchmark failure → Classify failure (Section 7) → Identify responsible layer
+      → Form hypothesis → Run experiment → Did it help?
+             ↙ YES                    ↘ NO
+           Keep                     Remove
+```
+
+---
+
+## 1. Vision
+
+Build an exceptionally capable, structure-aware, evidence-grounded RAG system — not by assembling every RAG technique that sounds interesting, but by discovering, through our own benchmark, which techniques our documents and questions actually require. Then turn the proven engine into infrastructure other applications can use.
+
+---
+
+## 2. The Problem We Are Solving
+
+Real-world knowledge bases are messy: PDFs (including 1,000+ page and scanned), books, research papers, DOCX, PPTX, XLSX, CSV, HTML, images, screenshots, diagrams, charts, tables — often mixed together. Information lives not just in text but in tables, layout, diagram structure, heading hierarchy, footnotes, and cross-references.
+
+**Core problem:**
+> How do we build a RAG system that reliably ingests, understands, indexes, retrieves, and reasons over heterogeneous real-world documents — preserving structure, semantics, and provenance — and grounds every answer in evidence rather than plausibility?
+
+---
+
+## 3. Product Principles
+
+1. **Documents are not text.** Text + structure + layout + tables + images + relationships + metadata + provenance.
+2. **Preserve information before optimizing retrieval.** Never flatten a document just because flat text is easier to embed.
+3. **Retrieval before generation.** The LLM generates from evidence, not invention.
+4. **Evidence beats confidence.** Insufficient evidence → abstain.
+5. **Everything must be measurable.** No claim survives without the benchmark (Phase 0) proving it on our data.
+6. **Design for scale, implement incrementally.** The document model is shaped so scale doesn't require a rewrite — but we don't build distributed infrastructure before we need it.
+7. **No unnecessary magic — but don't reinvent infrastructure to prove it.** Understand embeddings, chunking, and retrieval mechanisms deeply (good material for a separate study track). The *product* uses strong existing tools (Docling, Qdrant, established embedding/reranking models) unless the benchmark proves a real gap they can't cover.
+8. **Nothing ships beyond the current milestone's scope** without benchmark evidence of a real gap. *(See central rule above — this is the rule the whole project runs on.)*
+
+---
+
+## 4. Architecture / North Star
+
+```text
+                   HETEROGENEOUS DATA (PDF, DOCX, PPTX, HTML, images, XLSX...)
+                                     │
+                          DOCUMENT INTELLIGENCE
+                     (OCR • Layout • Vision • Tables • Structure)
+                                     │
+                        CANONICAL DOCUMENT MODEL
+                    (tenant/ACL + versioning fields, from day one)
+                                     │
+                          INTELLIGENT CHUNKING
+                                     │
+                          MULTI-MODAL INDEXING
+                                     │
+                          ADVANCED RETRIEVAL
+              (Dense → Hybrid → Reranking → added only per benchmark gap)
+                                     │
+                          CONTEXT ENGINEERING
+                                     │
+                            EVIDENCE ENGINE
+                  (Grounding • Abstention • Citations • Conflict surfacing)
+                                     │
+                                    LLM
+                                     │
+                            GROUNDED ANSWER
+                                     │
+                    EVALUATION (Section 22) ── regression gate ── back to top
+                                     │
+                       ┌─────────────┴─────────────┐
+                  STEP 1: PRODUCT              STEP 2: PLATFORM
+                  (proven engine)          (API • SDK • multi-tenant)
+```
+
+The ingestion service and canonical document model are shared by both the Step 1 chatbot and the Step 2 API from the start (Section 33) — the chatbot is the engine's first consumer, not a special case bolted onto it.
+
+---
+
+# PHASE 0 — BENCHMARK
+
+Nothing in Step 1 (Sections 9+) gets built or tuned before this exists. This is preparation, not product.
+
+## 5. Benchmark Dataset
+
+### 5.1 Source documents
+
+5–10 real, messy documents already on hand (pull from Lexo / ImaginePDF work) — PDFs to start (see Section 9.1 on MVP scope).
+
+### 5.2 Question schema (per question, not just a flat list)
+
+```text
+question_id
+document_ids
+question_type: simple | multi-hop | table | visual | cross-document | contradiction | impossible
+difficulty: easy | medium | hard
+gold_answer
+gold_evidence: [page/section references]
+answerable: true | false
+required_modality: text | table | visual | text+table | ...
+```
+
+Example:
+
+```text
+Q17
+type: multi-hop
+difficulty: hard
+required_modality: text + table
+answerable: true
+gold_evidence: [page 42, page 117]
+```
+
+This lets later analysis say something like *"dense retrieval handles easy factual questions well but collapses on hard multi-hop questions"* instead of reporting one flat Recall@10 number.
+
+### 5.3 Question types (30–50 questions total to start)
+
+- **Simple:** "What was the company's Q3 revenue?"
+- **Multi-hop:** "Why did revenue increase while operating margin declined?"
+- **Visual:** "According to the chart on page 731, which segment contributed most to the decline?"
+- **Table:** "What was the difference between Segment A and Segment B?"
+- **Cross-document:** "How did the 2025 strategy differ from the 2024 strategy?"
+- **Contradiction:** "The old report says X while the revised report says Y — which is current?" (expected: system surfaces both with provenance, does **not** attempt to resolve which is correct — see Section 12.2)
+- **Impossible:** "What was the company's revenue in 2030?" (expected: *"I don't have evidence to answer that."*)
+
+---
+
+## 6. Evaluation Methodology
+
+- **Retrieval metrics** (Recall@K, Precision@K, MRR, nDCG) computed automatically against `gold_evidence` — no judgment call needed.
+- **Answer-quality metrics** (faithfulness, correctness, completeness) use LLM-as-judge, calibrated first: hand-score ~15–20 benchmark answers, compare to the judge, only trust the judge once it roughly agrees with human labeling.
+- **Citation metric:** does the cited evidence span actually support the claim made? Checked against `gold_evidence`, not just "a citation exists."
+
+---
+
+## 7. Failure Taxonomy
+
+Every failed benchmark case is classified into exactly one layer, so failures point directly at what to fix:
+
+```text
+INGESTION_FAILURE
+  ├── extraction
+  ├── OCR
+  ├── reading_order
+  ├── table
+  └── visual
+
+REPRESENTATION_FAILURE
+  ├── structure_lost
+  ├── provenance_lost
+  └── relationship_lost
+
+CHUNKING_FAILURE
+
+EMBEDDING_FAILURE
+
+RETRIEVAL_FAILURE
+  ├── relevant_document_missed
+  ├── relevant_chunk_missed
+  └── ranking_failure
+
+CONTEXT_FAILURE
+  ├── too_much_context
+  ├── insufficient_context
+  └── ordering_problem
+
+GENERATION_FAILURE
+  ├── hallucination
+  ├── incomplete_answer
+  └── reasoning_error
+
+GROUNDING_FAILURE
+  └── unsupported_claim
+
+SYSTEM_FAILURE
+  ├── timeout
+  ├── worker_failure
+  └── infrastructure_failure
+```
+
+This taxonomy is what the central development loop (top of document) runs on — a failure without a taxonomy label doesn't get a fix attempt.
+
+---
+
+## 8. Baseline Metrics
+
+Recorded after the MVP (Section 9) first runs against the Phase 0 benchmark — not invented in advance. This baseline is the number every later change is compared to (regression gate, Section 23).
+
+Fields to record: Recall@K, Precision@K, MRR, nDCG, faithfulness/correctness (judge-scored), citation accuracy, abstention correctness, p95 query latency, ingestion time/page, cost/query. (Targets are set in Section 21, *after* this baseline exists.)
+
+---
+
+# STEP 1 — RAG PRODUCT
+
+Organized into milestones. Each milestone is validated against the (growing) benchmark before the next begins.
+
+```text
+Step 1
+ ├── Milestone 1: PDF baseline
+ ├── Milestone 2: document intelligence (more formats, structure)
+ ├── Milestone 3: advanced retrieval (only where benchmark shows a gap)
+ ├── Milestone 4: grounding & guardrails
+ └── Milestone 5: production hardening (reliability, security, scale, cost)
+```
+
+## 9. Milestone 1 — MVP (PDF Baseline)
+
+### 9.1 Scope — unambiguous
+
+**The first executable slice is PDF only.** Not "PDF/DOCX." DOCX begins immediately after this baseline is established (start of Milestone 2), not inside the MVP.
+
+```text
+PDF → basic text+table extraction → fixed-size chunking
+    → single embedding model → dense vector search (no hybrid, no rerank)
+    → top-k context → LLM answer with citations → abstain if evidence weak
+```
+
+### 9.2 Definition of done
+
+Run the full Phase 0 benchmark. Record Section 8's baseline metrics. This baseline is what every subsequent change — in any later milestone — is measured against.
+
+## 10. Milestone 2 — Document Intelligence
+
+Widen formats one at a time, extending the benchmark with real documents of that format before moving to the next:
+
+- DOCX → PPTX → HTML → images (OCR + layout + visual understanding combined) → XLSX/CSV → (later) EPUB, XML, JSON, email, source code, transcripts.
+
+Format-specific handling:
+- **PDF:** layout, sections, tables, figures, images, scanned pages (OCR), page provenance.
+- **PPTX:** slides, titles, bullet hierarchy, speaker notes, tables, charts, images, element relationships.
+- **DOCX:** headings, paragraphs, lists, tables, images, captions, hierarchy.
+- **HTML:** title, headings, article structure, lists, tables, code blocks, links — filtering nav/footer/ad boilerplate.
+
+**Recommended base tooling:** Docling for document intelligence (PDF, DOCX, PPTX, XLSX, HTML, images with structure preservation) — starting point, replaced only where the benchmark shows a real gap.
+
+### 10.1 Canonical Document Model
+
+Built once, used by every format from Milestone 1 onward:
+
+```text
+Document
+├── document_id
+├── tenant_id / owner_id        # present from day one, even single-tenant
+├── access_control (ACL/roles)  # present from day one, even if trivially "owner-only"
+├── version
+│   ├── version_id
+│   ├── is_active (bool)        # retrieval defaults to active version only
+│   └── superseded_by
+├── metadata (source, upload date, format, page count)
+├── sections (heading, paragraph, table, figure, image, code)
+├── relationships (cross-references between sections/pages)
+└── provenance (page, section, table_id, bounding box where relevant)
+```
+
+**Versioning mechanism:** new versions mark old chunks `is_active=false` rather than deleting them; retrieval filters to active by default, with explicit override for history. Reindexing touches only changed sections.
+
+**Tenant/ACL fields exist now**, even single-tenant, so Step 2 multi-tenancy (Section 28) is a filter addition, not a schema migration.
+
+### 10.2 Embeddings
+
+Understand deeply (own study track): training, dimensions, cosine/dot/Euclidean distance, normalization, multilingual/multimodal embeddings, embedding/index compatibility. For the product: select from 2–3 strong existing models, benchmark against Phase 0 data, pick the winner — don't train one for v1.
+
+### 10.3 Chunking
+
+- **Baseline (Milestone 1):** fixed-size / recursive.
+- **Advanced — only if the benchmark shows a gap:** semantic, structure-aware, hierarchical, parent-child, contextual, late chunking, table-aware, figure-aware.
+
+## 11. Milestone 3 — Advanced Retrieval (benchmark-gated)
+
+| Level | Capability | Add when |
+|---|---|---|
+| 1 | Dense vector retrieval | Milestone 1 default |
+| 2 | + BM25 → hybrid | benchmark shows dense-only misses keyword-heavy queries |
+| 3 | + RRF + reranking | benchmark shows ranking quality is the bottleneck |
+| 4 | Query rewriting/expansion, multi-query, metadata filtering, HyDE, contextual retrieval | specific benchmark question types fail |
+| 5 | Hierarchical, multi-hop, adaptive, agentic, graph, multimodal retrieval | only for the specific question types (Section 5.3) that demand them |
+
+Each level is a benchmark-driven decision (per the central rule), never a default build-out.
+
+### 11.1 Context Engineering
+
+Goal: smallest sufficient context, not the largest possible one. Token budgets, context selection, compression, deduplication, ordering, relevance thresholds, parent-context reconstruction, lost-in-the-middle handling. Built once retrieval quality is no longer the bottleneck.
+
+## 12. Milestone 4 — Grounding & Guardrails
+
+### 12.1 Evidence sufficiency
+
+```text
+Question → Retrieved evidence → Enough evidence? YES → Answer / NO → Abstain
+```
+
+### 12.2 Citations and contradictions
+
+Every factual claim traceable to a specific evidence span. **Contradiction handling stays deliberately narrow:** surface both sources with provenance and state the conflict explicitly. Automatic resolution of which source is "correct" is out of scope — a genuinely open problem, and not this project's job to solve.
+
+### 12.3 Model security: prompt injection & exfiltration
+
+Kept as its own concern, separate from data security (Section 19) and system reliability (Section 20):
+- Retrieved document content is always inserted as clearly delimited, role-tagged *data*, never as instructions.
+- The prompt template explicitly marks document content untrusted.
+- Generated claims are checked against actual retrieved spans (citation verification) rather than trusting model self-reporting.
+- Optional hardening once the core works: a lightweight classifier flagging instruction-like patterns in ingested content, for visibility.
+- Data exfiltration risk (a document instructing the system to leak other tenants' data or secrets) is considered here too, and mitigated by the ACL/tenant filtering in Section 10.1 being enforced at retrieval time, not just at the prompt level.
+
+## 13. Milestone 5 — Production Hardening
+
+Covers reliability (Section 20), security (Section 19), scalability (Section 25), and cost/latency (Section 21) together — see those sections. This milestone is where the system moves from "proves the concept on the benchmark" to "trustworthy enough to depend on," even at small scale.
+
+---
+
+## 14. Multimodal RAG (cross-cutting, addressed within relevant milestones)
+
+Visual question-answering over charts/diagrams (Section 5.3's "visual" category) is treated as a Research Question (Section 24) before being committed to as a permanent pipeline stage — see Section 24's multimodal question.
+
+---
+
+# RELIABILITY, SECURITY & SCALE
+
+Kept as three separate concerns rather than one "security" section, since they have different failure modes.
+
+## 19. Data Security
+
+- Encryption at rest for uploaded documents and derived indexes.
+- Explicit retention/deletion policy — including deletion of vector index entries, not just source files.
+- Explicit PII stance: out of scope for v1, or basic redaction — decided, not left implicit.
+- Tenant isolation and ACL inheritance: a document's derived data (chunks, embeddings) always follows the same ACL as the source document (ties to Section 10.1's tenant fields).
+
+## 20. System Reliability
+
+Handle corrupted/malformed documents, unsupported formats, OCR/extraction failures, oversized files, timeouts, model/embedding/database failures, duplicates, partial processing, worker crashes, network failures.
+
+```text
+Failure → Retry → Fallback → Dead-letter queue → Inspection/recovery
+```
+
+Also: idempotent processing, resumable jobs, visible processing status.
+
+## 21. Cost & Latency
+
+**Baseline first, targets second** — no numbers are invented before the system exists. After Milestone 1 (Section 9.2) produces the first baseline (Section 8), provisional targets are set relative to it.
+
+Example shape (not real numbers until measured):
+
+```text
+Baseline (measured):    p95 query 4.8s   |  ingestion 3.2s/page  |  cost/query $0.003
+Target (set after):     p95 < 3s         |  ingestion < 2s/page  |  cost/query < $0.005
+```
+
+Tracked in the same eval harness as retrieval quality (Section 22), so a change that improves recall but blows the latency/cost budget is a visible tradeoff, not a silent win.
+
+## 22. Evaluation Framework
+
+Metrics by layer:
+- **Ingestion:** correct extraction of text, tables, images, reading order, headings.
+- **Chunking:** context preservation.
+- **Retrieval:** Recall@K, Precision@K, MRR, nDCG.
+- **Reranking:** did it improve evidence ordering?
+- **Generation:** correctness, faithfulness, relevance, completeness.
+- **Citation:** does cited evidence actually support the claim?
+- **Safety:** hallucination rate, unsupported answers, injection resistance, abstention correctness.
+
+## 23. Regression Testing
+
+The Phase 0 benchmark is CI for the pipeline, not a one-time check. Any change to chunking, embeddings, retrieval, reranking, or prompts is re-run against it before being considered done. This is what makes Principle 5 ("everything must be measurable") enforceable rather than aspirational.
+
+## 24. Research Experiments (Research Questions)
+
+Because this project is also a deep RAG-learning effort, each area carries an explicit open question to answer experimentally on our own corpus — not assumed from general RAG lore:
+
+- **Embeddings:** Does embedding model X outperform model Y on our corpus?
+- **Chunking:** Does structure-aware chunking improve Recall@K over recursive chunking, on our documents?
+- **Retrieval:** At what point does hybrid retrieval outperform dense-only retrieval?
+- **Reranking:** Does reranking improve answer quality enough to justify the added latency?
+- **Context:** How much retrieved context maximizes answer quality before noise starts hurting it?
+- **Multimodal:** Does visual understanding materially improve answers to chart/diagram questions, versus OCR-only?
+- **Guardrails:** Can unsupported-answer rate be reduced without increasing incorrect abstention on answerable questions?
+- **Scaling:** Which ingestion stage becomes the bottleneck first as document volume increases?
+
+Each question gets a short written answer once its experiment runs — this is the artifact that turns the project into a lab notebook, not just a codebase.
+
+## 25. Scalability
+
+MVP and Milestone 1–4: a single job queue, one worker pool (e.g., Celery/RQ), async from upload but not yet split by format.
+
+```text
+Upload → Object Storage → Job Queue → Processing → Indexes
+```
+
+Split into per-format worker pools (PDF/OCR/PPT/DOCX/Image/HTML) **only when profiling shows an actual bottleneck** — not upfront. Matches Principle 6 (design for scale, implement incrementally) rather than contradicting it.
+
+---
+
+# STEP 2 — RAG INFRASTRUCTURE PLATFORM
+
+Begins only after Step 1's benchmark shows the engine reliably works (Milestone 5 complete).
+
+## 26. API
+
+```text
+POST /projects        POST /documents        GET /documents/:id
+DELETE /documents/:id  POST /query            POST /retrieve
+GET /documents/:id/status
+```
+
+## 27. SDK
+
+`@ourcompany/rag-js`, `ourcompany-rag-python` — thin clients over the same engine used by the Step 1 chatbot.
+
+## 28. Multi-Tenancy
+
+Because tenant/ACL fields already exist in the canonical model (Section 10.1), this is enforcement — API keys, auth, quotas, rate limits, ACL-aware retrieval filters — not a schema rebuild.
+
+```text
+RAG PLATFORM → Tenant A / Tenant B / Tenant C, isolated documents & index access
+```
+
+**Rule: Tenant A must never retrieve Tenant B's information.**
+
+## 29. Authentication
+
+API keys and per-tenant auth, layered on the ACL model from Section 10.1 rather than a separate system bolted on later.
+
+## 30. Framework Integrations
+
+Next.js, FastAPI, Django, LangChain, LlamaIndex, Vercel AI SDK — added once the API (Section 26) is stable, not before.
+
+## 31. Scaling (platform-level)
+
+Revisits Section 25's worker/queue architecture at multi-tenant scale — split by format and by tenant load, again only where profiling on real platform traffic shows the need.
+
+## 32. Developer Experience
+
+Documentation, CLI, npm/pip publishing — deferred until the SDK (Section 27) has at least one real external or internal consumer beyond the Step 1 chatbot.
+
+---
+
+## 33. The Crucial Architectural Rule
+
+Step 1 is designed so Step 2 doesn't require rebuilding everything — canonical document model, tenant fields, and versioning exist from the start (Section 10.1). But **Step 2 is not implemented until Step 1's benchmark proves the engine.**
+
+```text
+Ingestion Service → Canonical Document → Index → { Step 1 UI, Step 2 API }
+```
+
+## 34. Build-Order Roadmap
+
+1. **Phase 0 (Sections 5–8):** benchmark dataset with full metadata schema, evaluation methodology, failure taxonomy, and (after Milestone 1 runs) baseline metrics.
+2. **Milestone 1 (Section 9):** PDF-only MVP. Record baseline.
+3. **Milestone 2 (Section 10):** widen formats one at a time, each validated against an expanded benchmark; canonical model with tenant/version fields built here.
+4. **Milestone 3 (Section 11):** retrieval sophistication added only where the failure taxonomy points at `RETRIEVAL_FAILURE`.
+5. **Milestone 4 (Section 12):** grounding/guardrails once retrieval is no longer the dominant failure category.
+6. **Milestone 5 (Section 13):** reliability, security, cost/latency tracking — before treating the system as production-ready even at small scale.
+7. **Step 2 (Sections 26–32):** begins only after Milestone 5 is complete and the full benchmark suite passes reliably.
+
+## 35. Definition of Success
+
+A user uploads a 1,000+ page document with tables, charts, images, and scanned pages, and asks a difficult question. The system understands the document, preserves structure, finds relevant evidence, handles tables/images, reranks evidence where needed, constructs appropriate context, checks evidence sufficiency, surfaces (not resolves) contradictions, generates a grounded answer with citations — and **we can measure exactly how well it performed**, and exactly which layer (Section 7's taxonomy) is responsible when it doesn't.
+
+## 36. Long-Term Vision
+
+> **Phase 0:** Build the benchmark and failure taxonomy that will judge every decision that follows.
+> **Step 1:** Build a milestone-based, benchmark-driven, structure-aware, evidence-grounded RAG engine — never ahead of what the benchmark justifies.
+> **Step 2:** Turn the proven engine into a developer platform — API + SDK + integrations + multi-tenancy — so other applications use the same infrastructure instead of rebuilding it.
+
+**This is the master specification for the project.**

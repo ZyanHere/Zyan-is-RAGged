@@ -7,8 +7,11 @@
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
 
-/** Set to true to use mock data instead of hitting the real backend */
-export const MOCK_MODE = true;
+/**
+ * Set NEXT_PUBLIC_MOCK_MODE=true to use canned mock data instead of the real
+ * backend. Defaults to false — real chat messages go to the FastAPI backend.
+ */
+export const MOCK_MODE = process.env.NEXT_PUBLIC_MOCK_MODE === "true";
 
 class ApiClient {
   private baseUrl: string;

@@ -1,0 +1,2184 @@
+<title>myRAG Blueprint</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&family=JetBrains+Mono:wght@400;500;700&display=swap">
+
+<style>
+  :root {
+    --ground:      #F6F7F5;
+    --surface:     #FFFFFF;
+    --surface-2:   #EFF2EF;
+    --ink:         #141B1A;
+    --ink-soft:    #4B5A57;
+    --ink-faint:   #7B8A86;
+    --rule:        #DCE2DE;
+    --rule-soft:   #E9EDE9;
+    --accent:      #0E6B60;
+    --accent-ink:  #0B554C;
+    --accent-wash: #E4F0ED;
+    --ok:          #2F6B3A;
+    --ok-wash:     #E5F0E6;
+    --now:         #8A5A0B;
+    --now-wash:    #F7EEDD;
+    --later:       #5B6470;
+    --later-wash:  #ECEEF1;
+
+    --f-display: "Archivo", "Helvetica Neue", Arial, sans-serif;
+    --f-body:    "Source Serif 4", Georgia, "Times New Roman", serif;
+    --f-mono:    "JetBrains Mono", ui-monospace, "SFMono-Regular", Consolas, monospace;
+
+    --col: 74ch;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:      #0E1413;
+      --surface:     #151D1B;
+      --surface-2:   #1B2523;
+      --ink:         #E8EDEB;
+      --ink-soft:    #A0AEAA;
+      --ink-faint:   #778783;
+      --rule:        #26332F;
+      --rule-soft:   #1E2A27;
+      --accent:      #4FBFAE;
+      --accent-ink:  #7BD3C5;
+      --accent-wash: #16302C;
+      --ok:          #79C089;
+      --ok-wash:     #1A2A1D;
+      --now:         #D9A758;
+      --now-wash:    #2B2415;
+      --later:       #9AA5B1;
+      --later-wash:  #1E2429;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --ground:      #0E1413;
+    --surface:     #151D1B;
+    --surface-2:   #1B2523;
+    --ink:         #E8EDEB;
+    --ink-soft:    #A0AEAA;
+    --ink-faint:   #778783;
+    --rule:        #26332F;
+    --rule-soft:   #1E2A27;
+    --accent:      #4FBFAE;
+    --accent-ink:  #7BD3C5;
+    --accent-wash: #16302C;
+    --ok:          #79C089;
+    --ok-wash:     #1A2A1D;
+    --now:         #D9A758;
+    --now-wash:    #2B2415;
+    --later:       #9AA5B1;
+    --later-wash:  #1E2429;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--f-body);
+    font-size: 16.5px;
+    line-height: 1.65;
+    margin: 0;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  /* ── Shell ─────────────────────────────────────────────── */
+
+  .shell {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    max-width: 1500px;
+    margin: 0 auto;
+  }
+
+  @media (min-width: 1080px) {
+    .shell { grid-template-columns: 290px minmax(0, 1fr); }
+  }
+
+  /* ── TOC rail ──────────────────────────────────────────── */
+
+  .rail {
+    border-bottom: 1px solid var(--rule);
+    padding: 20px 24px;
+    background: var(--surface);
+  }
+
+  @media (min-width: 1080px) {
+    .rail {
+      position: sticky;
+      top: 0;
+      height: 100dvh;
+      overflow-y: auto;
+      border-bottom: none;
+      border-right: 1px solid var(--rule);
+      padding: 34px 26px 40px;
+    }
+  }
+
+  .brand {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    margin-bottom: 22px;
+  }
+  .brand strong {
+    font-family: var(--f-display);
+    font-weight: 700;
+    font-size: 1.05rem;
+    letter-spacing: -0.015em;
+  }
+  .brand span {
+    font-family: var(--f-mono);
+    font-size: 0.63rem;
+    text-transform: uppercase;
+    letter-spacing: 0.13em;
+    color: var(--ink-faint);
+  }
+
+  .toc { display: flex; flex-direction: column; gap: 1px; }
+  .toc a {
+    display: grid;
+    grid-template-columns: 22px 1fr;
+    gap: 9px;
+    align-items: baseline;
+    padding: 6px 9px;
+    border-radius: 4px;
+    text-decoration: none;
+    color: var(--ink-soft);
+    font-family: var(--f-display);
+    font-size: 0.86rem;
+    font-weight: 500;
+    line-height: 1.35;
+    border-left: 2px solid transparent;
+  }
+  .toc a .n {
+    font-family: var(--f-mono);
+    font-size: 0.68rem;
+    color: var(--ink-faint);
+    font-weight: 500;
+  }
+  .toc a:hover { background: var(--surface-2); color: var(--ink); }
+  .toc a.active {
+    color: var(--accent-ink);
+    background: var(--accent-wash);
+    border-left-color: var(--accent);
+  }
+  .toc a.active .n { color: var(--accent); }
+  .toc a:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+  .rail-note {
+    margin-top: 22px;
+    padding-top: 16px;
+    border-top: 1px solid var(--rule-soft);
+    font-family: var(--f-mono);
+    font-size: 0.66rem;
+    line-height: 1.7;
+    color: var(--ink-faint);
+  }
+
+  /* ── Main ──────────────────────────────────────────────── */
+
+  main {
+    padding: 40px 22px 120px;
+    min-width: 0;
+  }
+  @media (min-width: 760px)  { main { padding: 56px 44px 140px; } }
+  @media (min-width: 1080px) { main { padding: 64px 60px 160px; } }
+
+  .col { max-width: var(--col); }
+
+  /* ── Masthead ──────────────────────────────────────────── */
+
+  .masthead { max-width: var(--col); margin-bottom: 46px; }
+
+  .eyebrow {
+    font-family: var(--f-mono);
+    font-size: 0.68rem;
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+    color: var(--accent);
+    margin: 0 0 14px;
+  }
+
+  h1 {
+    font-family: var(--f-display);
+    font-weight: 700;
+    font-size: clamp(2.1rem, 5.4vw, 3.15rem);
+    line-height: 1.02;
+    letter-spacing: -0.03em;
+    text-wrap: balance;
+    margin: 0 0 18px;
+  }
+
+  .standfirst {
+    font-size: 1.12rem;
+    line-height: 1.62;
+    color: var(--ink-soft);
+    margin: 0 0 26px;
+  }
+
+  .meta-strip {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+  .meta-strip span {
+    font-family: var(--f-mono);
+    font-size: 0.68rem;
+    letter-spacing: 0.04em;
+    padding: 5px 10px;
+    border: 1px solid var(--rule);
+    border-radius: 3px;
+    color: var(--ink-soft);
+    background: var(--surface);
+  }
+
+  /* ── Sections ──────────────────────────────────────────── */
+
+  section { scroll-margin-top: 24px; padding-top: 12px; }
+  section + section { margin-top: 60px; }
+
+  h2 {
+    font-family: var(--f-display);
+    font-weight: 700;
+    font-size: clamp(1.5rem, 3.1vw, 1.95rem);
+    letter-spacing: -0.022em;
+    line-height: 1.14;
+    text-wrap: balance;
+    margin: 0 0 6px;
+    padding-bottom: 12px;
+    border-bottom: 2px solid var(--ink);
+    max-width: var(--col);
+  }
+  h2 .h-num {
+    font-family: var(--f-mono);
+    font-size: 0.72rem;
+    font-weight: 500;
+    letter-spacing: 0.1em;
+    color: var(--accent);
+    display: block;
+    margin-bottom: 8px;
+  }
+
+  h3 {
+    font-family: var(--f-display);
+    font-weight: 600;
+    font-size: 1.14rem;
+    letter-spacing: -0.012em;
+    margin: 38px 0 10px;
+    max-width: var(--col);
+  }
+
+  h4 {
+    font-family: var(--f-mono);
+    font-weight: 700;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.13em;
+    color: var(--ink-faint);
+    margin: 26px 0 8px;
+  }
+
+  p, ul, ol { max-width: var(--col); }
+  p { margin: 0 0 14px; }
+  ul, ol { margin: 0 0 14px; padding-left: 1.15rem; }
+  li { margin-bottom: 6px; }
+  li::marker { color: var(--ink-faint); }
+
+  a { color: var(--accent-ink); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+
+  strong { font-weight: 600; color: var(--ink); }
+
+  code {
+    font-family: var(--f-mono);
+    font-size: 0.83em;
+    background: var(--surface-2);
+    border: 1px solid var(--rule-soft);
+    border-radius: 3px;
+    padding: 0.08em 0.32em;
+    word-break: break-word;
+  }
+
+  /* ── Callouts ──────────────────────────────────────────── */
+
+  .rule-box {
+    max-width: var(--col);
+    background: var(--accent-wash);
+    border-left: 3px solid var(--accent);
+    border-radius: 0 4px 4px 0;
+    padding: 16px 20px;
+    margin: 20px 0;
+  }
+  .rule-box p { margin: 0; }
+  .rule-box p + p { margin-top: 10px; }
+  .rule-box .label {
+    font-family: var(--f-mono);
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    color: var(--accent);
+    display: block;
+    margin-bottom: 7px;
+  }
+  .rule-box strong { color: var(--ink); }
+
+  .note {
+    max-width: var(--col);
+    border: 1px solid var(--rule);
+    background: var(--surface);
+    border-radius: 4px;
+    padding: 15px 18px;
+    margin: 18px 0;
+    font-size: 0.95rem;
+    color: var(--ink-soft);
+  }
+  .note p { margin: 0; }
+  .note p + p { margin-top: 9px; }
+
+  /* ── Diagrams & code ───────────────────────────────────── */
+
+  .scroller {
+    overflow-x: auto;
+    margin: 20px 0;
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    background: var(--surface);
+  }
+  pre {
+    font-family: var(--f-mono);
+    font-size: 0.755rem;
+    line-height: 1.62;
+    margin: 0;
+    padding: 18px 20px;
+    color: var(--ink-soft);
+    white-space: pre;
+  }
+  pre b { color: var(--accent-ink); font-weight: 700; }
+
+  /* ── Tables ────────────────────────────────────────────── */
+
+  .t-wrap {
+    overflow-x: auto;
+    margin: 20px 0;
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    background: var(--surface);
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 0.88rem;
+    min-width: 520px;
+  }
+  thead th {
+    font-family: var(--f-mono);
+    font-size: 0.65rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    text-align: left;
+    color: var(--ink-faint);
+    padding: 11px 14px;
+    border-bottom: 1px solid var(--rule);
+    background: var(--surface-2);
+    white-space: nowrap;
+  }
+  tbody td {
+    padding: 11px 14px;
+    border-bottom: 1px solid var(--rule-soft);
+    vertical-align: top;
+    line-height: 1.5;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  td.c { text-align: center; }
+  td.num, .tnum { font-variant-numeric: tabular-nums; }
+  table code { font-size: 0.78em; background: transparent; border: none; padding: 0; color: var(--accent-ink); }
+  .rung {
+    font-family: var(--f-mono);
+    font-weight: 700;
+    color: var(--accent);
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* ── Chips ─────────────────────────────────────────────── */
+
+  .chip {
+    display: inline-block;
+    font-family: var(--f-mono);
+    font-size: 0.62rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.09em;
+    padding: 3px 8px;
+    border-radius: 3px;
+    white-space: nowrap;
+  }
+  .chip.done  { background: var(--ok-wash);    color: var(--ok); }
+  .chip.next  { background: var(--now-wash);   color: var(--now); }
+  .chip.later { background: var(--later-wash); color: var(--later); }
+
+  /* ── Failure taxonomy ──────────────────────────────────── */
+
+  .tax {
+    max-width: var(--col);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: 20px 0;
+  }
+  .tax-row {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 4px;
+    padding: 11px 14px;
+    background: var(--surface);
+    border: 1px solid var(--rule-soft);
+    border-left: 3px solid var(--accent);
+    border-radius: 0 4px 4px 0;
+  }
+  @media (min-width: 700px) {
+    .tax-row { grid-template-columns: 200px 1fr; gap: 14px; align-items: baseline; }
+  }
+  .tax-row .cat {
+    font-family: var(--f-mono);
+    font-size: 0.7rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: var(--ink);
+  }
+  .tax-row .kinds {
+    font-family: var(--f-mono);
+    font-size: 0.7rem;
+    line-height: 1.75;
+    color: var(--ink-soft);
+  }
+
+  /* ── Milestones ────────────────────────────────────────── */
+
+  .ms {
+    max-width: var(--col);
+    border: 1px solid var(--rule);
+    border-radius: 5px;
+    background: var(--surface);
+    padding: 18px 20px;
+    margin: 0 0 12px;
+  }
+  .ms-head {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 10px;
+  }
+  .ms-id {
+    font-family: var(--f-mono);
+    font-weight: 700;
+    font-size: 0.85rem;
+    color: var(--accent);
+    letter-spacing: 0.03em;
+  }
+  .ms-title {
+    font-family: var(--f-display);
+    font-weight: 600;
+    font-size: 1.06rem;
+    letter-spacing: -0.012em;
+    margin: 0;
+    flex: 1 1 auto;
+  }
+  .ms ul { margin: 0 0 12px; }
+  .ms .dod {
+    border-top: 1px solid var(--rule-soft);
+    padding-top: 11px;
+    margin: 0;
+    font-size: 0.92rem;
+    color: var(--ink-soft);
+  }
+  .ms .dod b {
+    font-family: var(--f-mono);
+    font-size: 0.63rem;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--ink-faint);
+    display: block;
+    margin-bottom: 4px;
+    font-weight: 700;
+  }
+
+  /* ── Summary ───────────────────────────────────────────── */
+
+  .summary {
+    max-width: var(--col);
+    background: var(--ink);
+    color: var(--ground);
+    border-radius: 6px;
+    padding: 28px 30px;
+    margin-top: 24px;
+  }
+  .summary h3 {
+    color: var(--ground);
+    margin: 0 0 16px;
+    font-size: 1.05rem;
+  }
+  .summary dl { margin: 0; display: flex; flex-direction: column; gap: 13px; }
+  .summary dt {
+    font-family: var(--f-mono);
+    font-size: 0.63rem;
+    text-transform: uppercase;
+    letter-spacing: 0.13em;
+    opacity: 0.62;
+    margin-bottom: 3px;
+  }
+  .summary dd { margin: 0; font-size: 0.96rem; line-height: 1.55; }
+  .summary code { background: rgba(255,255,255,0.1); border-color: transparent; color: inherit; }
+
+  @media (prefers-reduced-motion: reduce) {
+    * { scroll-behavior: auto !important; transition: none !important; }
+  }
+  html { scroll-behavior: smooth; }
+</style>
+
+<div class="shell">
+
+  <nav class="rail" aria-label="Contents">
+    <div class="brand">
+      <strong>myRAG Blueprint</strong>
+      <span>Step 1 · Application</span>
+    </div>
+    <div class="toc">
+      <a href="#topology"><span class="n">01</span><span>Service topology</span></a>
+      <a href="#stores"><span class="n">02</span><span>Data stores</span></a>
+      <a href="#flows"><span class="n">03</span><span>End-to-end flows</span></a>
+      <a href="#contracts"><span class="n">04</span><span>Service contracts</span></a>
+      <a href="#frontend"><span class="n">05</span><span>Frontend</span></a>
+      <a href="#backend"><span class="n">06</span><span>Backend</span></a>
+      <a href="#agent"><span class="n">07</span><span>Agent service</span></a>
+      <a href="#rag"><span class="n">08</span><span>RAG engine</span></a>
+      <a href="#crosscutting"><span class="n">09</span><span>Failure catalogue</span></a>
+      <a href="#milestones"><span class="n">10</span><span>Build order</span></a>
+    </div>
+    <p class="rail-note">
+      Sections 1–9 map the finished system.<br>
+      Section 10 says what to build, in order.
+    </p>
+  </nav>
+
+  <main>
+
+    <header class="masthead">
+      <p class="eyebrow">System Design · Step 1</p>
+      <h1>The application, mapped end to end</h1>
+      <p class="standfirst">
+        Three services, two pipelines, four data stores — and the order to build them in.
+        Sections 1–9 describe the finished system so every concept you'll meet while learning
+        already has a named home. Section 10 turns it into an ordered plan with exit criteria.
+      </p>
+      <div class="meta-strip">
+        <span>Frontend · Backend · Agent</span>
+        <span>API/SDK platform out of scope</span>
+        <span>OpenRouter → paid provider</span>
+      </div>
+    </header>
+
+    <div class="rule-box">
+      <span class="label">How to read this</span>
+      <p>
+        This is a <strong>map of the territory</strong>, not a to-do list. Two conventions run
+        throughout. <strong>Ladder tables</strong> mark <code>v1</code> as what gets built first —
+        later rungs are added only when the benchmark shows a gap. A rung listed here isn't a promise
+        to build it; it's a promise that we know where it would go.
+      </p>
+      <p>
+        <strong>Failure modes</strong> are listed per subsystem and map to the taxonomy in Section 9.
+        That taxonomy is what turns "the answer was bad" into "fix this specific layer."
+      </p>
+    </div>
+
+    <!-- ═══════════════ 1 ═══════════════ -->
+    <section id="topology">
+      <h2><span class="h-num">Section 01</span>Service topology &amp; responsibility boundaries</h2>
+
+      <p>Three services, three processes, three ports.</p>
+
+      <div class="scroller"><pre>┌──────────────────┐     HTTP/SSE      ┌──────────────────┐    HTTP/SSE     ┌──────────────────┐
+│    <b>FRONTEND</b>      │ ────────────────▶ │     <b>BACKEND</b>      │ ──────────────▶ │      <b>AGENT</b>       │
+│  Next.js :3000   │ ◀──────────────── │  FastAPI :8000   │ ◀────────────── │  FastAPI :8001   │
+│                  │                   │                  │                 │  + LangGraph     │
+│  UI, UX, client  │                   │  identity, data, │                 │  + RAG engine    │
+│  state, streams  │                   │  orchestration   │                 │  + workers       │
+└──────────────────┘                   └──────────────────┘                 └──────────────────┘
+                                              │                                      │
+                                              ▼                                      ▼
+                                    Postgres · Object store               Vector DB · Redis
+                                    Redis (queue, cache)                  (checkpoints, memory)</pre></div>
+
+      <div class="rule-box">
+        <span class="label">The one rule</span>
+        <p><strong>The frontend never talks to the agent. The backend never talks to an LLM.</strong></p>
+        <p>
+          Every hop goes through the backend. This is layered access, and it's what makes auth,
+          rate limiting, quotas, and audit possible later — they all live in exactly one place.
+        </p>
+      </div>
+
+      <h3>Responsibility table</h3>
+      <div class="t-wrap">
+        <table>
+          <thead><tr><th>Concern</th><th>Frontend</th><th>Backend</th><th>Agent</th></tr></thead>
+          <tbody>
+            <tr><td>UI, rendering, client state</td><td class="c">✅</td><td class="c">—</td><td class="c">—</td></tr>
+            <tr><td>Identity, sessions, auth</td><td class="c">—</td><td class="c">✅</td><td class="c">—</td></tr>
+            <tr><td>Conversation &amp; message persistence</td><td class="c">—</td><td class="c">✅</td><td class="c">—</td></tr>
+            <tr><td>Document records, upload, object storage</td><td class="c">—</td><td class="c">✅</td><td class="c">—</td></tr>
+            <tr><td>Access control <em>decisions</em></td><td class="c">—</td><td class="c">✅</td><td class="c">—</td></tr>
+            <tr><td>Access control <em>enforcement</em> at retrieval</td><td class="c">—</td><td class="c">—</td><td class="c">✅</td></tr>
+            <tr><td>Job creation / status tracking</td><td class="c">—</td><td class="c">✅</td><td class="c">—</td></tr>
+            <tr><td>Job execution (parse → chunk → embed → index)</td><td class="c">—</td><td class="c">—</td><td class="c">✅</td></tr>
+            <tr><td>Prompting, LLM calls, model config, API keys</td><td class="c">—</td><td class="c">—</td><td class="c">✅</td></tr>
+            <tr><td>Retrieval, reranking, context assembly</td><td class="c">—</td><td class="c">—</td><td class="c">✅</td></tr>
+            <tr><td>Grounding, citations, abstention</td><td class="c">—</td><td class="c">—</td><td class="c">✅</td></tr>
+            <tr><td>Agent memory &amp; checkpoints</td><td class="c">—</td><td class="c">—</td><td class="c">✅</td></tr>
+            <tr><td>Guardrails</td><td class="c">—</td><td class="c">partial<sup>1</sup></td><td class="c">✅</td></tr>
+            <tr><td>Rate limiting, quotas</td><td class="c">—</td><td class="c">✅</td><td class="c">—</td></tr>
+            <tr><td>Evals / benchmark harness</td><td class="c">—</td><td class="c">—</td><td class="c">✅</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p style="font-size:0.88rem;color:var(--ink-faint)">
+        <sup>1</sup> The backend does <em>transport-level</em> protection (payload size, request rate,
+        file type). <em>Semantic</em> protection — injection, grounding, output safety — is the agent's job.
+      </p>
+
+      <h3>Why the agent is a separate service</h3>
+      <p>Not ceremony — four concrete reasons:</p>
+      <ol>
+        <li><strong>Different runtime shape.</strong> Chat is latency-sensitive and streaming. Ingestion is minutes-long batch work. Different concurrency models, different scaling.</li>
+        <li><strong>Different dependency tree.</strong> The agent pulls in LangChain/LangGraph, Docling, torch, embedding models — heavy and frequently upgraded. The backend stays light.</li>
+        <li><strong>Secret isolation.</strong> Model API keys exist in exactly one process. The backend can be compromised without leaking them.</li>
+        <li><strong>Replaceability.</strong> The agent is the part you'll rewrite most. A hard HTTP boundary means rewriting it never touches the backend.</li>
+      </ol>
+    </section>
+
+    <!-- ═══════════════ 2 ═══════════════ -->
+    <section id="stores">
+      <h2><span class="h-num">Section 02</span>Data stores — who owns what</h2>
+
+      <div class="t-wrap">
+        <table>
+          <thead><tr><th>Store</th><th>Purpose</th><th>Owner</th><th>Dev</th><th>Prod</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Postgres</strong></td><td>Users, conversations, messages, documents, jobs, audit</td><td>Backend</td><td>Docker</td><td>Neon / RDS / Supabase</td></tr>
+            <tr><td><strong>Object storage</strong></td><td>Raw files, extracted page images</td><td>Backend writes<br>Agent reads</td><td>MinIO</td><td>S3 / R2</td></tr>
+            <tr><td><strong>Vector DB</strong></td><td>Chunks, embeddings, chunk metadata</td><td>Agent</td><td>Qdrant</td><td>Qdrant Cloud / Pinecone</td></tr>
+            <tr><td><strong>Redis</strong></td><td>Job queue, cache, rate limits, checkpoints, short-term memory</td><td>Shared, namespaced</td><td>Docker</td><td>Managed Redis</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Store rules</h3>
+      <ul>
+        <li><strong>One writer per table.</strong> Postgres is written only by the backend. The vector DB only by the agent. Cross-service reads go over HTTP, never by reaching into someone else's database.</li>
+        <li><strong>Redis is shared but namespaced:</strong> <code>q:*</code> queues, <code>cache:*</code>, <code>rl:*</code> rate limits, <code>ckpt:*</code> checkpoints, <code>mem:*</code> memory. Never a bare key.</li>
+        <li><strong>Object storage is the only place raw bytes live.</strong> Postgres stores a pointer — bucket, key, checksum — never the file.</li>
+      </ul>
+
+      <h3>Vector DB: Qdrant or Pinecone</h3>
+      <p>Both are correct answers; they optimise for different things.</p>
+      <div class="t-wrap">
+        <table>
+          <thead><tr><th></th><th>Qdrant — recommended</th><th>Pinecone</th></tr></thead>
+          <tbody>
+            <tr><td>Cost while iterating</td><td>Free, local Docker</td><td>Free tier, then per-index</td></tr>
+            <tr><td>Reindex speed <em>(constant while benchmarking)</em></td><td>Fast, local disk</td><td>Network round-trips</td></tr>
+            <tr><td>Metadata filtering (ACL + versioning)</td><td>Rich, first-class</td><td>Good</td></tr>
+            <tr><td>Hybrid dense + sparse in one engine</td><td>Native</td><td>Extra setup</td></tr>
+            <tr><td>Ops burden</td><td>You run it</td><td>Managed</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        <strong>Decision:</strong> Qdrant locally, behind a <code>VectorStore</code> interface so Pinecone
+        is a config swap, not a rewrite.
+      </p>
+
+      <h3>Core relational schema</h3>
+      <div class="scroller"><pre><b>tenants</b>        (id, name, created_at)
+<b>users</b>          (id, tenant_id, email, role, created_at)
+
+<b>documents</b>      (id, tenant_id, owner_id, filename, mime_type, size_bytes,
+                checksum_sha256, storage_key, page_count,
+                status, error_code, error_message,
+                version_id, is_active, superseded_by,
+                created_at, processed_at)
+
+<b>conversations</b>  (id, tenant_id, owner_id, title, created_at, updated_at,
+                archived_at)
+
+<b>messages</b>       (id, conversation_id, role, content,
+                citations_json, usage_json, latency_ms,
+                stop_reason, created_at)
+
+<b>jobs</b>           (id, tenant_id, document_id, type, status, attempts,
+                idempotency_key, last_error, created_at, updated_at)
+
+<b>audit_log</b>      (id, tenant_id, actor_id, action, target_type, target_id,
+                metadata_json, created_at)</pre></div>
+
+      <p>Four details that matter later:</p>
+      <ul>
+        <li><code>checksum_sha256</code> gives free deduplication and idempotent re-upload.</li>
+        <li><code>version_id</code> / <code>is_active</code> / <code>superseded_by</code> implement versioning by <em>deactivation</em>, never deletion — retrieval filters to active by default.</li>
+        <li><code>citations_json</code> on messages keeps a rendered answer reproducible even after the document is re-indexed.</li>
+        <li><code>tenant_id</code> on every row from day one, even single-tenant.</li>
+      </ul>
+    </section>
+
+    <!-- ═══════════════ 3 ═══════════════ -->
+    <section id="flows">
+      <h2><span class="h-num">Section 03</span>End-to-end data flows</h2>
+      <p>Three flows carry the whole product. Everything else is a variation.</p>
+
+      <h3>Flow A — Chat (the read path)</h3>
+      <p>The latency-critical path. Target: first token visible fast, full answer streamed.</p>
+
+      <div class="scroller"><pre>USER types → presses Enter
+  │
+  ├─ <b>FRONTEND</b>
+  │    1. validate non-empty, not already streaming
+  │    2. optimistic: append user message to UI immediately
+  │    3. POST /api/conversations/{id}/messages  (Accept: text/event-stream)
+  │       abortable via AbortController (powers the Stop button)
+  │
+  ├─ <b>BACKEND</b>
+  │    4. authn/authz: who is this, do they own this conversation
+  │    5. rate limit check (Redis)
+  │    6. persist the user message (Postgres)   ← durable before any model call
+  │    7. load recent history + access context
+  │    8. POST agent /chat/stream {messages, access_context, conversation_id}
+  │    9. proxy the SSE stream through, unbuffered
+  │   10. accumulate the full reply as it passes
+  │   11. on stream end: persist assistant message + citations + usage
+  │       on client disconnect: persist the partial, mark it interrupted
+  │
+  ├─ <b>AGENT</b>  (LangGraph run)
+  │   12. load checkpoint / short-term memory for this thread
+  │   13. INPUT GUARDRAILS (injection scan, PII, size)
+  │   14. ROUTE: does this need retrieval? (chit-chat and follow-ups may not)
+  │   15. if yes → RAG ENGINE:
+  │            query transform → retrieve → rerank → assemble context
+  │   16. EVIDENCE SUFFICIENCY gate → if weak, take the abstain branch
+  │   17. GENERATE with evidence, streaming tokens out as they arrive
+  │   18. OUTPUT GUARDRAILS: citation verification, grounding check
+  │   19. emit citations event, usage event, done event
+  │   20. write checkpoint + any long-term memory
+  │
+  └─ <b>FRONTEND</b>
+      21. render tokens as they arrive (streaming bubble)
+      22. on citations event → render source cards
+      23. on done → finalise message, re-enable input
+      24. on error → inline error with Retry</pre></div>
+
+      <div class="note">
+        <p><strong>Key property:</strong> steps 6 and 11 make the conversation durable independent of the stream. A dropped connection loses the stream, never the history.</p>
+      </div>
+
+      <h3>Flow B — Ingestion (the write path)</h3>
+      <p>Async by construction. A 2,000-page PDF takes minutes; nothing may block an HTTP request on it.</p>
+
+      <div class="scroller"><pre>USER drops a file
+  │
+  ├─ <b>FRONTEND</b>
+  │    1. client-side validate: type, size, count
+  │    2. POST /api/documents (multipart) with upload progress
+  │    3. receive {document_id, status: "queued"} immediately
+  │    4. subscribe to status — show a per-file progress row
+  │
+  ├─ <b>BACKEND</b>
+  │    5. authn/authz + quota check
+  │    6. stream bytes to object storage (never buffer whole file in RAM)
+  │    7. compute checksum → if identical doc exists for tenant, short-circuit
+  │    8. INSERT documents row (status=queued)
+  │    9. enqueue job on Redis, idempotency_key = checksum+tenant
+  │   10. return 202 Accepted
+  │
+  ├─ <b>AGENT WORKER</b>  (separate process from the agent API)
+  │   11. claim job (visibility timeout so a crash re-queues it)
+  │   12. callback: status=processing
+  │   13. RAG INGESTION PIPELINE:
+  │         extract → normalise to canonical document model → chunk
+  │         → embed → upsert into vector DB (tenant/ACL/version in metadata)
+  │   14. emit progress callbacks (pages done / total) for the UI
+  │   15. on success → callback status=ready, page_count, chunk_count
+  │       on failure → classify, retry with backoff,
+  │                    after N attempts → dead-letter + status=error
+  │
+  └─ <b>BACKEND</b>
+      16. apply callbacks to Postgres; frontend's next poll sees the change</pre></div>
+
+      <div class="note">
+        <p><strong>Why a worker and not a direct HTTP call:</strong> a 10-minute HTTP request is a broken design — it dies to proxy timeouts, can't resume, and can't report progress. The queue also gives retries, backpressure, and crash recovery for free.</p>
+      </div>
+
+      <h3>Flow C — Status &amp; lifecycle</h3>
+      <div class="scroller"><pre><b>Poll</b>     GET /api/documents?status=processing   every 2s while any doc is
+         in flight, backing off to 10s, stopping entirely when none are.
+         (Upgrade path: SSE at /api/documents/events — same data, no polling.)
+
+<b>Delete</b>   DELETE /api/documents/{id}
+         → backend marks deleted → enqueues purge job
+         → agent worker deletes chunks from the vector DB
+         → backend deletes the object and the row
+
+         Deleting a document MUST delete its derived vectors. A "deleted"
+         document whose chunks still answer questions is a data-leak bug.
+
+<b>Reindex</b>  new version → old chunks is_active=false (not deleted)
+         → new chunks written → retrieval filters to active by default</pre></div>
+    </section>
+
+    <!-- ═══════════════ 4 ═══════════════ -->
+    <section id="contracts">
+      <h2><span class="h-num">Section 04</span>Service contracts</h2>
+      <p>The interfaces between services. These must stay stable; everything behind them is free to change.</p>
+
+      <h3>Frontend ⇄ Backend (public API)</h3>
+      <div class="t-wrap">
+        <table>
+          <thead><tr><th>Method</th><th>Path</th><th>Purpose</th><th>M</th></tr></thead>
+          <tbody>
+            <tr><td><code>GET</code></td><td><code>/health</code></td><td>liveness</td><td><span class="chip done">M0</span></td></tr>
+            <tr><td><code>POST</code></td><td><code>/api/conversations</code></td><td>create conversation</td><td><span class="chip next">M1</span></td></tr>
+            <tr><td><code>GET</code></td><td><code>/api/conversations</code></td><td>list (paginated)</td><td><span class="chip next">M1</span></td></tr>
+            <tr><td><code>GET</code></td><td><code>/api/conversations/{id}</code></td><td>detail + messages</td><td><span class="chip next">M1</span></td></tr>
+            <tr><td><code>PATCH</code></td><td><code>/api/conversations/{id}</code></td><td>rename / archive</td><td><span class="chip next">M1</span></td></tr>
+            <tr><td><code>DELETE</code></td><td><code>/api/conversations/{id}</code></td><td>delete</td><td><span class="chip next">M1</span></td></tr>
+            <tr><td><code>POST</code></td><td><code>/api/conversations/{id}/messages</code></td><td><strong>send → SSE stream</strong></td><td><span class="chip next">M1</span></td></tr>
+            <tr><td><code>POST</code></td><td><code>/api/documents</code></td><td>upload (multipart)</td><td><span class="chip later">M2</span></td></tr>
+            <tr><td><code>GET</code></td><td><code>/api/documents</code></td><td>list + filter + paginate</td><td><span class="chip later">M2</span></td></tr>
+            <tr><td><code>GET</code></td><td><code>/api/documents/{id}</code></td><td>detail + status</td><td><span class="chip later">M2</span></td></tr>
+            <tr><td><code>DELETE</code></td><td><code>/api/documents/{id}</code></td><td>delete + purge vectors</td><td><span class="chip later">M2</span></td></tr>
+            <tr><td><code>GET</code></td><td><code>/api/documents/{id}/content</code></td><td>signed URL for preview</td><td><span class="chip later">M4</span></td></tr>
+            <tr><td><code>POST</code></td><td><code>/api/messages/{id}/feedback</code></td><td>👍/👎 (eval signal)</td><td><span class="chip later">M5</span></td></tr>
+            <tr><td><code>GET</code></td><td><code>/api/me</code></td><td>user, quotas, limits</td><td><span class="chip later">M6</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Backend ⇄ Agent (internal API)</h3>
+      <p>Never exposed to the browser. Authenticated with a shared internal token.</p>
+      <div class="t-wrap">
+        <table>
+          <thead><tr><th>Method</th><th>Path</th><th>Purpose</th></tr></thead>
+          <tbody>
+            <tr><td><code>POST</code></td><td><code>/chat/stream</code></td><td>conversation + access context → SSE token stream</td></tr>
+            <tr><td><code>POST</code></td><td><code>/ingest</code></td><td>worker-invoked: run ingestion for a document</td></tr>
+            <tr><td><code>POST</code></td><td><code>/purge</code></td><td>delete all vectors for a document</td></tr>
+            <tr><td><code>POST</code></td><td><code>/retrieve</code></td><td>retrieval only, no generation (debug + eval harness)</td></tr>
+            <tr><td><code>GET</code></td><td><code>/health</code></td><td>liveness + model reachability</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>The SSE event protocol</h3>
+      <p>One protocol, used agent→backend and backend→frontend unchanged. Named events, JSON payloads.</p>
+      <div class="scroller"><pre>event: <b>start</b>        data: {"message_id": "...", "model": "..."}
+event: <b>status</b>       data: {"stage": "retrieving"}        # UI: "Searching documents…"
+event: <b>status</b>       data: {"stage": "reranking"}
+event: <b>status</b>       data: {"stage": "generating"}
+event: <b>token</b>        data: {"text": "The "}               # the hot path
+event: <b>citations</b>    data: {"citations": [ ... ]}         # once, before done
+event: <b>usage</b>        data: {"input_tokens": N, "output_tokens": N, "cost_usd": 0.0}
+event: <b>done</b>         data: {"stop_reason": "end_turn"}
+event: <b>error</b>        data: {"code": "AGENT_TIMEOUT", "message": "...", "retryable": true}</pre></div>
+
+      <ul>
+        <li><strong><code>status</code> events are a UX feature, not debug output.</strong> RAG has a multi-second gap before the first token; "Searching your documents…" is the difference between <em>thinking</em> and <em>broken</em>.</li>
+        <li><strong>Citations arrive as one event before <code>done</code></strong>, not per-token — they're only known once generation completes verification.</li>
+        <li><strong><code>error</code> can arrive mid-stream</strong> after tokens have rendered. The frontend must handle <em>partial answer plus error</em>, not assume error means nothing rendered.</li>
+        <li><strong>Heartbeat comment every 15s</strong> so proxies don't kill an idle stream during a long retrieval.</li>
+      </ul>
+
+      <h3>The access context</h3>
+      <p>Passed backend → agent on every request. The backend is the <em>authority</em> on identity; the agent is the <em>enforcer</em> at retrieval time.</p>
+      <div class="scroller"><pre>{
+  "tenant_id": "t_123",
+  "user_id": "u_456",
+  "allowed_document_ids": null,      <b>// null = all documents in the tenant</b>
+  "roles": ["owner"],
+  "include_inactive_versions": false
+}</pre></div>
+
+      <div class="rule-box">
+        <p>
+          The agent converts this into a <strong>hard metadata filter on every vector query</strong>.
+          Never a prompt instruction — filtering must be structural, because a prompt can be argued
+          with and a filter cannot.
+        </p>
+      </div>
+
+      <h3>Error contract</h3>
+      <p>Every backend error, one shape:</p>
+      <div class="scroller"><pre>{ "error": { "code": "RATE_LIMITED", "message": "human readable",
+             "retryable": true, "retry_after_s": 30, "request_id": "req_..." } }</pre></div>
+      <p>
+        <code>code</code> is a stable machine string the frontend switches on. <code>message</code> is for
+        humans. <code>request_id</code> correlates across all three services in logs.
+      </p>
+    </section>
+
+    <!-- ═══════════════ 5 ═══════════════ -->
+    <section id="frontend">
+      <h2><span class="h-num">Section 05</span>Frontend design</h2>
+      <p><strong>Stack:</strong> Next.js 16 (App Router) · React 19 · TypeScript · Tailwind v4.</p>
+
+      <h3>State architecture — three distinct layers</h3>
+      <p>
+        The single most important frontend decision, and the reason "just add Redux" is the wrong
+        instinct here: <strong>most of this app's state is server state</strong>, which needs caching,
+        revalidation, and polling — not a reducer.
+      </p>
+
+      <div class="t-wrap">
+        <table>
+          <thead><tr><th>Layer</th><th>What lives here</th><th>Tool</th><th>Why</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><strong>Server state</strong></td>
+              <td>conversations, messages, documents, upload status, user</td>
+              <td><strong>TanStack Query</strong></td>
+              <td>caching, dedup, retries, background refetch, <code>refetchInterval</code> for ingestion polling, optimistic updates + rollback</td>
+            </tr>
+            <tr>
+              <td><strong>Client state</strong></td>
+              <td>sidebar open, active conversation id, theme, filters, composer draft</td>
+              <td><strong>Zustand</strong></td>
+              <td>tiny, no boilerplate, no provider pyramid</td>
+            </tr>
+            <tr>
+              <td><strong>Stream state</strong></td>
+              <td>in-flight assistant message, token buffer, abort controller</td>
+              <td><strong>local <code>useReducer</code></strong></td>
+              <td>lives and dies with one request; a global store here causes re-render storms at 60 tokens/sec</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <ul>
+        <li>Server data is <strong>never</strong> copied into Zustand. One source of truth per datum.</li>
+        <li>The streaming buffer is <strong>never</strong> in a global store. Token-rate updates must touch one component subtree.</li>
+        <li>Query keys are structured and centralised — <code>['conversations']</code>, <code>['conversation', id]</code>, <code>['documents', {status, page}]</code> — so invalidation is precise.</li>
+      </ul>
+      <p style="font-size:0.92rem;color:var(--ink-soft)">
+        Redux Toolkit + RTK Query remains a valid alternative. The <em>layer split</em> is the part that
+        matters; the libraries are swappable.
+      </p>
+
+      <h3>Route &amp; component structure</h3>
+      <div class="scroller"><pre>src/
+├── app/
+│   ├── layout.tsx                 providers, fonts, theme, error boundary
+│   ├── page.tsx                   redirect → /chat
+│   ├── chat/
+│   │   ├── layout.tsx             sidebar + main shell
+│   │   ├── page.tsx               new conversation
+│   │   └── [conversationId]/page.tsx
+│   ├── documents/page.tsx         document library
+│   ├── error.tsx                  route error boundary
+│   ├── not-found.tsx
+│   └── global-error.tsx           last-resort boundary
+├── components/
+│   ├── chat/                      ChatWindow, MessageList, MessageBubble,
+│   │                              StreamingMessage, CitationCard, SourcePanel,
+│   │                              ChatInput, MessageActions, EmptyState
+│   ├── documents/                 UploadZone, UploadQueue, DocumentTable,
+│   │                              DocumentRow, StatusBadge, DeleteDialog
+│   ├── layout/                    Sidebar, ConversationList, TopBar, MobileNav
+│   └── ui/                        Button, Dialog, Toast, Skeleton, Tooltip,
+│                                  Badge, Spinner, VirtualList
+├── hooks/                         useChatStream, useConversations, useDocuments,
+│                                  useUpload, useAutoScroll, useHotkeys
+├── lib/                           api client, sse parser, query client,
+│                                  env validation, formatters, errors
+├── stores/                        ui.store.ts, composer.store.ts
+└── types/                         shared domain types (mirror backend schemas)</pre></div>
+
+      <h3>Streaming — the hard part of the UI</h3>
+      <p>Consuming SSE correctly is where chat UIs usually break.</p>
+
+      <h4>Mechanics</h4>
+      <ul>
+        <li>Use <code>fetch</code> + <code>ReadableStream</code>, not <code>EventSource</code> — it can't POST or set auth headers.</li>
+        <li>Parse SSE incrementally with a buffer. <strong>Chunks split mid-event</strong>; a naive <code>split('\n\n')</code> per chunk drops data. Keep a carry-over buffer across reads.</li>
+        <li>Batch token appends with <code>requestAnimationFrame</code>. A <code>setState</code> per token at 60 tok/s janks; coalescing to ~16ms frames doesn't.</li>
+        <li>Hold an <code>AbortController</code> per stream — that's the Stop button, and it must also fire on unmount and navigation.</li>
+      </ul>
+
+      <h4>Required UX states</h4>
+      <div class="t-wrap">
+        <table>
+          <thead><tr><th>State</th><th>UI</th></tr></thead>
+          <tbody>
+            <tr><td>Submitted, nothing back yet</td><td>user bubble + animated dots</td></tr>
+            <tr><td><code>status: retrieving</code></td><td>"Searching your documents…" with a subtle spinner</td></tr>
+            <tr><td>Tokens arriving</td><td>live text + blinking cursor + <strong>Stop</strong></td></tr>
+            <tr><td>Stopped by user</td><td>keep partial text, mark "stopped", offer Regenerate</td></tr>
+            <tr><td>Citations arrived</td><td>source cards fade in under the message</td></tr>
+            <tr><td>Done</td><td>cursor removed, actions enabled (copy, regenerate, feedback)</td></tr>
+            <tr><td>Error after partial</td><td>keep the partial text, inline error card, <strong>Retry</strong></td></tr>
+            <tr><td>Network dropped mid-stream</td><td>detect stall (no event &gt; 30s), offer Retry; never hang forever</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="rule-box">
+        <span class="label">Auto-scroll rule</span>
+        <p>
+          Stick to the bottom <strong>only while the user is already at the bottom</strong>. If they
+          scroll up to read, do not yank them back — show a "↓ New messages" pill instead. This is the
+          single most-complained-about behaviour in chat UIs.
+        </p>
+      </div>
+
+      <h3>File management — complete specification</h3>
+
+      <h4>Upload</h4>
+      <ul>
+        <li>Accept drag-drop, click-to-browse, paste. Multi-file.</li>
+        <li>Client-side gate before any request: extension + MIME allowlist, per-file size cap (~50 MB), per-batch count cap (~10), total-quota check from <code>/api/me</code>.</li>
+        <li>A <strong>per-file row</strong> with its own progress bar and its own error — one bad file must not fail the batch.</li>
+        <li>Real upload progress needs <code>XMLHttpRequest.upload.onprogress</code> — <code>fetch</code> has no upload progress. Wrap it once in the api client.</li>
+        <li>Client-side checksum (Web Crypto SHA-256) warns "already uploaded" before spending bandwidth.</li>
+        <li>Cancel per file, retry per file.</li>
+      </ul>
+
+      <h4>Status lifecycle</h4>
+      <div class="scroller"><pre>queued → uploading → processing → ready
+                        └────────→ error (with reason + Retry)</pre></div>
+      <p>
+        <code>processing</code> shows real substeps when the backend reports them:
+        <em>extracting → chunking → embedding → indexing</em>, with page counts on long documents.
+        A 2,000-page PDF sitting on "processing" with no detail feels broken; the same wait showing
+        "embedding — page 840/2000" feels fine.
+      </p>
+
+      <h4>Listing — how many to show</h4>
+      <ul>
+        <li>Sidebar/compact: <strong>5 most recent</strong> with "View all". Never an unbounded list in a nav rail.</li>
+        <li>Documents page: <strong>server-side pagination, 25 per page</strong>, with search, filter (status/type/date), sort.</li>
+        <li>Virtualise any list that can exceed ~100 rows. At 10 M documents the client must never receive an unpaginated list — designed in from the first version, not retrofitted.</li>
+        <li>Poll only while something is <code>processing</code>; stop when the tab is hidden.</li>
+      </ul>
+
+      <h4>Delete</h4>
+      <ul>
+        <li>Confirmation dialog naming the file; explain that answers will no longer cite it.</li>
+        <li>Optimistic removal with rollback on failure.</li>
+        <li>Warn if the document is referenced by citations in existing conversations.</li>
+      </ul>
+
+      <h3>Chat surface</h3>
+      <ul>
+        <li><strong>Markdown</strong> via <code>react-markdown</code> + <code>remark-gfm</code>, <strong>sanitised</strong> with <code>rehype-sanitize</code> — model output is untrusted; unsanitised HTML is a direct XSS path.</li>
+        <li><strong>Code blocks:</strong> syntax highlighting, language label, copy button — lazy-loaded, since it's heavy and most messages have no code.</li>
+        <li><strong>Streaming markdown caveat:</strong> partial markdown is frequently invalid mid-stream (an unclosed fence). Render streaming text as plain text and switch to full markdown on <code>done</code>, or the layout flickers violently.</li>
+        <li><strong>Citations:</strong> numbered inline markers, hover highlights the matching source card, click opens the <strong>source panel</strong> with excerpt, document, page, and a "view in document" link.</li>
+        <li><strong>Message actions:</strong> copy, regenerate, 👍/👎 (feeds evals), and "show retrieved context" in dev mode — your debugging lifeline.</li>
+        <li><strong>Virtualise</strong> long conversations; a 500-message thread must not mount 500 markdown trees.</li>
+      </ul>
+
+      <h3>Composer</h3>
+      <p>
+        Auto-resizing textarea (cap ~200px) · Enter sends, Shift+Enter newline (inverted on mobile) ·
+        disabled while streaming with Stop offered instead · draft persisted per conversation in
+        Zustand + <code>localStorage</code> so a refresh doesn't lose typing · token counter near the
+        limit · attach button shared with the upload flow · <code>/</code> command palette hook (future) ·
+        paste-image support (future, multimodal).
+      </p>
+
+      <h3>Error handling — the full taxonomy</h3>
+      <p>Every failure needs a <em>decided</em> UX. Undecided cases are what make an app feel unfinished.</p>
+      <div class="t-wrap">
+        <table>
+          <thead><tr><th>Failure</th><th>Detection</th><th>UX</th><th>Recovery</th></tr></thead>
+          <tbody>
+            <tr><td>Backend unreachable</td><td>fetch rejects</td><td>full-width banner "Can't reach server"</td><td>auto-retry w/ backoff + manual</td></tr>
+            <tr><td>Agent down (502)</td><td><code>AGENT_UNAVAILABLE</code></td><td>inline "AI service unavailable"</td><td>Retry</td></tr>
+            <tr><td>Auth expired (401)</td><td>interceptor</td><td>redirect to login, preserve draft</td><td>re-auth</td></tr>
+            <tr><td>Forbidden (403)</td><td>interceptor</td><td>"You don't have access"</td><td>—</td></tr>
+            <tr><td>Rate limited (429)</td><td><code>retry_after_s</code></td><td>countdown on the send button</td><td>auto-enable at zero</td></tr>
+            <tr><td>Validation (422)</td><td>field errors</td><td>inline under the field</td><td>fix + resubmit</td></tr>
+            <tr><td>Payload too large (413)</td><td>pre-checked client-side too</td><td>per-file error row</td><td>remove/replace</td></tr>
+            <tr><td>Stream stalls</td><td>no event &gt; 30s</td><td>"Connection stalled" + Retry</td><td>abort + retry</td></tr>
+            <tr><td>Stream errors mid-answer</td><td><code>event: error</code></td><td>keep partial + error card</td><td>Regenerate</td></tr>
+            <tr><td>Model refusal</td><td><code>stop_reason: refusal</code></td><td>neutral explanation, not a crash</td><td>rephrase</td></tr>
+            <tr><td><strong>Abstention</strong> (no evidence)</td><td>answer with empty citations + flag</td><td><em>not an error</em> — a first-class "I don't have evidence" card suggesting an upload</td><td>upload doc</td></tr>
+            <tr><td>Ingestion failed</td><td>doc <code>status: error</code></td><td>row shows reason (corrupt / unsupported / OCR failed)</td><td>Retry / Remove</td></tr>
+            <tr><td>Quota exceeded</td><td><code>QUOTA_EXCEEDED</code></td><td>upgrade/cleanup prompt</td><td>delete docs</td></tr>
+            <tr><td>Unexpected render crash</td><td>error boundary</td><td>route-level fallback, rest of app alive</td><td>reload section</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        <strong>Global rules:</strong> every mutation surfaces a toast on failure; every retryable error
+        offers exactly one obvious retry affordance; no <code>catch {}</code> that silently swallows;
+        every error carries <code>request_id</code> and shows it in a dev-visible detail so a user report
+        is traceable.
+      </p>
+
+      <h3>Performance, accessibility, quality</h3>
+      <p>
+        <strong>Performance</strong> — Server Components for the static shell, Client Components only
+        where interactive · route-level code splitting · lazy-load markdown, highlighting, virtualisation ·
+        memoise message bubbles so a streaming message doesn't re-render history · <code>next/font</code>
+        to avoid layout shift · budget LCP &lt; 2.5s, INP &lt; 200ms.
+      </p>
+      <p>
+        <strong>Accessibility</strong> — keyboard-navigable everywhere · visible focus rings ·
+        <code>aria-live="polite"</code> on the streaming region so screen readers announce the answer ·
+        labelled inputs · dialogs trap and restore focus · respect <code>prefers-reduced-motion</code> ·
+        WCAG AA contrast in both themes.
+      </p>
+      <p>
+        <strong>Observability</strong> — error boundary reports to Sentry · log <code>request_id</code> on
+        every failure · Web Vitals · a dev-only debug panel showing retrieved chunks, scores, timings,
+        token usage.
+      </p>
+      <p>
+        <strong>Testing</strong> — Vitest + Testing Library for hooks and components (the SSE parser and
+        <code>useChatStream</code> deserve real unit tests, split-chunk cases included) · MSW to mock the
+        API deterministically · Playwright for the two critical journeys:
+        <em>upload → processed → ask → cited answer</em> and <em>send → stream → stop → regenerate</em>.
+      </p>
+      <p>
+        <strong>Security</strong> — no secrets in <code>NEXT_PUBLIC_*</code> · sanitise all rendered model
+        output · validate env at boot · no <code>dangerouslySetInnerHTML</code> on model text, ever.
+      </p>
+    </section>
+
+    <!-- ═══════════════ 6 ═══════════════ -->
+    <section id="backend">
+      <h2><span class="h-num">Section 06</span>Backend design</h2>
+      <p><strong>Stack:</strong> FastAPI · SQLAlchemy 2 + Alembic · Pydantic v2 · Redis · httpx.</p>
+      <p>
+        Today the backend is a pass-through. That's fine — but the structure below is what it grows
+        into, and each piece has a milestone.
+      </p>
+
+      <div class="rule-box">
+        <span class="label">What the backend is</span>
+        <p>
+          The <strong>control plane</strong>. It owns identity, durability, and access decisions. It knows
+          <em>nothing</em> about prompts, models, or embeddings.
+        </p>
+        <p>
+          Litmus test: if a change requires touching a prompt, it doesn't belong in the backend. If it
+          requires touching a database table, it doesn't belong in the agent.
+        </p>
+      </div>
+
+      <h3>Structure</h3>
+      <div class="scroller"><pre>backend/app/
+├── main.py                 app factory, middleware, exception handlers
+├── core/                   config, security, logging, dependencies
+├── api/routes/             health, conversations, messages, documents, feedback, me
+├── api/internal/           callbacks from the agent worker (job status)
+├── schemas/                Pydantic request/response models
+├── models/                 SQLAlchemy ORM models
+├── repositories/           DB access (no SQL in route handlers)
+├── services/
+│   ├── agent_client.py     HTTP+SSE client for the agent  <b>← the only outbound AI path</b>
+│   ├── conversation_service.py
+│   ├── document_service.py
+│   ├── storage.py          object storage (S3/MinIO)
+│   └── queue.py            job enqueue
+├── middleware/             request id, logging, rate limit, CORS, timing
+└── migrations/             Alembic</pre></div>
+      <p>Layering: <strong>route → service → repository → DB.</strong> Routes do validation and HTTP concerns only.</p>
+
+      <h3>Streaming proxy</h3>
+      <p>The subtle part of the backend. Five requirements:</p>
+      <ol>
+        <li><strong>Do not buffer.</strong> Stream chunks through as they arrive; buffering defeats the entire point.</li>
+        <li><strong>Accumulate while proxying</strong> so the complete answer can be persisted at the end.</li>
+        <li><strong>Detect client disconnect</strong> and still persist what was generated, marked interrupted — those tokens were paid for.</li>
+        <li><strong>Propagate cancellation:</strong> client aborts → backend aborts its request to the agent → agent stops generating. Without this, pressing Stop keeps costing money.</li>
+        <li><strong>Timeouts</strong> generous but finite; emit a proper <code>error</code> event rather than dying silently.</li>
+      </ol>
+
+      <h3>Idempotency, races, and concurrency</h3>
+      <p>The "advanced backend concepts" bucket — designed now, implemented at M6.</p>
+      <div class="t-wrap">
+        <table>
+          <thead><tr><th>Hazard</th><th>Mitigation</th></tr></thead>
+          <tbody>
+            <tr><td>Double-submit (double-click, retry)</td><td><code>Idempotency-Key</code> header; cache the response keyed on it (Redis, 24h)</td></tr>
+            <tr><td>Duplicate uploads</td><td><code>checksum_sha256</code> unique per tenant → return the existing document</td></tr>
+            <tr><td>Two workers claim one job</td><td>atomic claim — <code>SELECT … FOR UPDATE SKIP LOCKED</code>, or Redis visibility timeout</td></tr>
+            <tr><td>Concurrent messages in one conversation</td><td>per-conversation advisory lock; second request queues or 409s</td></tr>
+            <tr><td>Lost update on rename</td><td>optimistic concurrency via <code>updated_at</code> / version column</td></tr>
+            <tr><td>Delete during ingestion</td><td>job checks a cancellation flag between stages; purge runs after</td></tr>
+            <tr><td>Orphaned vectors after failed delete</td><td>reconciliation job sweeps vectors with no live document</td></tr>
+            <tr><td>Thundering-herd polling</td><td>jittered intervals + <code>ETag</code>/<code>If-None-Match</code> on list endpoints</td></tr>
+            <tr><td>Runaway cost</td><td>per-tenant token budget checked <em>before</em> dispatching to the agent</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Auth, rate limiting, quotas <span class="chip later">M6</span></h3>
+      <ul>
+        <li><strong>Auth:</strong> session cookie (httpOnly, SameSite=Lax) for the browser; internal shared-secret header for backend→agent. Structure the code as a <code>current_user</code> dependency from day one — then adding real auth is swapping the dependency, not rewriting routes.</li>
+        <li><strong>Rate limiting:</strong> Redis sliding window, per user and per tenant, different budgets per route class (chat vs upload vs read). Always return <code>Retry-After</code>.</li>
+        <li><strong>Quotas:</strong> documents, storage bytes, monthly tokens. Enforced <em>before</em> the expensive operation, surfaced via <code>/api/me</code> so the UI can warn early.</li>
+      </ul>
+
+      <h3>Observability &amp; testing</h3>
+      <p>
+        Structured JSON logs with <code>request_id</code> on every line · OpenTelemetry traces spanning
+        frontend → backend → agent → model, so one trace id answers "where did the 8 seconds go?" ·
+        metrics for request rate/latency/error by route, queue depth, job duration, tokens and cost per
+        tenant · <code>/health</code> (liveness) and <code>/ready</code> (DB + Redis + agent reachable).
+      </p>
+      <p>
+        Testing: pytest + httpx <code>AsyncClient</code> · a test Postgres per run · the agent mocked at
+        the HTTP boundary, SSE included · contract tests asserting response shapes match what the
+        frontend types expect.
+      </p>
+    </section>
+
+    <!-- ═══════════════ 7 ═══════════════ -->
+    <section id="agent">
+      <h2><span class="h-num">Section 07</span>Agent service design</h2>
+      <p>
+        <strong>Stack:</strong> FastAPI · LangChain (model/vector abstractions) · Redis · Qdrant ·
+        the RAG engine. LangGraph enters later, and only on evidence.
+      </p>
+
+      <h3>The internal split: RAG engine vs chat orchestrator</h3>
+      <div class="rule-box">
+        <p>
+          <strong>RAG is a subsystem of the chatbot, not the whole of it — and the chatbot's concerns
+          must not leak into it.</strong> Memory, routing, chit-chat, clarification, and human-in-the-loop
+          are <em>conversation</em> concerns. They live outside the RAG engine, which stays independently
+          usable.
+        </p>
+      </div>
+      <div class="scroller"><pre>agent/app/
+├── <b>rag_engine/</b>          ← STATELESS. Documents in, grounded answers out.
+│   │                    Knows nothing about conversations, users, or turns.
+│   ├── api.py              THE interface — the only entry point
+│   ├── ingestion/          job orchestration for the write path
+│   ├── extraction/         bytes → structure
+│   ├── document_model/     the canonical form
+│   ├── chunking/
+│   ├── embeddings/
+│   ├── indexing/
+│   ├── retrieval/
+│   ├── reranking/
+│   ├── context/            assemble the evidence into a prompt
+│   ├── generation/         evidence → answer (single-turn)
+│   ├── grounding/          sufficiency, citations, verification, abstention
+│   └── safety/             CONTENT-level: untrusted delimiting, ACL filters
+│
+├── <b>chat_orchestrator/</b>   ← STATEFUL. Owns the conversation.
+│   ├── pipeline.py         M1–M3: a plain function. No graph.
+│   ├── question_resolution/  coreference → standalone question
+│   ├── routing/            chit-chat vs retrieval vs clarify vs refuse
+│   ├── memory/             short_term, long_term, summarizer, store
+│   ├── hitl/               interrupt points, approval protocol
+│   ├── tools/              non-retrieval tools
+│   └── graph/              LangGraph — added only when the gate opens
+│
+├── shared/              providers (OpenRouter/Anthropic), config, tracing
+├── workers/             ingestion worker, purge worker
+└── evaluation/          two suites: rag_engine and orchestrator, measured separately</pre></div>
+
+      <p>
+        The payoff is not tidiness. It's that <strong>Step 2's <code>/query</code> and
+        <code>/retrieve</code> endpoints are exactly <code>rag_engine.api</code></strong> — a RAG engine
+        entangled with chat orchestration cannot be exposed as a platform API without a rewrite.
+      </p>
+
+      <h3>The interface — and the rule that enforces it</h3>
+      <div class="scroller"><pre>rag_engine.<b>retrieve</b>(question: str, access: AccessContext, opts) -> list[Evidence]
+rag_engine.<b>answer</b>(question: str, access: AccessContext, opts)   -> GroundedAnswer</pre></div>
+      <p>
+        <code>GroundedAnswer</code> = <code>{text, citations[], evidence[], sufficiency, usage, trace}</code>.
+      </p>
+
+      <div class="rule-box">
+        <span class="label">The rule</span>
+        <p><strong>The RAG engine never sees conversation history.</strong></p>
+        <p>
+          It receives a <em>standalone question</em> and an access context. Nothing else. No message
+          list, no user profile, no memory, no thread id.
+        </p>
+      </div>
+
+      <p>This one rule resolves every ambiguous case cleanly:</p>
+      <div class="t-wrap">
+        <table>
+          <thead><tr><th>Concern</th><th>Home</th><th>Why</th></tr></thead>
+          <tbody>
+            <tr><td>"What about 2024?" → resolve against prior turns</td><td><strong>Orchestrator</strong></td><td>needs conversation</td></tr>
+            <tr><td>Rewriting / expanding / HyDE on a standalone question</td><td><strong>RAG engine</strong></td><td>doesn't need conversation</td></tr>
+            <tr><td>Deciding this message needs no retrieval at all</td><td><strong>Orchestrator</strong></td><td>a conversation judgement</td></tr>
+            <tr><td>Deciding the retrieved evidence is insufficient</td><td><strong>RAG engine</strong></td><td>a property of the evidence</td></tr>
+            <tr><td>Asking the user a clarifying question</td><td><strong>Orchestrator</strong></td><td>a turn-taking act</td></tr>
+            <tr><td>Abstaining because evidence is weak</td><td><strong>RAG engine</strong></td><td>returned as <code>sufficiency: insufficient</code></td></tr>
+            <tr><td>Remembering the user prefers short answers</td><td><strong>Orchestrator</strong></td><td>conversation state</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        If the orchestrator ever wants to pass message history <em>into</em> the engine, that's the signal
+        the boundary is being violated — resolve the question first instead.
+      </p>
+      <p>
+        <strong>Testable consequence:</strong> the RAG engine can be exercised end to end by the benchmark
+        with no chatbot present at all. That's what keeps Section 08 measurable independently of Section 07.
+      </p>
+
+      <h3>Provider abstraction — OpenRouter first, paid later</h3>
+      <p>Starting on OpenRouter's free tier and switching later is a <em>design constraint</em>, not an afterthought.</p>
+      <div class="scroller"><pre>providers/base.py
+    get_chat_model(purpose)  → LangChain BaseChatModel
+    get_embedding_model()    → LangChain Embeddings</pre></div>
+      <ul>
+        <li><code>purpose</code> lets different jobs use different models: <code>chat</code> (best), <code>rerank</code>/<code>classify</code> (cheap+fast), <code>judge</code> (strong, eval-only), <code>summarize</code> (cheap).</li>
+        <li>OpenRouter is OpenAI-compatible → <code>ChatOpenAI(base_url="https://openrouter.ai/api/v1", …)</code>. Switching to first-party Anthropic later is a config change plus one adapter file.</li>
+        <li><strong>Free-tier realities to design around:</strong> aggressive rate limits (need retry/backoff and a request queue), no prompt caching, weaker structured-output reliability (validate and repair JSON rather than trusting it), variable latency, changing model availability.</li>
+      </ul>
+      <div class="rule-box">
+        <p>
+          <strong>Never call a provider SDK directly from graph nodes</strong> — always through
+          <code>providers/</code>, so all of the above is handled in one place.
+        </p>
+        <p>
+          <strong>Embeddings are the sticky choice.</strong> Changing an embedding model invalidates every
+          stored vector and forces a full reindex. Pick deliberately, record it in vector metadata, and
+          treat a change as a migration.
+        </p>
+      </div>
+
+      <h3>The orchestrator — a function first, a graph only when earned</h3>
+      <p><strong>M1–M3 use no LangGraph at all.</strong> The orchestrator is a plain function:</p>
+      <div class="scroller"><pre>def handle_turn(history, user_message, access) -> GroundedAnswer:
+    question = resolve_question(history, user_message)   <b># coreference only</b>
+    return rag_engine.answer(question, access)</pre></div>
+      <p>
+        That's the entire orchestrator until the benchmark says otherwise. It's trivially debuggable,
+        and — the point — it lets the RAG engine be measured without any orchestration confounding the
+        numbers.
+      </p>
+      <p><strong>The gate for introducing a graph.</strong> LangGraph is adopted when at least one of these is a <em>named, measured</em> failure, not an anticipated one:</p>
+      <div class="t-wrap">
+        <table>
+          <thead><tr><th>Graph capability</th><th>Adopt when the benchmark shows</th></tr></thead>
+          <tbody>
+            <tr><td>Conditional routing</td><td>measurable cost/latency waste retrieving for messages that need no retrieval</td></tr>
+            <tr><td>Loops (retrieve → judge → re-query)</td><td>questions failing that a second, reformulated retrieval would answer</td></tr>
+            <tr><td>Checkpoints</td><td>runs that must survive interruption, or HITL becomes required</td></tr>
+            <tr><td>Interruption (HITL)</td><td>ambiguous questions failing that a clarifying turn would fix</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        Until one of those is on the board, a graph is machinery without a job. When the gate does open,
+        the migration is contained — the orchestrator's function body becomes nodes;
+        <strong><code>rag_engine.api</code> does not change.</strong>
+      </p>
+
+      <h4>Graph state, when that time comes</h4>
+      <div class="scroller"><pre>class OrchestratorState(TypedDict):
+    <b># input — conversation-level</b>
+    messages: Annotated[list[BaseMessage], add_messages]
+    access_context: AccessContext
+    conversation_id: str
+    <b># working — conversation decisions ONLY</b>
+    route: Literal["direct", "retrieve", "clarify", "refuse"]
+    resolved_question: str          <b># standalone; the only thing the engine receives</b>
+    <b># returned by the engine — opaque to the orchestrator</b>
+    result: GroundedAnswer | None   <b># text, citations, evidence, sufficiency, trace</b>
+    <b># meta</b>
+    trace: list[StepTrace]
+    usage: Usage
+    errors: list[AgentError]</pre></div>
+      <p>
+        Note what is <em>absent</em>: <code>retrieved</code>, <code>reranked</code>, <code>context</code>,
+        <code>search_queries</code>, <code>sufficiency</code>. Those are RAG-engine internals. They surface
+        for debugging through <code>GroundedAnswer.trace</code>, but the orchestrator never manipulates
+        them — the moment it does, retrieval strategy has leaked into conversation logic.
+      </p>
+
+      <h4>Node graph</h4>
+      <p>
+        Note that the entire RAG pipeline is <em>one node</em> from the orchestrator's point of view.
+        The orchestrator doesn't know whether that node did dense retrieval or an eleven-stage hybrid
+        rerank — that's the boundary doing its job.
+      </p>
+      <div class="scroller"><pre>   <b>CHAT ORCHESTRATOR</b>                          │  <b>RAG ENGINE</b>
+                                              │
+        ┌──────────────┐                      │
+        │  load_memory │  thread state +      │
+        │              │  long-term facts     │
+        └──────┬───────┘                      │
+        ┌──────▼────────────┐                 │
+        │ resolve_question  │  coreference →   │
+        │                   │  standalone Q    │
+        └──────┬────────────┘                 │
+        ┌──────▼───────┐                      │
+        │    route     │  chit-chat? needs docs? ambiguous?
+        └──┬────┬───┬──┘                      │
+   direct │    │   │ clarify → ask, end turn  │
+          │    │   └──────────────┐           │
+          │    │ retrieve         │           │
+          │    ▼                  │           │
+          │  ┌──────────────────┐ │           │   ┌─────────────────────────────┐
+          │  │ rag_engine       │─┼───────────┼──▶│ transform → retrieve →      │
+          │  │   .answer(Q,acl) │ │           │   │ rerank → context →          │
+          │  │                  │◀┼───────────┼───│ sufficiency → generate →    │
+          │  └────────┬─────────┘ │           │   │ verify_citations            │
+          │           │           │           │   │   → GroundedAnswer          │
+          │           │           │           │   └─────────────────────────────┘
+          │           │           │           │     (abstains internally when
+          └────┬──────┘           │           │      evidence is insufficient)
+        ┌──────▼───────┐          │           │
+        │ memory_write │◀─────────┘           │
+        └──────┬───────┘                      │
+               ▼  checkpoint + respond        │</pre></div>
+      <p>
+        Every node writes a <code>StepTrace</code>, and the engine returns its own trace inside
+        <code>GroundedAnswer</code>. Because the two traces are separate, a failure is immediately
+        attributable to <em>orchestration</em> or <em>retrieval</em> — precisely the distinction the
+        failure taxonomy needs.
+      </p>
+
+      <h3>Memory — all four kinds</h3>
+      <p>The word "memory" covers four different mechanisms. Conflating them is the usual source of confusion.</p>
+      <div class="t-wrap">
+        <table>
+          <thead><tr><th>Kind</th><th>Question it answers</th><th>Lifetime</th><th>Storage</th><th>M</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Short-term (thread)</strong></td><td>"what did we say earlier in <em>this</em> chat?"</td><td>one conversation</td><td>messages + Redis checkpoint</td><td><span class="chip later">M4</span></td></tr>
+            <tr><td><strong>Checkpoints</strong></td><td>"resume this run exactly where it stopped"</td><td>per graph step</td><td>LangGraph <code>RedisSaver</code></td><td><span class="chip later">M4</span></td></tr>
+            <tr><td><strong>Long-term semantic</strong></td><td>"what facts do I know about this user/domain?"</td><td>forever</td><td>vector store <code>mem:*</code></td><td><span class="chip later">M8</span></td></tr>
+            <tr><td><strong>Long-term episodic</strong></td><td>"what happened in past conversations?"</td><td>forever</td><td>Postgres + vector index</td><td><span class="chip later">M8</span></td></tr>
+            <tr><td><strong>Procedural</strong></td><td>"how should I behave here?" (learned prefs, few-shots)</td><td>forever</td><td>key-value / prompt fragments</td><td><span class="chip later">M8</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        <strong>Short-term needs a compaction strategy</strong> — a long conversation exceeds context.
+        Ladder: keep last N turns (v1) → rolling summary of older turns + last N verbatim → recursive
+        summarisation → semantic retrieval over the thread's own history.
+      </p>
+      <p>
+        <strong>Checkpoints</strong> are what make HITL and crash-resume possible: the graph persists
+        after each node, so a run can be paused, inspected, edited, and resumed. They also give
+        time-travel debugging — replay a bad answer from any node.
+      </p>
+      <p>
+        <strong>Long-term memory needs a write policy</strong>, or it fills with garbage: extract
+        candidate facts after a turn → deduplicate against existing memories → persist only above a
+        confidence threshold → attach provenance and timestamp → let the user view and delete. A "what
+        do you remember about me" panel is both a UX feature and a privacy requirement.
+      </p>
+
+      <h3>Human-in-the-loop</h3>
+      <p>
+        LangGraph <code>interrupt()</code> before a designated node pauses the run and persists state;
+        a later resume continues from that exact point.
+      </p>
+      <div class="t-wrap">
+        <table>
+          <thead><tr><th>Use case</th><th>Interrupt before</th><th>M</th></tr></thead>
+          <tbody>
+            <tr><td>Ambiguous question → ask a clarifying question</td><td><code>retrieve</code></td><td><span class="chip later">M8</span></td></tr>
+            <tr><td>Low-confidence answer → "is this what you meant?"</td><td><code>generate</code></td><td><span class="chip later">M8</span></td></tr>
+            <tr><td>Destructive tool (delete, send) → approve</td><td>tool node</td><td><span class="chip later">M9</span></td></tr>
+            <tr><td>Reviewer edits retrieved context before answering</td><td><code>generate</code></td><td>dev only</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        Frontend protocol: an <code>interrupt</code> SSE event carries the question and options; the UI
+        renders an approval card; the reply resumes the run by thread id.
+      </p>
+
+      <h3>Security &amp; guardrails</h3>
+      <div class="rule-box">
+        <span class="label">The security model is architectural</span>
+        <p><strong>Classifiers are monitoring, not defence.</strong></p>
+        <p>
+          Prompt-injection classifiers are unreliable — they miss novel phrasings and produce false
+          positives on legitimate content. A system that <em>relies</em> on one has no security model;
+          it has a filter and a hope. Design so that a successful injection cannot do anything worth doing.
+        </p>
+      </div>
+
+      <h4>The four structural invariants</h4>
+      <p>These are the security model. Each is testable, and none depends on a model's judgement.</p>
+      <div class="t-wrap">
+        <table>
+          <thead><tr><th>#</th><th>Invariant</th><th>Enforced by</th><th>Test that proves it</th></tr></thead>
+          <tbody>
+            <tr><td class="rung">1</td><td><strong>ACL/tenant filtering at query time</strong></td><td>a hard metadata filter on every vector query, applied in <code>rag_engine.retrieve</code> from the <code>AccessContext</code> — never a prompt instruction</td><td>tenant A's corpus contains a unique token; tenant B cannot surface it by any prompt</td></tr>
+            <tr><td class="rung">2</td><td><strong>Retrieved content is data, never instructions</strong></td><td>delimited, id-tagged blocks, explicitly marked untrusted in the prompt template</td><td>a document containing "ignore previous instructions and…" changes no behaviour</td></tr>
+            <tr><td class="rung">3</td><td><strong>Privilege separation</strong></td><td>the RAG engine has no credentials beyond read access to its own index; the backend holds identity; the agent holds model keys</td><td>compromising the engine yields no write path and no user data</td></tr>
+            <tr><td class="rung">4</td><td><strong>No document-controlled tool access</strong></td><td>retrieved content can never reach a tool-call decision path — tools are selected from the <em>user's</em> turn and orchestrator state, never from evidence text</td><td>a planted document instructing a tool call triggers nothing</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        Invariant 4 is the one that most often goes missing, and it's why tools live in
+        <code>chat_orchestrator/</code>, not in the RAG engine. The engine reads documents; it must never
+        be able to <em>act</em> on what it reads.
+      </p>
+
+      <h4>Optional monitoring (not defence)</h4>
+      <ul>
+        <li>Prompt-injection classifier over ingested content and user turns — <strong>for visibility</strong>: log, flag, count. It may inform a review queue. It must never be the reason the system is considered safe, and disabling it must not change the security posture.</li>
+        <li>PII detection (log/redact per policy), size/token caps, abuse and off-topic filtering, language detection.</li>
+      </ul>
+
+      <h4>Output checks</h4>
+      <p>
+        <strong>Grounding check</strong> (every factual claim traceable to a retrieved span) ·
+        <strong>citation verification</strong> (does the cited span actually <em>support</em> the claim,
+        not merely exist) · PII leakage check · refusal handling · schema validation where structured
+        output is required.
+      </p>
+      <p>
+        These belong to <code>rag_engine/grounding/</code> — they are properties of the answer-and-evidence
+        pair, not of the conversation.
+      </p>
+
+      <h3>Evaluation — two suites, measured separately</h3>
+      <p>
+        Evaluation is a sibling of both subsystems, not part of either. <strong>The split matters:</strong>
+        if the RAG engine and the orchestrator are scored together, a routing bug and a retrieval bug are
+        indistinguishable in the numbers.
+      </p>
+      <div class="scroller"><pre>evaluation/
+├── dataset/          benchmark questions + gold answers + gold evidence
+├── <b>rag_suite/</b>        ← calls rag_engine.api DIRECTLY. No chatbot involved.
+│                     single-turn, stateless: the honest measure of retrieval quality
+├── <b>chat_suite/</b>       ← multi-turn: coreference, routing, memory, clarification
+├── metrics/          Recall@K, Precision@K, MRR, nDCG, faithfulness,
+│                     correctness, citation accuracy, abstention correctness,
+│                     latency p50/p95, cost/query
+├── judge/            LLM-as-judge (calibrated against ~15–20 hand-scored answers)
+└── regression/       compare a run to the baseline; fail on regression</pre></div>
+      <p>
+        <code>rag_suite</code> is the one that exists first (M3) and the one the central rule refers to.
+        <code>chat_suite</code> only becomes meaningful once there is orchestration worth testing — which
+        is not until a graph is earned.
+      </p>
+      <p>
+        Two modes: <strong>offline</strong> (the benchmark suites, run on every pipeline change — CI for
+        RAG) and <strong>online</strong> (production signals: 👍/👎, abstention rate, latency, cost,
+        retrieval-score distributions).
+      </p>
+
+      <h3>Observability</h3>
+      <p>
+        LangSmith or Langfuse tracing across every node, prompt, retrieval, and token · per-request token
+        and cost accounting returned in the <code>usage</code> event, so cost is visible per answer rather
+        than discovered on a monthly bill · a <code>/retrieve</code> debug endpoint returning chunks with
+        scores · replay-from-checkpoint for post-mortems.
+      </p>
+    </section>
+
+    <!-- ═══════════════ 8 ═══════════════ -->
+    <section id="rag">
+      <h2><span class="h-num">Section 08</span>RAG engine design</h2>
+      <p>
+        Lives at <code>agent/app/rag_engine/</code>. Two pipelines share one canonical document model,
+        behind the single interface in Section 07.
+      </p>
+
+      <div class="scroller"><pre><b>INGESTION</b> (write, offline)                   <b>QUERY</b> (read, online)
+──────────────────────────                   ────────────────────
+ingestion/   job orchestration               retrieval/    find candidates
+extraction/  bytes → structure               reranking/    order them well
+document_model/  canonical form              context/      assemble the prompt
+chunking/    structure → chunks              generation/   evidence → answer
+embeddings/  chunks → vectors                grounding/    sufficiency, citations,
+indexing/    vectors → store                               verification, abstention
+                                             safety/       content-level: untrusted
+                                                           delimiting, ACL filters</pre></div>
+
+      <div class="rule-box">
+        <p>
+          <strong>What is deliberately <em>not</em> here:</strong> memory, routing, chit-chat handling,
+          clarification, HITL, tools, conversation state. Those are <code>chat_orchestrator/</code>.
+          Evaluation is a sibling of both, because it measures them separately.
+        </p>
+        <p>
+          <code>generation/</code> belongs to the engine because grounding and citation verification are
+          inseparable from the call that produced the claims — but it is <strong>single-turn generation
+          from supplied evidence</strong>, not conversation management.
+        </p>
+      </div>
+
+      <h3>extraction/ — bytes → structure</h3>
+      <div class="t-wrap">
+        <table>
+          <tbody>
+            <tr><td style="width:120px"><strong>Job</strong></td><td>Turn a file into text <strong>plus structure</strong>: headings, reading order, tables, figures, page provenance.</td></tr>
+            <tr><td><strong>v1</strong></td><td>PDF only, PyMuPDF text + basic table extraction.</td></tr>
+            <tr><td><strong>Ladder</strong></td><td>Docling (layout + tables + reading order) → OCR for scanned pages → vision model for charts/diagrams → per-format handlers (DOCX, PPTX, HTML, XLSX, images)</td></tr>
+            <tr><td><strong>Failures</strong></td><td>scanned PDF yields empty text · two-column text interleaved · table flattened into unparseable prose · headers/footers polluting content · captions detached from figures · encrypted or corrupt file · 2,000-page memory blowup</td></tr>
+            <tr><td><strong>Metrics</strong></td><td>text coverage %, table detection F1, reading-order accuracy, pages/sec</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="rule-box">
+        <p>
+          <strong>Non-negotiable:</strong> extraction records <strong>provenance</strong> — page, bbox,
+          section path — for every unit. Provenance lost here can never be recovered downstream, and
+          citations are impossible without it.
+        </p>
+      </div>
+
+      <h3>document_model/ — the canonical form</h3>
+      <p>Every format converges here. Built once, consumed by everything after.</p>
+      <div class="scroller"><pre>Document
+├── document_id, tenant_id, owner_id, acl
+├── version {version_id, is_active, superseded_by}
+├── metadata {source, format, page_count, language, created_at}
+├── sections[]      {type: heading|paragraph|table|figure|image|code|list,
+│                    content, level, page, bbox, section_path, order}
+├── relationships[] {type: reference|caption_of|continues|part_of, from, to}
+└── provenance      per-section page/bbox/table_id</pre></div>
+      <p style="font-size:0.92rem;color:var(--ink-soft)">
+        <strong>Failures:</strong> structure flattened to plain text · provenance dropped ·
+        cross-references lost · table semantics (row/column headers) destroyed.
+      </p>
+
+      <h3>chunking/ — structure → retrievable units</h3>
+      <div class="t-wrap">
+        <table>
+          <tbody>
+            <tr><td style="width:120px"><strong>v1</strong></td><td>Recursive character split, ~512 tokens, ~15% overlap, never crossing a page boundary; provenance carried onto every chunk.</td></tr>
+            <tr><td><strong>Ladder</strong></td><td>structure-aware (respect headings) → table-aware (a table is one chunk, or row-groups with the header repeated) → parent–child (embed small, return large) → contextual (prepend an LLM-written summary of where this chunk sits — big measured wins) → semantic (split on embedding-distance shifts) → hierarchical → late chunking</td></tr>
+            <tr><td><strong>Failures</strong></td><td>a sentence split mid-fact · a table cut in half · a chunk with no context ("it increased by 12%" — <em>what</em> did?) · chunks so large the real fact is diluted · overlap so high the index bloats</td></tr>
+            <tr><td><strong>Metrics</strong></td><td>Recall@K by strategy, chunk size distribution, % of gold evidence contained wholly within one chunk</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        Chunking is the highest-leverage, most-underrated knob in RAG. It's also the reason the benchmark
+        must exist before tuning.
+      </p>
+
+      <h3>embeddings/ — chunks → vectors</h3>
+      <div class="t-wrap">
+        <table>
+          <tbody>
+            <tr><td style="width:120px"><strong>v1</strong></td><td>One strong general model; batch, retry, cache by content hash.</td></tr>
+            <tr><td><strong>Ladder</strong></td><td>benchmark 2–3 candidates on <em>our</em> corpus → domain-specific → multilingual → multi-vector (ColBERT-style) → multimodal (image embeddings for charts)</td></tr>
+            <tr><td><strong>Failures</strong></td><td>model/index dimension mismatch · normalisation mismatch with the distance metric · silent truncation of over-long chunks · rate limits during bulk ingest · <strong>model change invalidating the whole index</strong></td></tr>
+            <tr><td><strong>Metrics</strong></td><td>Recall@K per model, embed cost/1k chunks, embed latency, cache hit rate</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        Record the embedding model id and dimension <strong>in the index metadata</strong>. Mixing two
+        models in one collection produces silently wrong retrieval.
+      </p>
+
+      <h3>indexing/ — vectors → store</h3>
+      <p>
+        One collection, tenant-filtered (simple, good to millions) — shard per tenant only when profiling
+        demands it. Every chunk's payload carries <code>tenant_id</code>, <code>document_id</code>,
+        <code>version_id</code>, <code>is_active</code>, <code>acl</code>, <code>page</code>,
+        <code>section_path</code>, <code>chunk_index</code>, <code>content_hash</code>,
+        <code>embedding_model</code>.
+      </p>
+      <div class="rule-box">
+        <p>
+          <strong>Filters applied on every single query, without exception:</strong>
+          <code>tenant_id</code>, ACL, <code>is_active</code>. These are structural.
+        </p>
+      </div>
+      <p style="font-size:0.92rem;color:var(--ink-soft)">
+        <strong>Failures:</strong> stale vectors after re-upload · orphaned vectors after delete (a data
+        leak) · missing payload index making filters slow · unbounded upsert batch timing out · index
+        rebuild with no way to serve during it.
+        <br><strong>Operational needs:</strong> idempotent upsert keyed on <code>content_hash</code>,
+        delete-by-<code>document_id</code>, and a reconciliation sweep for orphans.
+      </p>
+
+      <h3>retrieval/ — the deep section</h3>
+      <p>
+        Retrieval is where most RAG quality lives, so it gets the full ladder.
+        <strong>Each rung is added only when the benchmark shows the failure it fixes.</strong>
+      </p>
+      <div class="t-wrap">
+        <table>
+          <thead><tr><th>Rung</th><th>Technique</th><th>Add when the benchmark shows</th></tr></thead>
+          <tbody>
+            <tr><td class="rung">1</td><td><strong>Dense vector search</strong> (top-k, cosine)</td><td>— this is v1</td></tr>
+            <tr><td class="rung">2</td><td><strong>+ BM25 → hybrid</strong> with RRF fusion</td><td>keyword/rare-term queries fail: product codes, names, IDs, exact phrases. Dense embeddings are lossy on exact tokens.</td></tr>
+            <tr><td class="rung">3</td><td><strong>+ Metadata filtering</strong> (date, type, document, section)</td><td>the right doc exists but the wrong-era/wrong-type one wins</td></tr>
+            <tr><td class="rung">4</td><td><strong>Query transformation</strong> — rewriting, multi-query, decomposition, HyDE, step-back</td><td>question wording ≠ document wording; multi-hop questions need sub-questions</td></tr>
+            <tr><td class="rung">5</td><td><strong>Contextual retrieval</strong> (chunk + LLM-written context, indexed together)</td><td>chunks are individually meaningless without their section</td></tr>
+            <tr><td class="rung">6</td><td><strong>Parent–child / small-to-big</strong></td><td>matched chunks are right but too small to answer from</td></tr>
+            <tr><td class="rung">7</td><td><strong>Hierarchical / summary-first</strong></td><td>a 2,000-page doc needs "which section?" before "which chunk?"</td></tr>
+            <tr><td class="rung">8</td><td><strong>Multi-hop / iterative</strong> (retrieve → reason → retrieve again)</td><td>answers require chaining facts across pages/documents</td></tr>
+            <tr><td class="rung">9</td><td><strong>Agentic retrieval</strong> (model chooses tools/strategies per query)</td><td>question types so heterogeneous no fixed strategy wins</td></tr>
+            <tr><td class="rung">10</td><td><strong>Graph retrieval</strong> (entity/relationship graph)</td><td>questions are about relationships spanning many documents</td></tr>
+            <tr><td class="rung">11</td><td><strong>Multimodal retrieval</strong> (image/chart embeddings)</td><td>chart/diagram questions fail with text-only retrieval</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h4>Retrieval failure modes, named precisely</h4>
+      <div class="t-wrap">
+        <table>
+          <tbody>
+            <tr><td style="width:250px"><code>relevant_document_missed</code></td><td>the right document never entered the candidate set</td></tr>
+            <tr><td><code>relevant_chunk_missed</code></td><td>right document, wrong chunk retrieved</td></tr>
+            <tr><td><code>ranking_failure</code></td><td>the right chunk was retrieved but ranked below the cutoff</td></tr>
+            <tr><td><code>semantic_drift</code></td><td>embeddings matched topic, not the specific fact</td></tr>
+            <tr><td><code>keyword_blindness</code></td><td>exact term present in the corpus, missed by dense-only search</td></tr>
+            <tr><td><code>over_retrieval</code></td><td>k too large, correct chunk buried in noise</td></tr>
+            <tr><td><code>filter_too_strict</code></td><td>metadata filter excluded the answer</td></tr>
+            <tr><td><code>multi_hop_failure</code></td><td>each hop retrievable, chain not followed</td></tr>
+            <tr><td><code>temporal_confusion</code></td><td>retrieved the outdated version of a fact</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        <strong>Metrics:</strong> Recall@{1,5,10,20}, Precision@K, MRR, nDCG@10 — all of them
+        <strong>sliced by question type and difficulty</strong>. One flat Recall number hides exactly the
+        information you need.
+      </p>
+
+      <h3>reranking/</h3>
+      <div class="t-wrap">
+        <table>
+          <tbody>
+            <tr><td style="width:120px"><strong>Job</strong></td><td>Reorder the top ~50 candidates into the best ~5 with a slower, more accurate model.</td></tr>
+            <tr><td><strong>v1</strong></td><td>None. Retrieval must be the proven bottleneck first.</td></tr>
+            <tr><td><strong>Ladder</strong></td><td>cross-encoder (bge-reranker / Cohere Rerank) → LLM listwise rerank → diversity-aware (MMR) so k results aren't five near-duplicates → recency/authority weighting</td></tr>
+            <tr><td><strong>Failures</strong></td><td>latency blowup for marginal quality · reranker trained on a different domain scoring worse than retrieval · over-filtering that drops needed context</td></tr>
+            <tr><td><strong>Metrics</strong></td><td>nDCG before vs after, added latency, answer-quality delta — <em>the deciding question is quality gained per millisecond added</em></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>context/ — assembling the prompt</h3>
+      <div class="rule-box">
+        <p>Goal: <strong>the smallest sufficient context, not the largest possible one.</strong></p>
+      </div>
+      <p>
+        Responsibilities: token budgeting (reserve room for the answer) · deduplication of near-identical
+        chunks · ordering — <strong>lost-in-the-middle is real</strong>, so put the strongest evidence
+        first and last · parent-context reconstruction · optional compression (extract only relevant
+        sentences) · relevance thresholding, dropping weak chunks rather than padding to k · clear
+        delimiting and labelling of each source so citations can reference it.
+      </p>
+      <p style="font-size:0.92rem;color:var(--ink-soft)">
+        <strong>Failures:</strong> <code>too_much_context</code> (noise drowns signal, cost balloons) ·
+        <code>insufficient_context</code> (over-trimmed) · <code>ordering_problem</code> (key evidence
+        buried mid-prompt) · context overflow silently truncating the <em>end</em>, which is often the
+        question itself.
+      </p>
+
+      <h3>grounding/ — evidence, citations, abstention</h3>
+      <ol>
+        <li><strong>Sufficiency gate (pre-generation):</strong> score whether the evidence can answer the question at all. Insufficient → abstain instead of generating. <em>Abstention is a feature, and the benchmark's "impossible" questions exist to test it.</em></li>
+        <li><strong>Citation binding (during generation):</strong> the model must attach a source id to each factual claim; the prompt enumerates sources with stable ids.</li>
+        <li><strong>Citation verification (post-generation):</strong> programmatically check that each cited span actually supports its claim. A citation that exists but doesn't support the claim is worse than none — it manufactures false confidence.</li>
+      </ol>
+      <p>
+        <strong>Contradictions:</strong> when sources disagree, surface both with provenance and state the
+        conflict. Do not silently resolve — deliberately narrow scope.
+      </p>
+      <p style="font-size:0.92rem;color:var(--ink-soft)">
+        <strong>Failures:</strong> <code>unsupported_claim</code> (hallucination with a citation attached) ·
+        citation pointing at the wrong page · over-abstention on answerable questions · under-abstention
+        on impossible ones.
+      </p>
+
+      <h3>generation/</h3>
+      <p>
+        Prompt structure, fixed and cache-friendly: system role &amp; rules → <strong>untrusted document
+        content, delimited and id-tagged</strong> → conversation history → question → output-format
+        instructions.
+      </p>
+      <p>
+        Concerns: streaming · low temperature for factual work · stop reasons handled · refusal handled ·
+        retry/fallback across models · <strong>token and cost accounting per call</strong> · deterministic
+        prompt prefixes so caching works when you move to a paid provider.
+      </p>
+      <p style="font-size:0.92rem;color:var(--ink-soft)">
+        <strong>Failures:</strong> <code>hallucination</code> · <code>incomplete_answer</code> (only part of
+        a multi-part question) · <code>reasoning_error</code> (right evidence, wrong inference) · ignoring
+        provided evidence in favour of parametric memory · format violations.
+      </p>
+
+      <h3>Scale — what changes at 10 M documents / 2,000-page files</h3>
+      <p>Designed for now, implemented when profiling demands it.</p>
+      <div class="t-wrap">
+        <table>
+          <thead><tr><th>Pressure</th><th>First thing that breaks</th><th>Response</th></tr></thead>
+          <tbody>
+            <tr><td>One 2,000-page PDF</td><td>extraction memory + wall time</td><td>stream page-by-page; checkpoint per page-range; resumable jobs; per-page progress</td></tr>
+            <tr><td>Thousands of docs</td><td>ingestion throughput</td><td>worker pool; per-format pools only when profiling shows the bottleneck</td></tr>
+            <tr><td>10 M+ chunks</td><td>vector search latency &amp; RAM</td><td>quantisation (scalar/binary), HNSW tuning, payload indexes, sharding</td></tr>
+            <tr><td>Many tenants</td><td>noisy-neighbour</td><td>per-tenant queues and quotas; ACL filters already structural</td></tr>
+            <tr><td>Re-embedding everything</td><td>downtime</td><td>blue/green collections: build alongside, atomic alias swap</td></tr>
+            <tr><td>Cost</td><td>embedding + generation spend</td><td>cache embeddings by content hash, cache identical queries, batch APIs, smaller models for non-critical roles</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- ═══════════════ 9 ═══════════════ -->
+    <section id="crosscutting">
+      <h2><span class="h-num">Section 09</span>Cross-cutting concerns &amp; the failure catalogue</h2>
+
+      <h3>Configuration &amp; secrets</h3>
+      <p>
+        Each service owns its own <code>.env</code>; no shared secrets file. Model API keys exist
+        <strong>only</strong> in the agent. All config validated at boot so a missing variable fails loudly
+        at startup, not mysteriously at 2am. <code>.env.example</code> in every service,
+        <code>.env</code> never committed.
+      </p>
+
+      <h3>Local development</h3>
+      <p>
+        A root <code>docker-compose.yml</code> brings up Postgres, Redis, Qdrant, and MinIO. The three
+        application services run on the host with hot reload — faster iteration than containerising them.
+        One <code>make dev</code> starts everything in order: infra → agent → backend → frontend.
+      </p>
+
+      <h3>The master failure taxonomy</h3>
+      <p>Every failed benchmark case gets exactly one label. This is what converts "the answer was bad" into "fix <em>this</em>".</p>
+
+      <div class="tax">
+        <div class="tax-row"><span class="cat">INGESTION_FAILURE</span><span class="kinds">extraction · ocr · reading_order · table · visual</span></div>
+        <div class="tax-row"><span class="cat">REPRESENTATION_FAILURE</span><span class="kinds">structure_lost · provenance_lost · relationship_lost</span></div>
+        <div class="tax-row"><span class="cat">CHUNKING_FAILURE</span><span class="kinds">split_mid_fact · context_orphaned · table_split · size_wrong</span></div>
+        <div class="tax-row"><span class="cat">EMBEDDING_FAILURE</span><span class="kinds">model_mismatch · truncation · domain_gap</span></div>
+        <div class="tax-row"><span class="cat">RETRIEVAL_FAILURE</span><span class="kinds">relevant_document_missed · relevant_chunk_missed · ranking_failure · keyword_blindness · semantic_drift · filter_too_strict · multi_hop_failure · temporal_confusion</span></div>
+        <div class="tax-row"><span class="cat">RERANKING_FAILURE</span><span class="kinds">reordered_wrongly · over_filtered</span></div>
+        <div class="tax-row"><span class="cat">CONTEXT_FAILURE</span><span class="kinds">too_much_context · insufficient_context · ordering_problem</span></div>
+        <div class="tax-row"><span class="cat">GENERATION_FAILURE</span><span class="kinds">hallucination · incomplete_answer · reasoning_error · ignored_evidence · format_violation</span></div>
+        <div class="tax-row"><span class="cat">GROUNDING_FAILURE</span><span class="kinds">unsupported_claim · wrong_citation · over_abstention · under_abstention</span></div>
+        <div class="tax-row"><span class="cat">GUARDRAIL_FAILURE</span><span class="kinds">injection_succeeded · pii_leaked · acl_bypass</span></div>
+        <div class="tax-row"><span class="cat">SYSTEM_FAILURE</span><span class="kinds">timeout · worker_crash · rate_limit · infrastructure · stream_interrupted</span></div>
+        <div class="tax-row"><span class="cat">UX_FAILURE</span><span class="kinds">misleading_state · lost_work · unclear_error</span></div>
+      </div>
+
+      <div class="rule-box">
+        <p>
+          <strong>Rule:</strong> a failure without a label does not get a fix attempt. Guessing is what the
+          taxonomy exists to prevent.
+        </p>
+      </div>
+
+      <h3>Security posture</h3>
+      <p>
+        Transport TLS in any deployed environment · secrets only in the agent · encryption at rest for
+        uploads · ACL enforced structurally at retrieval · every document's derived data inherits the
+        source document's ACL · deletion means the vectors go too · PII stance decided explicitly (v1:
+        <strong>out of scope, documented</strong>, not silently ignored) · prompt injection treated as a
+        first-class threat · all model output sanitised before rendering.
+      </p>
+
+      <h3>Cost &amp; latency</h3>
+      <p>
+        Measured before targeted. Recorded per query: input/output tokens, embedding calls, retrieval
+        time, rerank time, generation time, total p50/p95, cost. Tracked in the <em>same</em> harness as
+        quality, so a change that improves recall while doubling latency is a visible trade-off rather
+        than a silent regression.
+      </p>
+    </section>
+
+    <!-- ═══════════════ 10 ═══════════════ -->
+    <section id="milestones">
+      <h2><span class="h-num">Section 10</span>Build order — milestones</h2>
+      <p>Each milestone lists what gets built and what "done" means.</p>
+      <p>
+        <strong>M0–M3 are a fixed sequence</strong> — you cannot measure before something exists to
+        measure, so this much is ordered by necessity, not by evidence.
+      </p>
+      <div class="rule-box">
+        <span class="label">Everything after M3 is a gate, not a date</span>
+        <p>
+          Each capability is entered when a <em>named benchmark failure</em> demands it, and skipped or
+          deferred when it doesn't. The order shown is the likely one, not a schedule. This is the central
+          rule applied to the plan itself: an unconditional milestone would be the same mistake as an
+          unconditional feature.
+        </p>
+      </div>
+      <div class="t-wrap">
+        <table>
+          <thead><tr><th>#</th><th>Milestone</th><th>Entry condition</th></tr></thead>
+          <tbody>
+            <tr><td class="rung">M0</td><td>Skeleton chatbot</td><td><span class="chip done">mostly done</span></td></tr>
+            <tr><td class="rung">M1</td><td>Real chat product</td><td>M0 complete. Streaming + persistence. <strong>No RAG, no graph.</strong></td></tr>
+            <tr><td class="rung">M2</td><td>Dumb RAG</td><td>M1 complete. Upload → naive answer with citations. <strong>Still no graph.</strong></td></tr>
+            <tr><td class="rung">M3</td><td>The benchmark</td><td>M2 complete. Measurement exists; baseline recorded.</td></tr>
+            <tr><td colspan="3" style="text-align:center;font-style:italic;color:var(--ink-faint);font-size:0.85rem">every gate below requires a named failure in the M3 benchmark</td></tr>
+            <tr><td class="rung">G1</td><td>Retrieval intelligence</td><td><code>RETRIEVAL_FAILURE</code> is the dominant category</td></tr>
+            <tr><td class="rung">G2</td><td>Orchestration (LangGraph, routing, memory)</td><td>the graph gate opens — waste, loops, or ambiguity measured</td></tr>
+            <tr><td class="rung">G3</td><td>Grounding &amp; guardrails</td><td><code>GROUNDING_FAILURE</code>; or before any untrusted-document exposure</td></tr>
+            <tr><td class="rung">G4</td><td>Human-in-the-loop</td><td>ambiguous questions fail that a clarifying turn would fix</td></tr>
+            <tr><td class="rung">G5</td><td>Scale &amp; hardening</td><td>profiling shows a real bottleneck, or documents exceed capacity</td></tr>
+            <tr><td class="rung">P1</td><td>Frontend production pass</td><td>independent of the benchmark — gated on the product being used</td></tr>
+            <tr><td class="rung">P2</td><td>Backend production pass</td><td>independent — gated on multi-user or public exposure</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>
+        P1 and P2 are deliberately <em>not</em> benchmark-gated: auth, accessibility, and error handling
+        are correctness requirements of a product, not hypotheses about retrieval. They're sequenced by
+        when the product meets real users.
+      </p>
+
+      <div class="ms">
+        <div class="ms-head">
+          <span class="ms-id">M0</span>
+          <h3 class="ms-title" style="margin:0">Skeleton chatbot</h3>
+          <span class="chip done">essentially done</span>
+        </div>
+        <p>Three services talking; a message reaches a model and comes back.</p>
+        <ul><li><strong>Remaining:</strong> switch the agent to the OpenRouter provider (free tier) behind <code>providers/</code>.</li></ul>
+        <p class="dod"><b>Done when</b>Typing a message in the browser returns a real model answer through backend → agent.</p>
+      </div>
+
+      <div class="ms">
+        <div class="ms-head">
+          <span class="ms-id">M1</span>
+          <h3 class="ms-title" style="margin:0">Real chat product</h3>
+          <span class="chip next">next</span>
+        </div>
+        <p>
+          The chatbot becomes genuinely usable. <strong>No RAG yet</strong> — deliberately, because
+          streaming and persistence are hard enough alone and far easier to debug without retrieval in
+          the picture.
+        </p>
+        <ul>
+          <li><strong>No LangGraph, no memory subsystem.</strong> The orchestrator is <code>handle_turn()</code> — a function</li>
+          <li>Postgres + Alembic; conversations and messages persisted</li>
+          <li>SSE streaming end-to-end, Stop button, cancellation propagated</li>
+          <li>Frontend state architecture installed (TanStack Query + Zustand + stream hook)</li>
+          <li>Conversation list, switching, rename, delete; history survives refresh</li>
+          <li>Error taxonomy implemented; markdown rendering + sanitisation</li>
+          <li>Docker-compose for infra</li>
+        </ul>
+        <p class="dod"><b>Done when</b>You can hold a multi-turn conversation, watch tokens stream, stop mid-answer, refresh the page, and find the conversation intact.</p>
+      </div>
+
+      <div class="ms">
+        <div class="ms-head">
+          <span class="ms-id">M2</span>
+          <h3 class="ms-title" style="margin:0">Dumb RAG</h3>
+          <span class="chip later">planned</span>
+        </div>
+        <p>Deliberately naive. Its purpose is to make the pipeline <em>real</em> and produce the first failures worth measuring.</p>
+        <ul>
+          <li>Upload → object storage → job queue → agent worker</li>
+          <li>PDF text extraction → fixed-size chunking → one embedding model → Qdrant</li>
+          <li>Retrieval: dense only, top-k. No hybrid, no rerank, no query rewriting</li>
+          <li><strong><code>rag_engine.api</code> exists from this milestone</strong> — the orchestrator calls <code>answer()</code> and nothing else. Even naive, the boundary is real from day one</li>
+          <li><strong>Still no graph.</strong> The orchestrator remains a function</li>
+          <li>Generation with retrieved context + citations; abstain if nothing retrieved</li>
+          <li>Frontend: upload zone, per-file progress, status polling, document list, citation cards</li>
+        </ul>
+        <p class="dod"><b>Done when</b>You upload a PDF, ask a question about it, and get an answer citing a real page. Expect it to be mediocre — that is the point.</p>
+      </div>
+
+      <div class="ms">
+        <div class="ms-head">
+          <span class="ms-id">M3</span>
+          <h3 class="ms-title" style="margin:0">The benchmark</h3>
+          <span class="chip later">planned</span>
+        </div>
+        <p>Now the naive system exists, an honest exam can be written against it.</p>
+        <ul>
+          <li>30–50 questions over 5–10 real documents, with the full metadata schema (type, difficulty, gold answer, gold evidence, answerable, modality)</li>
+          <li><code>rag_suite</code> calls <code>rag_engine.api</code> <strong>directly, with no chatbot in the loop</strong> — this is what makes the retrieval numbers honest</li>
+          <li>Automatic retrieval metrics (Recall@K, Precision@K, MRR, nDCG), sliced by question type</li>
+          <li>LLM-judge for answer quality, <strong>calibrated</strong> against ~15–20 hand-scored answers</li>
+          <li>Citation accuracy and abstention correctness</li>
+          <li><strong>Record the baseline</strong> — the number every future change is measured against</li>
+          <li>One command runs the suite and prints a comparison to baseline</li>
+        </ul>
+        <p class="dod"><b>Done when</b>The runner produces a scorecard with a per-failure-type breakdown, and you know exactly which layer is your worst. This is the moment the project stops being vibes-based — everything after is benchmark-gated.</p>
+      </div>
+
+      <div class="ms">
+        <div class="ms-head">
+          <span class="ms-id">G1</span>
+          <h3 class="ms-title" style="margin:0">Retrieval intelligence</h3>
+          <span class="chip later">gated</span>
+        </div>
+        <p><strong>Gate:</strong> <code>RETRIEVAL_FAILURE</code> is the dominant category in the M3 baseline. It usually is — which is why this is listed first rather than orchestration.</p>
+        <p>Climb the Section 08 ladder one rung at a time. For each: form the hypothesis from a <em>named</em> failure, run the experiment, keep it if it helps, delete it if it doesn't, and <strong>write the result down</strong> in <code>docs/experiments/</code>.</p>
+        <p>Likely order: hybrid (BM25 + RRF) → reranking → contextual chunking/retrieval → query transformation → parent–child → multi-hop.</p>
+        <p>All of this happens <strong>inside <code>rag_engine/</code></strong>. The orchestrator doesn't change, and neither does <code>rag_engine.api</code> — that's the boundary paying for itself.</p>
+        <p class="dod"><b>Done when</b>Each retained technique has a written experiment note showing its benchmark delta, and each rejected one has a note saying why.</p>
+      </div>
+
+      <div class="ms">
+        <div class="ms-head">
+          <span class="ms-id">G2</span>
+          <h3 class="ms-title" style="margin:0">Orchestration — LangGraph, routing, memory</h3>
+          <span class="chip later">gated</span>
+        </div>
+        <p><strong>Gate:</strong> measured retrieval waste on no-retrieval messages, questions a reformulated second attempt would answer, or a requirement for interruption. <strong>Not</strong> "we will eventually want a graph."</p>
+        <ul>
+          <li>Migrate <code>chat_orchestrator/pipeline.py</code> from a function to a LangGraph graph</li>
+          <li>Conditional routing; retry-with-new-question loop</li>
+          <li>Redis checkpointer; short-term memory with a compaction strategy</li>
+          <li><code>status</code> SSE events driven by real graph stages</li>
+          <li>LangSmith/Langfuse tracing across orchestrator nodes</li>
+          <li><code>chat_suite</code> becomes meaningful; add multi-turn cases</li>
+        </ul>
+        <p>Long-term memory (semantic, episodic, procedural) is a <strong>separate sub-gate</strong> — entered only when conversations demonstrably need cross-session recall, with the write policy and user-visible memory panel.</p>
+        <p class="dod"><b>Done when</b>The <code>rag_suite</code> score is unchanged — orchestration must not degrade retrieval — <code>chat_suite</code> improves, and every answer has an inspectable two-part trace.</p>
+      </div>
+
+      <div class="ms">
+        <div class="ms-head">
+          <span class="ms-id">G3</span>
+          <h3 class="ms-title" style="margin:0">Grounding &amp; guardrails</h3>
+          <span class="chip later">gated</span>
+        </div>
+        <p><strong>Gate:</strong> <code>GROUNDING_FAILURE</code> appears in the benchmark — <em>or</em>, unconditionally, before any untrusted document reaches the system. The four structural invariants are not benchmark-gated; they are preconditions for exposure.</p>
+        <ul>
+          <li>The four structural invariants implemented, each covered by its adversarial test</li>
+          <li>Citation verification (claim ↔ span), grounding checks, calibrated abstention</li>
+          <li>Contradiction surfacing with provenance</li>
+          <li>Optional: injection classifier wired as <em>monitoring</em> — logged and counted, never load-bearing</li>
+        </ul>
+        <p class="dod"><b>Done when</b>The benchmark's <em>impossible</em> questions are abstained on correctly, its <em>contradiction</em> questions surface both sources, a planted injection changes no behaviour, and a planted tool-call instruction in a document triggers nothing.</p>
+      </div>
+
+      <div class="ms">
+        <div class="ms-head">
+          <span class="ms-id">G4</span>
+          <h3 class="ms-title" style="margin:0">Human-in-the-loop</h3>
+          <span class="chip later">gated</span>
+        </div>
+        <p><strong>Gate:</strong> ambiguous questions fail in the benchmark that a clarifying turn would fix. Requires G2 (checkpoints).</p>
+        <p>Clarifying questions via <code>interrupt()</code>; the <code>interrupt</code> SSE event and approval card; approval gates on any destructive tool.</p>
+        <p class="dod"><b>Done when</b>An ambiguous benchmark question produces a clarifying turn and, once answered, a correct result — with the run resumed from its checkpoint rather than restarted.</p>
+      </div>
+
+      <div class="ms">
+        <div class="ms-head">
+          <span class="ms-id">G5</span>
+          <h3 class="ms-title" style="margin:0">Scale &amp; hardening</h3>
+          <span class="chip later">gated</span>
+        </div>
+        <p><strong>Gate:</strong> profiling shows a real bottleneck, or real documents exceed current capacity. Not before.</p>
+        <p>Per-page checkpointed extraction for 2,000-page files · resumable, idempotent jobs · dead-letter queue with an inspection path · worker pools sized by profiling · vector quantisation + HNSW tuning + payload indexes · blue/green reindex with alias swap · cost/latency dashboards · load testing · a backup/restore drill.</p>
+        <p class="dod"><b>Done when</b>A 2,000-page PDF ingests without manual intervention and survives a mid-job worker kill; p95 query latency and cost/query meet the targets set against the M3 baseline.</p>
+      </div>
+
+      <div class="ms">
+        <div class="ms-head">
+          <span class="ms-id">P1</span>
+          <h3 class="ms-title" style="margin:0">Frontend production pass</h3>
+          <span class="chip later">when users arrive</span>
+        </div>
+        <p><strong>Gate:</strong> not benchmark-driven — entered when the product meets real users.</p>
+        <p>Virtualised lists · skeletons everywhere · optimistic updates with rollback · full a11y pass · light/dark with no theme flash · mobile layout · source panel with document preview · message actions · draft persistence · Sentry + Web Vitals · Vitest unit tests (SSE parser included) + MSW + two Playwright journeys.</p>
+        <p class="dod"><b>Done when</b>Both critical journeys pass in Playwright, Lighthouse a11y is ~100, and no interaction lacks a defined loading/error state.</p>
+      </div>
+
+      <div class="ms">
+        <div class="ms-head">
+          <span class="ms-id">P2</span>
+          <h3 class="ms-title" style="margin:0">Backend production pass</h3>
+          <span class="chip later">on exposure</span>
+        </div>
+        <p><strong>Gate:</strong> not benchmark-driven — entered on multi-user or public exposure.</p>
+        <p>Auth (session cookies, <code>current_user</code> dependency, internal token for the agent) · rate limiting · quotas surfaced via <code>/api/me</code> · idempotency keys · the concurrency mitigations from Section 06 · OpenTelemetry tracing across all three services · structured logs · pytest suite with a real test DB.</p>
+        <p class="dod"><b>Done when</b>Two browsers with different users cannot see each other's data, a double-click cannot double-charge, and one trace id explains any slow request end to end.</p>
+      </div>
+
+      <div class="summary">
+        <h3>The shortest possible summary</h3>
+        <dl>
+          <div>
+            <dt>Three services</dt>
+            <dd>Frontend never touches the agent; backend never touches an LLM.</dd>
+          </div>
+          <div>
+            <dt>Two subsystems inside the agent</dt>
+            <dd><code>rag_engine/</code> is stateless and conversation-blind; <code>chat_orchestrator/</code> owns memory, routing, and turns. The interface between them is two functions.</dd>
+          </div>
+          <div>
+            <dt>Two pipelines</dt>
+            <dd>Ingest — async, queued, in the agent's workers. Chat — streamed, real-time.</dd>
+          </div>
+          <div>
+            <dt>Four stores</dt>
+            <dd>Postgres (control plane) · object storage (bytes) · Qdrant (vectors) · Redis (queue, cache, checkpoints).</dd>
+          </div>
+          <div>
+            <dt>Security is structural</dt>
+            <dd>Four testable invariants; classifiers are monitoring, never defence.</dd>
+          </div>
+          <div>
+            <dt>One rule</dt>
+            <dd>Nothing is built beyond the current step without the benchmark naming the failure it fixes — and that applies to the milestones themselves, which is why everything after M3 is a gate, not a date.</dd>
+          </div>
+          <div>
+            <dt>Order</dt>
+            <dd>Working chatbot → dumb RAG → <strong>benchmark</strong> → then whichever gate the baseline opens.</dd>
+          </div>
+        </dl>
+      </div>
+    </section>
+
+  </main>
+</div>
+
+<script>
+  (function () {
+    var links = Array.prototype.slice.call(document.querySelectorAll('.toc a'));
+    var map = {};
+    links.forEach(function (a) {
+      var id = a.getAttribute('href').slice(1);
+      var el = document.getElementById(id);
+      if (el) map[id] = a;
+    });
+
+    var current = null;
+    function setActive(id) {
+      if (id === current) return;
+      current = id;
+      links.forEach(function (a) { a.classList.remove('active'); });
+      if (map[id]) map[id].classList.add('active');
+    }
+
+    if ('IntersectionObserver' in window) {
+      var visible = {};
+      var obs = new IntersectionObserver(function (entries) {
+        entries.forEach(function (e) {
+          visible[e.target.id] = e.isIntersecting ? e.intersectionRatio : 0;
+        });
+        var best = null, bestRatio = 0;
+        Object.keys(visible).forEach(function (id) {
+          if (visible[id] > bestRatio) { bestRatio = visible[id]; best = id; }
+        });
+        if (best) setActive(best);
+      }, { rootMargin: '-10% 0px -60% 0px', threshold: [0, 0.25, 0.5, 1] });
+
+      Object.keys(map).forEach(function (id) {
+        obs.observe(document.getElementById(id));
+      });
+    }
+  })();
+</script>

@@ -6,6 +6,7 @@ import { ChatWindow } from "@/components/chat/ChatWindow";
 import { ChatInput } from "@/components/chat/ChatInput";
 import { useChat } from "@/hooks/useChat";
 import { getConversations } from "@/services/chat";
+import { MOCK_MODE } from "@/services/api";
 import type { Conversation } from "@/types";
 
 export default function ChatPage() {
@@ -77,11 +78,18 @@ export default function ChatPage() {
             )}
           </div>
 
-          {/* Mock mode pill */}
-          <div className="ml-auto flex items-center gap-1.5 rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 text-xs text-amber-700">
-            <span className="h-1.5 w-1.5 rounded-full bg-amber-400 animate-pulse" />
-            Mock mode
-          </div>
+          {/* Connection status pill */}
+          {MOCK_MODE ? (
+            <div className="ml-auto flex items-center gap-1.5 rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 text-xs text-amber-700">
+              <span className="h-1.5 w-1.5 rounded-full bg-amber-400 animate-pulse" />
+              Mock mode
+            </div>
+          ) : (
+            <div className="ml-auto flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-xs text-emerald-700">
+              <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
+              Live
+            </div>
+          )}
         </header>
 
         {/* Chat window */}

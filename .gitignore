@@ -1,0 +1,53 @@
+﻿# ─── Environment ─────────────────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+
+# ─── Dependencies ─────────────────────────────────────────────────────────────
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# ─── Build outputs ────────────────────────────────────────────────────────────
+dist/
+build/
+.output/
+out/
+.next/
+
+# ─── Cache ────────────────────────────────────────────────────────────────────
+.cache/
+.turbo/
+.parcel-cache/
+*.tsbuildinfo
+
+# ─── Logs ─────────────────────────────────────────────────────────────────────
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ─── IDE / OS ─────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Benchmark data (populated separately, not committed) ─────────────────────
+benchmark/documents/
+benchmark/questions/
+benchmark/gold/
+benchmark/results/
+
+# Frontend env (must not be committed)
+frontend/.env
+frontend/.env.local
+frontend/.env.*.local
