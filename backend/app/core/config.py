@@ -14,6 +14,14 @@ class Settings(BaseSettings):
         default="http://localhost:3000", alias="FRONTEND_ORIGIN"
     )
 
+    # ── Agent service ─────────────────────────────────────────────────────────
+    # The backend calls the agent over HTTP. All model config — API key,
+    # model, prompt — lives in the agent, not here.
+    agent_base_url: str = Field(
+        default="http://localhost:8001", alias="AGENT_BASE_URL"
+    )
+    agent_timeout: float = Field(default=120.0, alias="AGENT_TIMEOUT")
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
