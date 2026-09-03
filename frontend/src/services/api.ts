@@ -1,17 +1,11 @@
-﻿/**
+/**
  * api.ts — Base API client
  *
- * All HTTP calls go through here. The base URL is read from the environment,
- * never hardcoded. Swap the mock flag to false when the backend is ready.
+ * Every HTTP call goes through here. The base URL comes from the environment,
+ * never hardcoded.
  */
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000";
-
-/**
- * Set NEXT_PUBLIC_MOCK_MODE=true to use canned mock data instead of the real
- * backend. Defaults to false — real chat messages go to the FastAPI backend.
- */
-export const MOCK_MODE = process.env.NEXT_PUBLIC_MOCK_MODE === "true";
 
 class ApiClient {
   private baseUrl: string;
@@ -33,15 +27,6 @@ class ApiClient {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
-    });
-    if (!res.ok) throw new Error(`POST ${path} failed: ${res.statusText}`);
-    return res.json() as Promise<T>;
-  }
-
-  async postFormData<T>(path: string, formData: FormData): Promise<T> {
-    const res = await fetch(`${this.baseUrl}${path}`, {
-      method: "POST",
-      body: formData,
     });
     if (!res.ok) throw new Error(`POST ${path} failed: ${res.statusText}`);
     return res.json() as Promise<T>;

@@ -1,4 +1,4 @@
-﻿// EmptyState — shown before any messages exist
+// EmptyState — shown before any messages exist
 
 interface EmptyStateProps {
   onPromptClick: (prompt: string) => void;
@@ -52,10 +52,6 @@ export function EmptyState({ onPromptClick }: EmptyStateProps) {
           </button>
         ))}
       </div>
-
-      <p className="text-xs text-neutral-400">
-        🔒 RAG engine not yet connected — running in mock mode
-      </p>
     </div>
   );
 }

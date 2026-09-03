@@ -1,30 +1,30 @@
-﻿"use client";
+"use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { Sidebar } from "@/components/layout/Sidebar";
 import { ChatWindow } from "@/components/chat/ChatWindow";
 import { ChatInput } from "@/components/chat/ChatInput";
 import { useChat } from "@/hooks/useChat";
 import { getConversations } from "@/services/chat";
-import { MOCK_MODE } from "@/services/api";
 import type { Conversation } from "@/types";
 
 export default function ChatPage() {
   const { messages, conversation, isLoading, error, submit, startNewConversation } = useChat();
   const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [conversations, setConversations] = useState<Conversation[]>([]);
+  const [storedConversations, setStoredConversations] = useState<Conversation[]>([]);
 
   // Load conversation list on mount
   useEffect(() => {
-    getConversations().then(setConversations).catch(console.error);
+    getConversations().then(setStoredConversations).catch(console.error);
   }, []);
 
-  // When a new conversation is created, add it to the sidebar list
-  useEffect(() => {
-    if (conversation && !conversations.find((c) => c.id === conversation.id)) {
-      setConversations((prev) => [conversation, ...prev]);
-    }
-  }, [conversation, conversations]);
+  // The active conversation may not be stored yet (it is created client-side),
+  // so derive the sidebar list rather than syncing it into state.
+  const conversations = useMemo(() => {
+    if (!conversation) return storedConversations;
+    const known = storedConversations.some((c) => c.id === conversation.id);
+    return known ? storedConversations : [conversation, ...storedConversations];
+  }, [conversation, storedConversations]);
 
   const handleSubmit = async (content: string) => {
     await submit(content);
@@ -78,18 +78,7 @@ export default function ChatPage() {
             )}
           </div>
 
-          {/* Connection status pill */}
-          {MOCK_MODE ? (
-            <div className="ml-auto flex items-center gap-1.5 rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 text-xs text-amber-700">
-              <span className="h-1.5 w-1.5 rounded-full bg-amber-400 animate-pulse" />
-              Mock mode
-            </div>
-          ) : (
-            <div className="ml-auto flex items-center gap-1.5 rounded-full border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-xs text-emerald-700">
-              <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-              Live
-            </div>
-          )}
+
         </header>
 
         {/* Chat window */}

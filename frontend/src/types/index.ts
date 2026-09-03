@@ -1,4 +1,4 @@
-﻿// ─── Core domain types for myRAG ─────────────────────────────────────────────
+// ─── Core domain types for myRAG ─────────────────────────────────────────────
 
 // ── Chat ─────────────────────────────────────────────────────────────────────
 
@@ -29,26 +29,6 @@ export interface Conversation {
   createdAt: string;
   updatedAt: string;
   messageCount: number;
-}
-
-// ── Documents ─────────────────────────────────────────────────────────────────
-
-export type DocumentStatus =
-  | "idle"
-  | "uploading"
-  | "processing"
-  | "ready"
-  | "error";
-
-export interface UploadedDocument {
-  id: string;
-  name: string;
-  size: number;           // bytes
-  mimeType: string;
-  status: DocumentStatus;
-  errorMessage?: string;
-  uploadedAt: string;
-  processedAt?: string;
 }
 
 // ── API ───────────────────────────────────────────────────────────────────────

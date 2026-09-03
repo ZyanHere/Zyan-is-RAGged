@@ -1,11 +1,7 @@
-﻿"use client";
+"use client";
 
-import { useEffect, useState } from "react";
 import { cn } from "@/lib/utils";
-import { UploadZone } from "@/components/documents/UploadZone";
-import { useDocumentUpload } from "@/hooks/useDocumentUpload";
-import { getDocuments } from "@/services/documents";
-import type { Conversation, UploadedDocument } from "@/types";
+import type { Conversation } from "@/types";
 
 interface SidebarProps {
   conversations: Conversation[];
@@ -24,25 +20,6 @@ export function Sidebar({
   isOpen,
   onClose,
 }: SidebarProps) {
-  const [initialDocs, setInitialDocs] = useState<UploadedDocument[]>([]);
-
-  useEffect(() => {
-    getDocuments().then(setInitialDocs).catch(console.error);
-  }, []);
-
-  const {
-    documents,
-    isDragOver,
-    isUploading,
-    uploadError,
-    handleDrop,
-    handleDragOver,
-    handleDragLeave,
-    handleFileSelect,
-    clearError,
-    inputRef,
-  } = useDocumentUpload(initialDocs);
-
   return (
     <>
       {/* Mobile overlay */}
@@ -99,7 +76,11 @@ export function Sidebar({
         {/* Scrollable content */}
         <div className="flex-1 overflow-y-auto px-3 py-2 flex flex-col gap-4">
           {/* Conversations */}
-          {conversations.length > 0 && (
+          {conversations.length === 0 ? (
+            <p className="px-1 py-2 text-xs text-neutral-400">
+              No conversations yet. Start a new chat.
+            </p>
+          ) : (
             <div>
               <p className="mb-1.5 px-1 text-xs font-medium uppercase tracking-wide text-neutral-400">
                 Recent
@@ -122,32 +103,6 @@ export function Sidebar({
               </nav>
             </div>
           )}
-
-          {/* Documents */}
-          <div>
-            <p className="mb-1.5 px-1 text-xs font-medium uppercase tracking-wide text-neutral-400">
-              Documents
-            </p>
-            <UploadZone
-              documents={documents}
-              isDragOver={isDragOver}
-              isUploading={isUploading}
-              uploadError={uploadError}
-              onDrop={handleDrop}
-              onDragOver={handleDragOver}
-              onDragLeave={handleDragLeave}
-              onFileSelect={handleFileSelect}
-              onClearError={clearError}
-              inputRef={inputRef}
-            />
-          </div>
-        </div>
-
-        {/* Footer */}
-        <div className="border-t border-neutral-200 px-4 py-3">
-          <p className="text-xs text-neutral-400 text-center">
-            Mock mode — backend not connected
-          </p>
         </div>
       </aside>
     </>
