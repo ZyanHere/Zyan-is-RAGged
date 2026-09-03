@@ -31,9 +31,9 @@ class Settings(BaseSettings):
     chat_system_prompt: str = Field(
         default=(
             "You are myRAG, a helpful assistant. Answer clearly and concisely. "
-            "You do not yet have access to the user's uploaded documents — "
-            "document retrieval will be added later — so answer from general "
-            "knowledge and say so if a question would require their documents."
+            # "You do not yet have access to the user's uploaded documents — "
+            # "document retrieval will be added later — so answer from general "
+            # "knowledge and say so if a question would require their documents."
         ),
         alias="CHAT_SYSTEM_PROMPT",
     )

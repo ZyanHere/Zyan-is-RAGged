@@ -59,17 +59,19 @@ class OpenRouterChatModel:
             )
         except openai.AuthenticationError as exc:
             raise ProviderError(
-                "OpenRouter rejected the API key. Check OPENROUTER_API_KEY in agent/.env."
+                "OpenRouter rejected the API key. Check OPENROUTER_API_KEY in "
+                f"agent/.env. Provider said: {exc}"
             ) from exc
         except openai.NotFoundError as exc:
             raise ProviderError(
                 f"Model '{self.model}' was not found. Free model ids change — "
-                "verify it at https://openrouter.ai/models."
+                f"verify it at https://openrouter.ai/models. Provider said: {exc}"
             ) from exc
         except openai.RateLimitError as exc:
             raise ProviderError(
-                "OpenRouter rate limit hit. The free tier allows only a few "
-                "requests per minute — wait and retry."
+                "OpenRouter rate limited this request. This can mean the "
+                "per-minute cap, the daily free-tier quota, or the model being "
+                f"at upstream capacity. Provider said: {exc}"
             ) from exc
         except openai.APIError as exc:
             raise ProviderError(f"OpenRouter request failed: {exc}") from exc
