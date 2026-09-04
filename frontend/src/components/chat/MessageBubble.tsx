@@ -1,4 +1,4 @@
-﻿import { cn } from "@/lib/utils";
+import { cn } from "@/lib/utils";
 import { CitationCard } from "./CitationCard";
 import type { Message } from "@/types";
 
@@ -29,6 +29,14 @@ export function MessageBubble({ message }: MessageBubbleProps) {
           )}
         >
           {message.content}
+          {/* Caret while text is still arriving, so a pause reads as "thinking"
+              rather than "finished". */}
+          {message.isStreaming && (
+            <span
+              className="ml-0.5 inline-block h-4 w-[2px] translate-y-0.5 bg-neutral-500 animate-pulse"
+              aria-hidden="true"
+            />
+          )}
         </div>
 
         {/* Citations */}

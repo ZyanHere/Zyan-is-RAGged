@@ -9,7 +9,18 @@ import { getConversations } from "@/services/chat";
 import type { Conversation } from "@/types";
 
 export default function ChatPage() {
-  const { messages, conversation, isLoading, error, submit, startNewConversation } = useChat();
+  const {
+    messages,
+    streamingContent,
+    conversation,
+    isLoading,
+    isStreaming,
+    isReasoning,
+    error,
+    submit,
+    stop,
+    startNewConversation,
+  } = useChat();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [storedConversations, setStoredConversations] = useState<Conversation[]>([]);
 
@@ -84,7 +95,9 @@ export default function ChatPage() {
         {/* Chat window */}
         <ChatWindow
           messages={messages}
+          streamingContent={streamingContent}
           isLoading={isLoading}
+          isReasoning={isReasoning}
           error={error}
           onPromptClick={handleSubmit}
         />
@@ -94,7 +107,8 @@ export default function ChatPage() {
           <div className="mx-auto max-w-2xl">
             <ChatInput
               onSubmit={handleSubmit}
-              isLoading={isLoading}
+              onStop={stop}
+              isStreaming={isStreaming}
             />
             <p className="mt-2 text-center text-xs text-neutral-400">
               myRAG can make mistakes. Verify important information.

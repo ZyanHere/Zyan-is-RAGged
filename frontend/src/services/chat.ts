@@ -5,7 +5,8 @@
  */
 
 import { apiClient } from "./api";
-import type { Conversation, Message, SendMessageRequest } from "@/types";
+import { parseSseStream } from "@/lib/sse";
+import type { Conversation, SendMessageRequest } from "@/types";
 
 /**
  * Conversations are not persisted yet — the backend keeps history in memory,
@@ -31,7 +32,67 @@ export async function createConversation(title?: string): Promise<Conversation> 
   };
 }
 
-export async function sendMessage(req: SendMessageRequest): Promise<Message> {
-  const res = await apiClient.post<{ message: Message }>("/api/chat", req);
-  return res.message;
+export interface StreamHandlers {
+  /** Fired once, before any text. Carries the id the server assigned. */
+  onStart?: (info: { messageId: string; createdAt: string }) => void;
+  /** Fired for each piece of answer text. Append, do not replace. */
+  onToken: (text: string) => void;
+  /**
+   * Fired while a reasoning model is thinking out loud. This is not part of
+   * the answer — without it the UI would sit silent for many seconds and look
+   * hung, because reasoning models emit no answer text until they finish.
+   */
+  onReasoning?: (text: string) => void;
+  /** The server reported a failure — possibly after some text already arrived. */
+  onError?: (message: string, retryable: boolean) => void;
+  /** Generation finished normally. */
+  onDone?: () => void;
+}
+
+/**
+ * Send a message and stream the reply.
+ *
+ * Resolves when the stream ends. Rejects with an AbortError if `signal` is
+ * aborted — callers should treat that as "the user pressed Stop", not a failure.
+ */
+export async function streamMessage(
+  req: SendMessageRequest,
+  handlers: StreamHandlers,
+  signal?: AbortSignal
+): Promise<void> {
+  const body = await apiClient.postStream("/api/chat", req, signal);
+
+  for await (const event of parseSseStream(body)) {
+    let data: Record<string, unknown> = {};
+    try {
+      data = JSON.parse(event.data) as Record<string, unknown>;
+    } catch {
+      // A malformed payload should not kill the whole stream.
+      continue;
+    }
+
+    switch (event.event) {
+      case "start":
+        handlers.onStart?.({
+          messageId: String(data.messageId ?? crypto.randomUUID()),
+          createdAt: String(data.createdAt ?? new Date().toISOString()),
+        });
+        break;
+      case "token":
+        if (typeof data.text === "string") handlers.onToken(data.text);
+        break;
+      case "reasoning":
+        if (typeof data.text === "string") handlers.onReasoning?.(data.text);
+        break;
+      case "error":
+        handlers.onError?.(
+          String(data.message ?? "The assistant failed to respond."),
+          Boolean(data.retryable ?? true)
+        );
+        break;
+      case "done":
+        handlers.onDone?.();
+        break;
+    }
+  }
 }
