@@ -32,7 +32,7 @@ step without a named reason.* These files are where the "named reason" waits.
 
 | # | Title | Status | Trigger |
 |---|---|---|---|
-| [001](001-conversation-history-growth.md) | Conversation history grows unboundedly | deferred | context-window error, or moving to a paid provider |
+| [001](001-conversation-history-growth.md) | Conversation history grows unboundedly | deferred | answers get vague in long chats; or a smaller-context / paid model |
 
 ## How to use this
 

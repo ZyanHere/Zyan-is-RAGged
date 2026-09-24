@@ -11,3 +11,6 @@ __pycache__/
 .venv/
 venv/
 env/
+
+# Local vector store (Qdrant embedded mode writes here)
+qdrant_data/

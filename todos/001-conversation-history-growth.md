@@ -2,11 +2,20 @@
 
 **Status:** deferred
 **Trigger:** any of —
-- a conversation fails with a context-length error from the provider
-- we move to a paid provider (cost becomes real, and prompt caching becomes available)
+- **answers get vague or self-contradictory in long conversations** (quality
+  degradation, see "lost in the middle" below) — this is the realistic trigger,
+  and it arrives long before the hard limit
+- we move to a model with a smaller context window (paid models are often
+  128K-200K, not 1M)
+- we move to a paid provider (cost becomes real, and prompt caching becomes
+  available)
 - the benchmark (M3) starts running multi-turn cases
-**Milestone:** most likely G2 (orchestration/memory); possibly earlier if the wall is hit
+- a conversation fails with a context-length error (the hard wall — unlikely to
+  be what we hit first)
+**Milestone:** most likely G2 (orchestration/memory)
 **Filed:** 2026-09-02
+**Updated:** 2026-09-03 — measured against the running model; added the three
+failure curves and revised which trigger fires first
 
 ---
 
@@ -46,20 +55,57 @@ turns. **OpenRouter's free tier does not offer prompt caching**, which is a
 concrete reason to move to a paid provider before running the benchmark
 repeatedly.
 
-### The harder wall: the context window
+### It fails in three ways, at three different points
 
-Cost degrades gracefully. The context limit does not — it fails outright, and
-every retry re-sends the same oversized payload, so the conversation becomes
-permanently unusable.
+Measured against `nvidia/nemotron-3.5-lightning:free` (1M context), which is
+what the agent currently runs.
+
+**1. Quality degrades gradually — "lost in the middle" (hits first)**
+
+Everything is still in the input, but *present in the context* is not the same
+as *reliably used*. Models attend best to the beginning and end of a long
+context and worst to the middle. By turn 400, a fact stated at turn 180 sits in
+the least-attended region.
+
+There is no error. The assistant just gets vaguer, misses details, and
+contradicts things it said earlier. Experienced as "it got dumber."
+
+This is the same reason `rag_engine/context/` has an ordering responsibility:
+strongest evidence first and last, never buried in the middle.
+
+**2. Cost and latency grow quadratically**
+
+| Turn | Sent that turn | Cumulative input |
+|-----:|---------------:|-----------------:|
+| 10 | 4,300 | 22,300 |
+| 100 | 45,700 | 2,293,000 |
+| 500 | 229,700 | 57,465,000 |
+| 1,000 | 459,700 | **229,930,000** |
+
+A 1,000-turn conversation pushes ~230M input tokens through the API. At Sonnet
+5 rates that is roughly **$460 for one conversation** (far less with prompt
+caching, but the shape of the curve does not change). Latency tracks it — a
+460K-token request is meaningfully slower than a 4K one.
+
+**3. The hard wall (hits last)**
 
 | Context window | Conversation dies around |
 |---|---|
-| 32K (common on free models) | **~70 turns** |
-| 128K | ~278 turns |
-| 1M | ~2,000 turns |
+| 1M — `nemotron-3.5-lightning` (current) | **~2,165 turns** |
+| 262K — `gemma-4` | ~561 turns |
+| 32K — older free tiers | ~62 turns |
 
-There is currently **no guard for this**. The failure will surface as an opaque
-provider error, not a helpful message.
+(Assumes system 100, user 60, assistant 400 tokens per turn, and 4,096 reserved
+for output — output shares the same window as input.)
+
+The failure is worse than it sounds: **the conversation becomes permanently
+unusable.** Every retry re-sends the same oversized payload and fails
+identically. There is no recovery without discarding history, and the code has
+no mechanism to do that.
+
+Note how much the model choice moved this: switching from a 32K free model to
+the 1M one pushed the wall from ~62 turns to ~2,165. That is why failure mode 1,
+not 3, is the realistic trigger.
 
 ---
 
@@ -69,11 +115,17 @@ Three honest reasons:
 
 1. **The cost today is $0.** Free tier. The quadratic curve is real but the
    multiplier is zero.
-2. **We will not hit 70 turns while testing.** Manual testing runs 3-10 turns.
+2. **The hard wall is ~2,165 turns away** on the current model, and
+   conversations do not survive a backend restart anyway (in-memory dict), so
+   in practice no conversation gets near it.
 3. **Building it now would be building ahead of evidence** — the exact thing
    the project's central rule forbids. We do not yet know whether a sliding
    window or summarisation is right, because we have no benchmark showing which
    failure actually occurs.
+
+What *would* change this: quality degradation (failure mode 1) is subjective
+and has no error message, so it needs the benchmark's multi-turn cases to
+detect reliably. That is the honest reason to wait for M3 rather than guess.
 
 Deferring is the correct decision. It stops being correct the moment a trigger
 fires.
@@ -124,6 +176,9 @@ This one item touches most of the memory topics in the design doc:
   that get called "memory".
 - **Token counting** — measuring before sending, rather than discovering the
   limit by hitting it.
+- **Lost in the middle** — why a bigger context window does not straightforwardly
+  mean better recall, and why ordering the prompt is a real design decision
+  rather than cosmetic.
 
 Related: design doc section 7.5 (Memory — all four kinds), which places this in
 the wider map.
