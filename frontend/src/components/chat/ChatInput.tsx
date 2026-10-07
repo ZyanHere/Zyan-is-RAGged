@@ -1,22 +1,35 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
+
 import { cn } from "@/lib/utils";
 
 interface ChatInputProps {
-  onSubmit: (content: string) => void;
-  /** Abort the in-flight reply. */
-  onStop: () => void;
-  /** True from submit until the stream ends. */
-  isStreaming: boolean;
+  onSubmit: (question: string) => void;
+  /** A question is in flight. */
+  isBusy: boolean;
   disabled?: boolean;
+  placeholder?: string;
 }
 
-export function ChatInput({ onSubmit, onStop, isStreaming, disabled }: ChatInputProps) {
+/**
+ * The question composer.
+ *
+ * The Stop button is gone. In v0 it aborted an SSE stream, which genuinely
+ * stopped generation. With a single JSON response there is nothing to abort
+ * usefully — the work is already happening on the server, so cancelling the
+ * request would hide the answer without saving the cost. A disabled input and a
+ * spinner is the honest signal.
+ */
+export function ChatInput({
+  onSubmit,
+  isBusy,
+  disabled,
+  placeholder,
+}: ChatInputProps) {
   const [value, setValue] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
-  // Auto-resize textarea
   useEffect(() => {
     const el = textareaRef.current;
     if (!el) return;
@@ -24,9 +37,11 @@ export function ChatInput({ onSubmit, onStop, isStreaming, disabled }: ChatInput
     el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
   }, [value]);
 
+  const isBlocked = isBusy || disabled;
+
   const handleSubmit = () => {
     const trimmed = value.trim();
-    if (!trimmed || isStreaming || disabled) return;
+    if (!trimmed || isBlocked) return;
     onSubmit(trimmed);
     setValue("");
   };
@@ -38,53 +53,60 @@ export function ChatInput({ onSubmit, onStop, isStreaming, disabled }: ChatInput
     }
   };
 
-  const canSubmit = value.trim().length > 0 && !isStreaming && !disabled;
+  const canSubmit = value.trim().length > 0 && !isBlocked;
 
   return (
-    <div className="flex items-end gap-3 rounded-2xl border border-neutral-200 bg-white px-4 py-3 shadow-sm focus-within:border-blue-400 focus-within:ring-2 focus-within:ring-blue-100 transition-all">
+    <div className="flex items-end gap-3 rounded-2xl border border-neutral-200 bg-white px-4 py-3 shadow-sm transition-all focus-within:border-blue-400 focus-within:ring-2 focus-within:ring-blue-100">
       <textarea
         ref={textareaRef}
         value={value}
         onChange={(e) => setValue(e.target.value)}
         onKeyDown={handleKeyDown}
-        placeholder="Ask a question…"
+        placeholder={placeholder ?? "Ask a question about your documents…"}
         rows={1}
-        disabled={disabled}
-        className="flex-1 resize-none bg-transparent text-sm text-neutral-800 placeholder:text-neutral-400 outline-none leading-relaxed disabled:opacity-50"
-        aria-label="Chat message input"
+        disabled={isBlocked}
+        className="flex-1 resize-none bg-transparent text-sm leading-relaxed text-neutral-800 outline-none placeholder:text-neutral-400 disabled:opacity-50"
+        aria-label="Question"
       />
 
-      {/* While streaming the send button becomes Stop. One control, one
-          obvious action — never both at once. */}
-      {isStreaming ? (
-        <button
-          onClick={onStop}
-          aria-label="Stop generating"
-          title="Stop generating"
-          className="flex-shrink-0 flex h-8 w-8 items-center justify-center rounded-xl bg-neutral-800 text-white hover:bg-neutral-900 active:scale-95 transition-all"
-        >
-          <svg className="h-3.5 w-3.5" viewBox="0 0 24 24" fill="currentColor">
-            <rect x="5" y="5" width="14" height="14" rx="2" />
+      <button
+        type="button"
+        onClick={handleSubmit}
+        disabled={!canSubmit}
+        aria-label="Ask"
+        className={cn(
+          "flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-xl transition-all",
+          canSubmit
+            ? "bg-blue-600 text-white hover:bg-blue-700 active:scale-95"
+            : "cursor-not-allowed bg-neutral-100 text-neutral-400",
+        )}
+      >
+        {isBusy ? (
+          <svg
+            className="h-4 w-4 animate-spin"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+          >
+            <path d="M21 12a9 9 0 1 1-6.219-8.56" />
           </svg>
-        </button>
-      ) : (
-        <button
-          onClick={handleSubmit}
-          disabled={!canSubmit}
-          aria-label="Send message"
-          className={cn(
-            "flex-shrink-0 flex h-8 w-8 items-center justify-center rounded-xl transition-all",
-            canSubmit
-              ? "bg-blue-600 text-white hover:bg-blue-700 active:scale-95"
-              : "bg-neutral-100 text-neutral-400 cursor-not-allowed"
-          )}
-        >
-          <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+        ) : (
+          <svg
+            className="h-4 w-4"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          >
             <line x1="22" y1="2" x2="11" y2="13" />
             <polygon points="22 2 15 22 11 13 2 9 22 2" />
           </svg>
-        </button>
-      )}
+        )}
+      </button>
     </div>
   );
 }

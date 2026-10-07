@@ -1,28 +1,48 @@
 "use client";
 
+import type { ReactNode } from "react";
+
 import { cn } from "@/lib/utils";
-import type { Conversation } from "@/types";
+import type { IngestedDocument } from "@/types";
 
 interface SidebarProps {
-  conversations: Conversation[];
-  activeConversationId: string | null;
-  onNewChat: () => void;
-  onSelectConversation: (id: string) => void;
+  documents: IngestedDocument[];
   isOpen: boolean;
   onClose: () => void;
+  /** The upload control. Passed in so this component knows nothing about uploading. */
+  children?: ReactNode;
 }
 
+/**
+ * The document list, and a slot for the upload control.
+ *
+ * In v0 this listed conversations. Conversations do not exist at stage 1.1 —
+ * the API is stateless and single-turn — so the list would have been a client
+ * fiction with a "TODO: load when backend is ready" handler. Documents are the
+ * thing the system actually has, which makes the sidebar useful instead of
+ * decorative.
+ *
+ * **This list is per browser tab and clears on refresh.** There is no
+ * `GET /documents` yet: with no database, the backend has nothing to list from.
+ * The index itself survives — Qdrant has the chunks on disk and questions will
+ * still find them — it is only the *knowledge of what was uploaded* that is
+ * lost. That gap is stage 1.2's trigger, and the footer says so on screen
+ * rather than only in a comment.
+ *
+ * The upload control arrives as `children` rather than as props. The
+ * alternative — threading `onSelectFile`, `isUploading`, `error` and
+ * `lastResult` through this component to reach `UploadPanel` — is four props
+ * drilled one level for nothing, and it would re-render the whole sidebar on
+ * every upload state change.
+ */
 export function Sidebar({
-  conversations,
-  activeConversationId,
-  onNewChat,
-  onSelectConversation,
+  documents,
   isOpen,
   onClose,
+  children,
 }: SidebarProps) {
   return (
     <>
-      {/* Mobile overlay */}
       {isOpen && (
         <div
           className="fixed inset-0 z-20 bg-black/30 lg:hidden"
@@ -31,78 +51,90 @@ export function Sidebar({
         />
       )}
 
-      {/* Sidebar panel */}
       <aside
         className={cn(
           "fixed inset-y-0 left-0 z-30 flex w-72 flex-col border-r border-neutral-200 bg-neutral-50 transition-transform duration-200",
           "lg:static lg:translate-x-0",
-          isOpen ? "translate-x-0" : "-translate-x-full"
+          isOpen ? "translate-x-0" : "-translate-x-full",
         )}
       >
-        {/* Header */}
-        <div className="flex items-center justify-between px-4 py-4 border-b border-neutral-200">
+        <div className="flex items-center justify-between border-b border-neutral-200 px-4 py-4">
           <div className="flex items-center gap-2">
-            <div className="h-7 w-7 rounded-lg bg-gradient-to-br from-blue-500 to-violet-600 flex items-center justify-center">
+            <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-gradient-to-br from-blue-500 to-violet-600">
               <span className="text-xs font-bold text-white">R</span>
             </div>
-            <span className="font-semibold text-neutral-800 tracking-tight">myRAG</span>
+            <span className="font-semibold tracking-tight text-neutral-800">
+              myRAG
+            </span>
           </div>
           <button
+            type="button"
             onClick={onClose}
-            className="lg:hidden text-neutral-400 hover:text-neutral-600"
+            className="text-neutral-400 hover:text-neutral-600 lg:hidden"
             aria-label="Close sidebar"
           >
-            <svg className="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <svg
+              className="h-5 w-5"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
               <line x1="18" y1="6" x2="6" y2="18" />
               <line x1="6" y1="6" x2="18" y2="18" />
             </svg>
           </button>
         </div>
 
-        {/* New chat button */}
-        <div className="px-3 py-3">
-          <button
-            onClick={onNewChat}
-            className="flex w-full items-center gap-2 rounded-xl border border-neutral-200 bg-white px-3 py-2.5 text-sm font-medium text-neutral-700 hover:bg-blue-50 hover:border-blue-300 hover:text-blue-700 transition-all shadow-sm"
-          >
-            <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <line x1="12" y1="5" x2="12" y2="19" />
-              <line x1="5" y1="12" x2="19" y2="12" />
-            </svg>
-            New chat
-          </button>
-        </div>
+        {/* Upload slot */}
+        <div className="px-3 py-3">{children}</div>
 
-        {/* Scrollable content */}
-        <div className="flex-1 overflow-y-auto px-3 py-2 flex flex-col gap-4">
-          {/* Conversations */}
-          {conversations.length === 0 ? (
-            <p className="px-1 py-2 text-xs text-neutral-400">
-              No conversations yet. Start a new chat.
+        <div className="flex flex-1 flex-col gap-4 overflow-y-auto px-3 py-2">
+          {documents.length === 0 ? (
+            <p className="px-1 py-2 text-xs leading-relaxed text-neutral-400">
+              No documents indexed in this session.
             </p>
           ) : (
             <div>
               <p className="mb-1.5 px-1 text-xs font-medium uppercase tracking-wide text-neutral-400">
-                Recent
+                Indexed this session
               </p>
-              <nav className="flex flex-col gap-0.5">
-                {conversations.map((conv) => (
-                  <button
-                    key={conv.id}
-                    onClick={() => onSelectConversation(conv.id)}
-                    className={cn(
-                      "w-full rounded-lg px-3 py-2 text-left text-sm transition-all",
-                      conv.id === activeConversationId
-                        ? "bg-blue-100 text-blue-800 font-medium"
-                        : "text-neutral-600 hover:bg-neutral-200/70"
-                    )}
+              <ul className="flex flex-col gap-1">
+                {documents.map((doc) => (
+                  <li
+                    key={doc.documentId}
+                    className="rounded-lg border border-neutral-200 bg-white px-3 py-2"
                   >
-                    <p className="truncate">{conv.title}</p>
-                  </button>
+                    <p
+                      className="truncate text-sm text-neutral-700"
+                      title={doc.filename}
+                    >
+                      {doc.filename}
+                    </p>
+                    <p className="mt-0.5 text-xs tabular-nums text-neutral-400">
+                      {doc.pageCount} pages · {doc.chunkCount} chunks
+                      {doc.pagesWithText < doc.pageCount && (
+                        <span className="text-amber-600">
+                          {" · "}
+                          {doc.pageCount - doc.pagesWithText} empty
+                        </span>
+                      )}
+                    </p>
+                  </li>
                 ))}
-              </nav>
+              </ul>
             </div>
           )}
+        </div>
+
+        <div className="border-t border-neutral-200 px-4 py-3">
+          <p className="text-xs leading-relaxed text-neutral-400">
+            This list is local to the browser tab and clears on refresh. The
+            index itself persists — a durable document record arrives with
+            Postgres at stage 1.2.
+          </p>
         </div>
       </aside>
     </>
