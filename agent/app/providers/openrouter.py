@@ -12,7 +12,8 @@ from typing import AsyncIterator
 
 import openai
 
-from app.providers.base import Chunk, ProviderError
+from app.errors import ProviderError
+from app.providers.base import Chunk
 
 
 class OpenRouterChatModel:

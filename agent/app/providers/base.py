@@ -11,7 +11,7 @@ branch to the factory, and change one env var. No caller changes.
 from functools import lru_cache
 from typing import AsyncIterator, Literal, NamedTuple, Protocol
 
-from app.core.config import settings
+from app.core.config import get_settings
 
 
 class Chunk(NamedTuple):
@@ -67,15 +67,6 @@ class ChatModel(Protocol):
         ...
 
 
-class ProviderError(RuntimeError):
-    """Raised when a provider cannot produce a reply.
-
-    The route layer converts this into a 502, or into an SSE `error` event when
-    the failure happens mid-stream. Vendor-specific exceptions are translated
-    here so callers never import an SDK's error classes.
-    """
-
-
 @lru_cache
 def get_chat_model() -> ChatModel:
     """Build the configured chat model once and reuse it.
@@ -85,6 +76,8 @@ def get_chat_model() -> ChatModel:
     # Imported inside the function so that adding a provider never costs an
     # import for the providers you are not using.
     from app.providers.openrouter import OpenRouterChatModel
+
+    settings = get_settings()
 
     return OpenRouterChatModel(
         api_key=settings.openrouter_api_key,
