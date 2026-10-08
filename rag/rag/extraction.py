@@ -83,7 +83,7 @@ def extract_pages(data:bytes, *, filename:str) -> list[Page ]:
             )
 
     pages: list[Page] = []
-    for zero_based_index, pdf_pagees in enumerate(reader.pages):
+    for zero_based_index, pdf_page in enumerate(reader.pages):
         try: 
             raw = pdf_page.extract_text() or ""
         except Exception :

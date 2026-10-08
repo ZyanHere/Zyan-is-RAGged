@@ -94,4 +94,4 @@ def chunk_pages(
             # character because overlap < size was checked above.
             start = end - chunk_overlap
 
-        return chunks
+    return chunks

@@ -213,13 +213,18 @@ def search(vector: list[float], *, top_k: int) -> list[RetrievedChunk]:
                 f"re-ingest the document."
             )
 
+        # Rebuilding the Chunk from the payload, then wrapping it with the
+        # score. The payload holds exactly a Chunk's fields — which is the
+        # check above — so the reconstruction is total rather than lossy.
         results.append(
             RetrievedChunk(
-                document_id=payload["document_id"],
-                filename=payload["filename"],
-                page=payload["page"],
-                chunk_index=payload["chunk_index"],
-                text=payload["text"],
+                chunk=Chunk(
+                    document_id=payload["document_id"],
+                    filename=payload["filename"],
+                    page=payload["page"],
+                    chunk_index=payload["chunk_index"],
+                    text=payload["text"],
+                ),
                 score=point.score,
             )
         )

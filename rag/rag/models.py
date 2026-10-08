@@ -88,10 +88,14 @@ class Chunk:
 class RetrievedChunk:
     """A chunk returned by a search, with its similarity score.
 
-    Deliberately not a `Chunk` with a score bolted on: retrieval reconstructs
-    these from the vector store's payload, and the type difference is a useful
-    reminder that the round trip through Qdrant is where a payload field
-    silently going missing would show up.
+    Composition rather than a flat copy of `Chunk`'s fields, so a chunk's shape
+    is defined in exactly one place. When stage 5.1 adds `tenant_id` and stage
+    4.4 adds a reranker score, each lands on the type that owns it instead of
+    being duplicated across both.
+
+    `score` belongs to the wrapper, not the chunk: it describes this
+    *retrieval*. The same chunk retrieved for a different question scores
+    differently, so it is not a property of the chunk at all.
 
     score:
         Qdrant's cosine similarity, roughly 0..1, higher is better. Only

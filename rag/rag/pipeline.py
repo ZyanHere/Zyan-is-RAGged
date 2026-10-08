@@ -46,8 +46,11 @@ def ingest(data: bytes, *, document_id: str, filename: str) -> IngestResult:
         EmbeddingError: the provider failed.
         VectorStoreError: storage failed.
     """
-    settings = get_settings()
-
+    # Deliberately *not* read until after extraction. Rejecting a file that is
+    # not a PDF, or a scanned one with no text layer, is a judgement about the
+    # input and must not depend on embedding or vector-store configuration
+    # being valid. Reading settings first made a missing GOOGLE_API_KEY mask
+    # every input error behind a config error — a real bug this ordering fixes.
     pages = extract_pages(data, filename=filename)
 
     pages_with_text = sum(1 for page in pages if page.text.strip())
@@ -63,6 +66,9 @@ def ingest(data: bytes, *, document_id: str, filename: str) -> IngestResult:
             f"is almost certainly a scanned document — images of text, with no "
             f"text layer. OCR is not supported yet, so nothing was indexed."
         )
+
+    # First use of configuration: chunking needs the size and overlap.
+    settings = get_settings()
 
     chunks = chunk_pages(
         pages,
@@ -109,8 +115,10 @@ def retrieve(question: str, *, top_k: int | None = None) -> list[RetrievedChunk]
     indexed or nothing matched — call `count_chunks()` to tell those apart, and
     only when you need to.
     """
-    settings = get_settings()
-
+    # Validate the question before touching configuration, for the same reason
+    # `ingest` validates the file first: judging the input is not the
+    # embedder's business, and reading settings first would report a config
+    # error for a caller mistake.
     cleaned = question.strip()
     if not cleaned:
         raise ValueError("Cannot retrieve for an empty question.")
@@ -118,4 +126,9 @@ def retrieve(question: str, *, top_k: int | None = None) -> list[RetrievedChunk]
     ensure_collection()
 
     vector = get_embedding_model().embed_query(cleaned)
-    return search(vector, top_k=top_k or settings.top_k)
+
+    # First use of configuration here, and only when the caller did not say.
+    if top_k is None:
+        top_k = get_settings().top_k
+
+    return search(vector, top_k=top_k)
