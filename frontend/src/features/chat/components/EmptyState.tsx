@@ -1,19 +1,32 @@
-interface EmptyStateProps {
-  /** Whether anything has been indexed in this browser session. */
-  hasDocuments: boolean;
-  onPromptClick: (prompt: string) => void;
-}
+"use client";
+
+import { selectHasUploads } from "@/features/documents/uploadsSlice";
+import { useAskQuestion } from "@/features/chat/useAskQuestion";
+import { useAppSelector } from "@/store/hooks";
 
 /**
  * Shown before the first question.
  *
  * The v0 version offered four suggested prompts unconditionally. With nothing
- * indexed those are fiction — every one of them returns "no documents have been
+ * indexed those are fiction — every one returns "no documents have been
  * indexed yet". So the state branches: upload first, then suggestions.
+ *
+ * ── A cross-feature read, on purpose ────────────────────────────────────────
+ *
+ * This lives in `features/chat` and reads `selectHasUploads` from
+ * `features/documents`. That is fine and worth stating plainly: **feature
+ * folders organise code, they do not forbid reads.** Trying to enforce
+ * isolation here would mean threading a boolean down from `page.tsx` purely to
+ * avoid an import — reintroducing the prop drilling layer 4 exists to remove.
+ *
+ * What a feature boundary *should* prevent is one feature mutating another's
+ * state. Reading a selector is a dependency on a shape; dispatching another
+ * feature's actions is a dependency on its behaviour. The first is cheap, the
+ * second is where coupling hurts.
  *
  * The prompts themselves are deliberately generic. Document-aware suggestions
  * would mean asking a model what a document contains before the user asks
- * anything, which is a real feature with a real cost and no trigger yet.
+ * anything — a real feature with a real cost and no trigger yet.
  */
 const SUGGESTED_PROMPTS = [
   "What is this document about?",
@@ -22,7 +35,10 @@ const SUGGESTED_PROMPTS = [
   "List any dates or figures mentioned",
 ];
 
-export function EmptyState({ hasDocuments, onPromptClick }: EmptyStateProps) {
+export function EmptyState() {
+  const hasDocuments = useAppSelector(selectHasUploads);
+  const { askQuestion } = useAskQuestion();
+
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-8 px-4 py-16 text-center">
       <div className="flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-blue-500 to-violet-600 shadow-lg">
@@ -57,7 +73,7 @@ export function EmptyState({ hasDocuments, onPromptClick }: EmptyStateProps) {
               <button
                 key={prompt}
                 type="button"
-                onClick={() => onPromptClick(prompt)}
+                onClick={() => askQuestion(prompt)}
                 className="rounded-xl border border-neutral-200 bg-white px-4 py-3 text-left text-sm text-neutral-600 shadow-sm transition-all hover:border-blue-300 hover:bg-blue-50 hover:text-blue-700"
               >
                 {prompt}

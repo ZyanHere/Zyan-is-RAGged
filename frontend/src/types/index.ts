@@ -75,6 +75,13 @@ export interface Answer {
  *
  * No derived `isProbablyScanned` flag: deciding what counts as suspicious is a
  * policy, and policy belongs in the component that renders the warning.
+ *
+ * Purely the server's view of one ingest. When the upload *happened* is not on
+ * this type: that is a fact about this browser session, not about the
+ * document, and it belongs on the `SessionUpload` wrapper in the uploads slice
+ * (layer 3). Keeping them apart is what makes stage 1.2 additive — a real
+ * `GET /documents` returns exactly this shape, and the session record stays
+ * where it is.
  */
 export interface IngestedDocument {
   documentId: string;
@@ -88,16 +95,6 @@ export interface IngestedDocument {
 
   charactersExtracted: number;
   chunkCount: number;
-
-  /**
-   * Set by the client, not the server.
-   *
-   * There is no `GET /documents` yet — with no database, the backend has
-   * nothing to list from. So the document list is whatever *this browser tab*
-   * has uploaded, and it vanishes on refresh. That is honest rather than
-   * broken, and stage 1.2 is where it becomes a real server-side list.
-   */
-  uploadedAt: string;
 }
 
 // ── Transcript ───────────────────────────────────────────────────────────────
@@ -123,5 +120,53 @@ export interface Message {
   /** Assistant turns only. Absent on user turns and when nothing was retrieved. */
   sources?: Source[];
 
-  createdAt: string;
+  /**
+   * Epoch milliseconds, not an ISO string and not a `Date`.
+   *
+   * Redux state must be serializable — `configureStore` ships a development
+   * check that warns on anything else, because a `Date` in the store breaks
+   * time-travel debugging, state persistence and replay. A number is the
+   * simplest thing that round-trips through JSON unchanged.
+   *
+   * It also comes free: RTK Query puts `fulfilledTimeStamp` on every fulfilled
+   * action, so the assistant turn's timestamp is read from the action rather
+   * than generated inside a reducer, which must stay pure.
+   */
+  createdAt: number;
+}
+
+// ── Session activity ─────────────────────────────────────────────────────────
+
+/**
+ * One upload made by *this browser session*.
+ *
+ * Distinct from `IngestedDocument`, and the distinction is the point.
+ * `IngestedDocument` is the server's view of one ingest — exactly what
+ * `GET /documents` will return at stage 1.2. A `SessionUpload` is a record of
+ * something *you did here*: which attempt it was, and when.
+ *
+ * Today they look like the same thing because the server list does not exist.
+ * Keeping them apart means stage 1.2 is purely additive — a query endpoint
+ * appears and this type does not move. Had the document list itself been
+ * modelled as client state, 1.2 would force a migration.
+ *
+ * The analogy worth holding: an upload tray is not a file browser. One is a
+ * log of your activity, the other is the contents of the server, and they stay
+ * separate concepts even once both exist.
+ */
+export interface SessionUpload {
+  /**
+   * The RTK Query `requestId` — unique per upload *attempt*.
+   *
+   * Deliberately not `document.documentId`. At stage 2.2 content-addressed
+   * idempotency makes re-uploading the same file return the *same* document
+   * id, so two entries in this list would collide on a React key. The request
+   * id has no such problem and needs no change then.
+   */
+  id: string;
+
+  document: IngestedDocument;
+
+  /** Epoch milliseconds, from the fulfilled action's `fulfilledTimeStamp`. */
+  uploadedAt: number;
 }

@@ -2,40 +2,44 @@
 
 import { useEffect, useRef } from "react";
 
+import { LoadingDots } from "@/components/ui/LoadingDots";
+import { selectMessages } from "@/features/chat/chatSlice";
+import { useAskQuestion } from "@/features/chat/useAskQuestion";
+import { useAppSelector } from "@/store/hooks";
+
 import { EmptyState } from "./EmptyState";
 import { MessageBubble } from "./MessageBubble";
-import { LoadingDots } from "@/components/ui/LoadingDots";
-import type { Message } from "@/types";
-
-interface ChatWindowProps {
-  messages: Message[];
-  /** A question is in flight. */
-  isAsking: boolean;
-  error: string | null;
-  hasDocuments: boolean;
-  onPromptClick: (prompt: string) => void;
-}
 
 /**
  * The scrolling transcript.
  *
- * `streamingContent` and `isReasoning` are gone — there is no partial reply to
- * render as a separate bubble, so an answer appears in one piece and the
- * waiting state is a single spinner.
+ * Reads the transcript and the in-flight state directly, so `page.tsx` renders
+ * `<ChatWindow />` with no props at all. The five it used to take —
+ * `messages`, `isAsking`, `error`, `hasDocuments`, `onPromptClick` — are now
+ * each read by whichever component actually uses them, and the last two went
+ * to `EmptyState`, which is the only thing that ever wanted them.
+ *
+ * That removes the one piece of genuine prop drilling the app had: this
+ * component used to accept `hasDocuments` and `onPromptClick` purely to hand
+ * them to `EmptyState`, without reading either.
+ *
+ * ── Subscription scope ──────────────────────────────────────────────────────
+ *
+ * `useAppSelector(selectMessages)` re-renders this subtree when the transcript
+ * changes, and typing in the composer no longer re-renders it at all — the
+ * draft is local to `ChatInput`. Before layer 4, every keystroke's state lived
+ * above both components and re-rendered the lot.
  *
  * The scroll behaviour is kept from v0 and worth keeping: auto-scroll only
  * while the reader is already near the bottom. Yanking someone back down while
  * they are reading a source they scrolled up to check is the most irritating
- * thing a transcript UI can do, and in this UI people *will* scroll up to read
- * sources.
+ * thing a transcript UI can do — and in this UI people *will* scroll up to
+ * read sources.
  */
-export function ChatWindow({
-  messages,
-  isAsking,
-  error,
-  hasDocuments,
-  onPromptClick,
-}: ChatWindowProps) {
+export function ChatWindow() {
+  const messages = useAppSelector(selectMessages);
+  const { isAsking, error } = useAskQuestion();
+
   const bottomRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
@@ -54,9 +58,7 @@ export function ChatWindow({
   }, [messages, isAsking]);
 
   if (messages.length === 0 && !isAsking && !error) {
-    return (
-      <EmptyState hasDocuments={hasDocuments} onPromptClick={onPromptClick} />
-    );
+    return <EmptyState />;
   }
 
   return (
@@ -71,7 +73,7 @@ export function ChatWindow({
         ))}
 
         {/* Embedding the question, searching, then generating — all of it
-            happens behind this one spinner, and on a free-tier model it can be
+            happens behind this one spinner, and on a free-tier model that is
             several seconds. Stage 10.2's tracing is what eventually tells you
             which part of the wait was which. */}
         {isAsking && (

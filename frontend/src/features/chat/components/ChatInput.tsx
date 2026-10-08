@@ -2,31 +2,38 @@
 
 import { useEffect, useRef, useState } from "react";
 
+import { useAskQuestion } from "@/features/chat/useAskQuestion";
 import { cn } from "@/lib/utils";
-
-interface ChatInputProps {
-  onSubmit: (question: string) => void;
-  /** A question is in flight. */
-  isBusy: boolean;
-  disabled?: boolean;
-  placeholder?: string;
-}
 
 /**
  * The question composer.
  *
+ * **Takes no props.** It reads what it needs from the feature hook, which is
+ * the point of layer 4: a component that needs store data subscribes to it
+ * rather than having it handed down. `page.tsx` renders `<ChatInput />` and
+ * knows nothing about asking questions.
+ *
+ * ── The one piece of state that stays local ─────────────────────────────────
+ *
+ * `value` — the textarea's contents — is deliberately *not* in Redux, and this
+ * is the clearest example of the rule. It changes on every keystroke, and
+ * nothing outside this component ever reads it. In the store it would dispatch
+ * an action per character, flood DevTools, and re-render every subscriber in
+ * the app for a value only this `<textarea>` cares about.
+ *
+ * The test: **does anything outside this component need to read it?** For a
+ * draft message, no. The moment it does — a draft restored across navigation,
+ * say — it stops being local.
+ *
  * The Stop button is gone. In v0 it aborted an SSE stream, which genuinely
- * stopped generation. With a single JSON response there is nothing to abort
- * usefully — the work is already happening on the server, so cancelling the
- * request would hide the answer without saving the cost. A disabled input and a
- * spinner is the honest signal.
+ * stopped generation. With a single JSON response there is nothing useful to
+ * abort: the work is already happening on the server, so cancelling would hide
+ * the answer without saving the cost. A disabled input and a spinner is the
+ * honest signal.
  */
-export function ChatInput({
-  onSubmit,
-  isBusy,
-  disabled,
-  placeholder,
-}: ChatInputProps) {
+export function ChatInput() {
+  const { askQuestion, isAsking } = useAskQuestion();
+
   const [value, setValue] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -37,12 +44,10 @@ export function ChatInput({
     el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
   }, [value]);
 
-  const isBlocked = isBusy || disabled;
-
   const handleSubmit = () => {
     const trimmed = value.trim();
-    if (!trimmed || isBlocked) return;
-    onSubmit(trimmed);
+    if (!trimmed || isAsking) return;
+    askQuestion(trimmed);
     setValue("");
   };
 
@@ -53,7 +58,7 @@ export function ChatInput({
     }
   };
 
-  const canSubmit = value.trim().length > 0 && !isBlocked;
+  const canSubmit = value.trim().length > 0 && !isAsking;
 
   return (
     <div className="flex items-end gap-3 rounded-2xl border border-neutral-200 bg-white px-4 py-3 shadow-sm transition-all focus-within:border-blue-400 focus-within:ring-2 focus-within:ring-blue-100">
@@ -62,9 +67,9 @@ export function ChatInput({
         value={value}
         onChange={(e) => setValue(e.target.value)}
         onKeyDown={handleKeyDown}
-        placeholder={placeholder ?? "Ask a question about your documents…"}
+        placeholder="Ask a question about your documents…"
         rows={1}
-        disabled={isBlocked}
+        disabled={isAsking}
         className="flex-1 resize-none bg-transparent text-sm leading-relaxed text-neutral-800 outline-none placeholder:text-neutral-400 disabled:opacity-50"
         aria-label="Question"
       />
@@ -81,7 +86,7 @@ export function ChatInput({
             : "cursor-not-allowed bg-neutral-100 text-neutral-400",
         )}
       >
-        {isBusy ? (
+        {isAsking ? (
           <svg
             className="h-4 w-4 animate-spin"
             viewBox="0 0 24 24"

@@ -2,41 +2,44 @@
 
 import { useRef } from "react";
 
-import type { IngestedDocument } from "@/types";
-
-interface UploadPanelProps {
-  onSelectFile: (file: File) => void;
-  isUploading: boolean;
-  error: string | null;
-  /** The most recent successful ingest, so its numbers can be inspected. */
-  lastResult: IngestedDocument | null;
-}
+import { selectLatestUpload } from "@/features/documents/uploadsSlice";
+import { useUploadDocumentMutation } from "@/services/documentsApi";
+import { useAppSelector } from "@/store/hooks";
 
 /**
  * The file picker, and the report of what ingestion actually did.
  *
- * Presentational: props in, one callback out. It holds no state beyond a ref to
- * the hidden input, so the upload lifecycle stays in `useUpload` and the
- * document list stays in `page.tsx`.
+ * Takes no props. It calls the mutation directly rather than going through a
+ * feature hook the way chat does — **because it is the only uploader.** The
+ * `useAskQuestion` hook exists to share one mutation entry between two
+ * components; here there is nothing to share, and a hook would be indirection
+ * for its own sake.
  *
- * The numbers are the point. A success message would hide the one failure that
- * matters at this stage — a scanned PDF that opens cleanly, yields no text, and
- * reports success having indexed nothing. The engine refuses that outright, but
- * the *partial* case (ten pages, three with text) is a real and quiet loss, and
- * the only way to notice it is to put `pagesWithText` next to `pageCount` and
- * let a human see the gap.
+ * If a second upload entry point ever appears — a drag-and-drop zone on the
+ * empty state, say — this becomes a `useUploadDocument` hook with a
+ * `fixedCacheKey`, for exactly the reason spelled out in `useAskQuestion`.
+ *
+ * ── Why the numbers, not a success message ──────────────────────────────────
+ *
+ * The dangerous outcome at this stage is not a crash. It is a scanned PDF that
+ * opens cleanly, yields no text, and reports success having indexed nothing.
+ * The engine refuses that outright — but the *partial* case, ten pages with
+ * three yielding text, is a real and quiet loss. The only way to notice it is
+ * to put `pagesWithText` next to `pageCount` and let a human see the gap.
  */
-export function UploadPanel({
-  onSelectFile,
-  isUploading,
-  error,
-  lastResult,
-}: UploadPanelProps) {
+export function UploadPanel() {
+  const [uploadDocument, { isLoading, error }] = useUploadDocumentMutation();
+  const latestUpload = useAppSelector(selectLatestUpload);
+
   const inputRef = useRef<HTMLInputElement>(null);
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) onSelectFile(file);
+    if (file) {
+      // No `.unwrap()`: `uploadsSlice` records success via `matchFulfilled`,
+      // and the failure is already in `error` below.
+      void uploadDocument(file);
+    }
 
     // Clear the input's value so selecting the same file again fires another
     // change event. Without this, re-uploading a file after fixing something
@@ -44,9 +47,8 @@ export function UploadPanel({
     e.target.value = "";
   };
 
-  const pagesLost = lastResult
-    ? lastResult.pageCount - lastResult.pagesWithText
-    : 0;
+  const document = latestUpload?.document ?? null;
+  const pagesLost = document ? document.pageCount - document.pagesWithText : 0;
 
   return (
     <div className="flex flex-col gap-2">
@@ -66,10 +68,10 @@ export function UploadPanel({
       <button
         type="button"
         onClick={() => inputRef.current?.click()}
-        disabled={isUploading}
+        disabled={isLoading}
         className="flex w-full items-center justify-center gap-2 rounded-xl border border-neutral-200 bg-white px-3 py-2.5 text-sm font-medium text-neutral-700 shadow-sm transition-all hover:border-blue-300 hover:bg-blue-50 hover:text-blue-700 disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:border-neutral-200 disabled:hover:bg-white disabled:hover:text-neutral-700"
       >
-        {isUploading ? (
+        {isLoading ? (
           <>
             <svg
               className="h-4 w-4 animate-spin"
@@ -105,8 +107,8 @@ export function UploadPanel({
 
       {/* Ingestion is synchronous at this stage, so the wait is real and can be
           minutes on a large document. Saying so beats a spinner that looks
-          stuck — and the 120s backend timeout is the trigger for stage 1.3. */}
-      {isUploading && (
+          stuck — and the backend's 120s timeout is stage 1.3's trigger. */}
+      {isLoading && (
         <p className="px-1 text-xs leading-relaxed text-neutral-400">
           Extracting, embedding and indexing. This runs synchronously, so a
           large PDF can take minutes.
@@ -115,27 +117,27 @@ export function UploadPanel({
 
       {error && (
         <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs leading-relaxed text-red-700">
-          {error}
+          {error.message}
         </p>
       )}
 
-      {lastResult && !isUploading && (
+      {document && !isLoading && (
         <div className="rounded-lg border border-neutral-200 bg-white px-3 py-2 text-xs">
           <p className="truncate font-medium text-neutral-700">
-            {lastResult.filename}
+            {document.filename}
           </p>
           <dl className="mt-1.5 grid grid-cols-2 gap-x-2 gap-y-0.5 text-neutral-500">
             <dt>Pages</dt>
-            <dd className="text-right tabular-nums">{lastResult.pageCount}</dd>
+            <dd className="text-right tabular-nums">{document.pageCount}</dd>
             <dt>With text</dt>
             <dd className="text-right tabular-nums">
-              {lastResult.pagesWithText}
+              {document.pagesWithText}
             </dd>
             <dt>Chunks</dt>
-            <dd className="text-right tabular-nums">{lastResult.chunkCount}</dd>
+            <dd className="text-right tabular-nums">{document.chunkCount}</dd>
             <dt>Characters</dt>
             <dd className="text-right tabular-nums">
-              {lastResult.charactersExtracted.toLocaleString()}
+              {document.charactersExtracted.toLocaleString()}
             </dd>
           </dl>
 
@@ -144,9 +146,8 @@ export function UploadPanel({
               and no question will ever find them. */}
           {pagesLost > 0 && (
             <p className="mt-2 rounded border border-amber-200 bg-amber-50 px-2 py-1.5 leading-relaxed text-amber-800">
-              {pagesLost} of {lastResult.pageCount} pages yielded no text and
-              were not indexed — likely scanned images. OCR arrives at stage
-              16.2.
+              {pagesLost} of {document.pageCount} pages yielded no text and were
+              not indexed — likely scanned images. OCR arrives at stage 16.2.
             </p>
           )}
         </div>
