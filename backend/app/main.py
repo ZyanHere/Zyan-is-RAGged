@@ -18,7 +18,12 @@ from fastapi.responses import JSONResponse
 
 from app.api.routes import documents, health, query
 from app.core.config import get_settings
-from app.errors import AgentUnavailableError, BackendError, UploadTooLargeError
+from app.errors import (
+    AgentUnavailableError,
+    BackendError,
+    BadUploadError,
+    UploadTooLargeError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +48,7 @@ app.include_router(query.router)
 
 # ── Failures ──────────────────────────────────────────────────────────────────
 #
+#   BadUploadError         400   the caller sent something unusable
 #   UploadTooLargeError    413
 #   AgentUnavailableError  503   our dependency is down, not us
 #   BackendError           500   registered last; catches what nothing named
@@ -54,6 +60,11 @@ app.include_router(query.router)
 
 def _error(status_code: int, message: str) -> JSONResponse:
     return JSONResponse(status_code=status_code, content={"detail": message})
+
+
+@app.exception_handler(BadUploadError)
+async def _bad_upload(request: Request, exc: BadUploadError):
+    return _error(400, str(exc))
 
 
 @app.exception_handler(UploadTooLargeError)

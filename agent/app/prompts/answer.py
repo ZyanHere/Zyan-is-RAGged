@@ -1,73 +1,43 @@
-"""The backend service.
+"""The grounded-answer prompt.
 
-    frontend :3000  ──HTTP──▶  backend :8000  ──HTTP──▶  agent :8001
+In its own module because a prompt is *behaviour*, not plumbing. When stage 18.1
+makes prompts versioned artifacts with an eval run per version, this is the file
+it formalises — and `PROMPT_VERSION` is the seed of that, so bump it whenever
+the text below changes.
 
-The only service the browser talks to, which is why it is the only one with
-CORS. It holds no model keys, no prompts and no engine imports.
-
-At stage 1.1 it forwards and little else. Modules 1.2 through 9 fill it in:
-Postgres, jobs, retries, quotas, rate limiting, caching. The shape is here so
-those land in a place that already exists.
+The prompt does two jobs: confine the model to the supplied excerpts, and make
+it mark which excerpt each claim came from so citations can be resolved to
+pages. Both are enforced weakly — by instruction. Stage 17.2 adds a programmatic
+check that a cited span actually supports its claim, and 17.3 adds a real
+abstention gate. Until then, an instruction is what we have, and knowing it is
+weak is the point.
 """
 
-import logging
+PROMPT_VERSION = "answer-v1"
 
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+SYSTEM_PROMPT = """\
+You answer questions using only the numbered excerpts provided by the user.
 
-from app.api.routes import documents, health, query
-from app.core.config import get_settings
-from app.errors import AgentUnavailableError, BackendError, UploadTooLargeError
+Rules:
+- Use only the excerpts. Do not use anything you know from outside them.
+- After each claim, cite the excerpt it came from using its number in square
+  brackets, like [1]. Cite several as [1][3] when a claim draws on more than one.
+- If the excerpts do not contain the answer, say exactly that and stop. Do not
+  guess, and do not fill the gap with general knowledge.
+- If the excerpts disagree with each other, say so and cite both. Do not pick
+  one silently.
+- Answer in plain prose. Be brief. Do not restate the question.\
+"""
 
-logger = logging.getLogger(__name__)
+USER_TEMPLATE = """\
+Excerpts:
 
-app = FastAPI(
-    title="myRAG backend",
-    description="The reliability layer. Owns durability, not intelligence.",
-    version="0.1.0",
-)
+{context}
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=get_settings().allowed_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+Question: {question}\
+"""
 
-app.include_router(health.router)
-app.include_router(documents.router)
-app.include_router(query.router)
-
-
-# ── Failures ──────────────────────────────────────────────────────────────────
-#
-#   UploadTooLargeError    413
-#   AgentUnavailableError  503   our dependency is down, not us
-#   BackendError           500   registered last; catches what nothing named
-#
-# Errors the agent *returns* are not handled here — they are forwarded with
-# their own status code and body, because the agent is the authority on what
-# went wrong inside it.
-
-
-def _error(status_code: int, message: str) -> JSONResponse:
-    return JSONResponse(status_code=status_code, content={"detail": message})
-
-
-@app.exception_handler(UploadTooLargeError)
-async def _upload_too_large(request: Request, exc: UploadTooLargeError):
-    return _error(413, str(exc))
-
-
-@app.exception_handler(AgentUnavailableError)
-async def _agent_unavailable(request: Request, exc: AgentUnavailableError):
-    logger.warning("agent unavailable: %s", exc)
-    return _error(503, str(exc))
-
-
-@app.exception_handler(BackendError)
-async def _backend_failed(request: Request, exc: BackendError):
-    logger.error("backend failed: %s", exc)
-    return _error(500, str(exc))
+EXCERPT_TEMPLATE = """\
+[{marker}] {filename}, page {page}
+{text}\
+"""

@@ -19,6 +19,21 @@ class BackendError(Exception):
     """Base class for every failure raised by the backend's own code."""
 
 
+class BadUploadError(BackendError):
+    """The upload is unusable on its face, before the agent is involved.
+
+    A client error, so a 400 — not a 500. Raising the bare `BackendError` here
+    would report our own failure for something the caller did wrong, which
+    matters as soon as you start reading error rates and asking whose fault an
+    outage was.
+
+    This overlaps with the engine's own checks on purpose: the agent validates
+    again, because it must not assume it is only ever called by this backend.
+    What this catches early is the most common bad upload, at the outermost
+    boundary, without a round trip.
+    """
+
+
 class UploadTooLargeError(BackendError):
     """The uploaded file exceeds the configured limit."""
 

@@ -40,11 +40,11 @@ def build_context(chunks: list[RetrievedChunk]) -> str:
     return "\n\n".join(
         EXCERPT_TEMPLATE.format(
             marker=marker,
-            filename=chunk.filename,
-            page=chunk.page,
-            text=chunk.text,
+            filename=retrieved.chunk.filename,
+            page=retrieved.chunk.page,
+            text=retrieved.chunk.text,
         )
-        for marker, chunk in enumerate(chunks, start=1)
+        for marker, retrieved in enumerate(chunks, start=1)
     )
 
 
@@ -79,7 +79,7 @@ def extract_citations(answer: str, chunks: list[RetrievedChunk]) -> list[Citatio
             )
             continue
 
-        chunk = chunks[marker - 1]
+        chunk = chunks[marker - 1].chunk
         citations.append(
             Citation(
                 marker=marker,
@@ -100,11 +100,14 @@ def to_sources(chunks: list[RetrievedChunk]) -> list[SourceChunk]:
     return [
         SourceChunk(
             marker=marker,
-            document_id=chunk.document_id,
-            filename=chunk.filename,
-            page=chunk.page,
-            score=chunk.score,
-            text=chunk.text,
+            document_id=retrieved.chunk.document_id,
+            filename=retrieved.chunk.filename,
+            page=retrieved.chunk.page,
+            # The score lives on the wrapper, not the chunk: it describes this
+            # *retrieval*, not the chunk itself. The same chunk retrieved for a
+            # different question scores differently.
+            score=retrieved.score,
+            text=retrieved.chunk.text,
         )
-        for marker, chunk in enumerate(chunks, start=1)
+        for marker, retrieved in enumerate(chunks, start=1)
     ]

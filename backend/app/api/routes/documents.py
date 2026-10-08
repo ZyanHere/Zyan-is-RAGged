@@ -19,7 +19,7 @@ from fastapi import APIRouter, File, UploadFile
 from fastapi.responses import JSONResponse
 
 from app.core.config import get_settings
-from app.errors import BackendError, UploadTooLargeError
+from app.errors import BadUploadError, UploadTooLargeError
 from app.services.agent_client import ingest_document
 
 router = APIRouter()
@@ -43,7 +43,7 @@ async def upload_document(file: UploadFile = File(...)) -> JSONResponse:
     if not content:
         # The engine checks this too. This one saves a pointless round trip for
         # the most common bad upload.
-        raise BackendError("The uploaded file is empty.")
+        raise BadUploadError(f"'{file.filename}' is empty (0 bytes).")
 
     status_code, body = await ingest_document(
         filename=file.filename or "upload.pdf",
