@@ -28,21 +28,35 @@ def _client() -> httpx.AsyncClient:
 
 
 async def ingest_document(
-    *, filename: str, content: bytes, content_type: str | None
+    *,
+    document_id: str,
+    filename: str,
+    content: bytes,
+    content_type: str | None,
 ) -> tuple[int, dict]:
-    """Forward an upload to the agent.
+    """Forward an upload to the agent, under an id we have already committed.
 
-    Returns the agent's status code alongside its JSON body so the route can
-    pass both through unchanged. Translating the agent's errors here would mean
-    inventing a second error vocabulary for no benefit — at stage 1.1 the agent
-    is the authority on what went wrong with a document.
+    Returns the agent's status code alongside its JSON body. Translating the
+    agent's errors here would mean inventing a second error vocabulary for no
+    benefit — the agent is the authority on what went wrong with a document,
+    and its `detail` is what gets stored on the failed job.
+
+    `document_id` travels as a second multipart field rather than a query
+    parameter, because it belongs to the same request as the file.
+
+    The direction matters: the id is **ours**, minted and committed before this
+    call, and the agent passes it through to `rag.ingest` and into the Qdrant
+    payload. If the agent minted it instead, the backend would have had nothing
+    to commit before starting work — which is the ordering stage 1.2 exists to
+    establish.
     """
     settings = get_settings()
     files = {"file": (filename, content, content_type or "application/pdf")}
+    data = {"document_id": document_id}
 
     try:
         async with _client() as client:
-            response = await client.post("/documents", files=files)
+            response = await client.post("/documents", files=files, data=data)
     except httpx.TimeoutException as exc:
         raise AgentUnavailableError(
             f"The agent did not respond within {settings.agent_timeout:.0f}s. "

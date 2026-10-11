@@ -75,6 +75,34 @@ class Settings(BaseSettings):
     # setting rather than a hard-coded `True`.
     db_echo: bool = False
 
+    # ── Connection pool ───────────────────────────────────────────────────────
+    #
+    # These are SQLAlchemy's own defaults, written out rather than inherited.
+    # Pool sizing is one of stage 1.2's stated subjects and it is invisible
+    # while it is implicit — and the arithmetic that matters is not obvious:
+    #
+    #     worker processes x (pool_size + max_overflow)  <=  Postgres max_connections
+    #
+    # Postgres defaults to 100. Four uvicorn workers at 5+10 each is 60, which
+    # fits; eight workers is 120, which does not — and the failure is
+    # "FATAL: sorry, too many clients already" at peak load, not at startup.
+    #
+    # Stage 8.3 is where these stop being guesses and become measured numbers.
+    db_pool_size: int = Field(default=5, gt=0)
+    """Connections kept open permanently."""
+
+    db_max_overflow: int = Field(default=10, ge=0)
+    """Extra connections opened under load, then closed again."""
+
+    db_pool_pre_ping: bool = True
+    """Check a pooled connection is alive before handing it out.
+
+    Costs a round trip per checkout and prevents the most annoying class of
+    error in development: Postgres restarts inside Docker, every pooled
+    connection is now dead, and the next request fails with a broken-pipe error
+    that has nothing to do with the code being written.
+    """
+
     @field_validator("database_url")
     @classmethod
     def _require_async_driver(cls, value: str) -> str:

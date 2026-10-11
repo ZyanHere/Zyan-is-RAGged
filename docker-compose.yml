@@ -1,16 +1,23 @@
 # Local infrastructure for myRAG.
 #
-# Postgres only, at stage 1.2. Qdrant stays embedded — it runs as a library
-# writing to `agent/qdrant_data`, which needs no container and has the useful
-# property of being single-process. That constraint is not a flaw to design
-# around: it is what forces `QDRANT_URL` at stage 1.3, when a separate worker
-# process needs concurrent access to the index. Adding Qdrant here then is a
-# dozen lines against a file that already exists.
+# Postgres, and the agent.
 #
-# The services themselves (backend, agent, frontend) are deliberately absent.
-# Containerising them is stage 15.1, and doing it now would mean rebuilding an
-# image on every code change for no benefit — `uvicorn --reload` against a
-# containerised database is the faster development loop.
+# Qdrant stays embedded — a library writing to a folder, single-process, no
+# container. That constraint is not a flaw to design around: it is what forces
+# `QDRANT_URL` at stage 1.3, when a separate worker process needs concurrent
+# access to the index. Adding Qdrant here then is a dozen lines.
+#
+# ── Why the agent is containerised and the backend is not ────────────────────
+#
+# Not symmetry, and not stage 15.1 arriving early for its own sake. Windows
+# Smart App Control refuses to load `grpcio`'s unsigned compiled binary, which
+# `qdrant-client` imports. The policy governs the Windows host and does not
+# reach inside a Linux container, so the agent runs here and the policy stays
+# switched on.
+#
+# The backend keeps running on the host under `uvicorn --reload`, which is the
+# faster loop and has no such problem. It reaches the agent on localhost:8001
+# through the published port.
 #
 #   docker compose up -d      start Postgres in the background
 #   docker compose ps         check health
@@ -85,6 +92,70 @@ services:
     # `always` would restart it even after you deliberately stopped it.
     restart: unless-stopped
 
+  agent:
+    build:
+      # The repository root, because the agent installs the sibling `rag`
+      # package with `-e ../rag`. A context of `agent/` cannot see it.
+      context: .
+      dockerfile: agent/Dockerfile
+
+    container_name: myrag-agent
+
+    # Keys arrive at runtime, never baked into the image. `.dockerignore`
+    # excludes `.env` from the build context so it cannot be copied in by
+    # accident.
+    env_file:
+      - ./agent/.env
+
+    environment:
+      # Override the host-shaped defaults from agent/.env.example. Inside the
+      # container the index lives on a volume, not next to the source.
+      QDRANT_PATH: /app/agent/qdrant_data
+
+    ports:
+      # The backend runs on the host and calls http://localhost:8001.
+      - "8001:8001"
+
+    volumes:
+      # Source mounted read-only, so a code change needs
+      # `docker compose restart agent` rather than a rebuild. Read-only
+      # because nothing in the container should ever write to your working
+      # tree.
+      - ./agent/app:/app/agent/app:ro
+      - ./rag/rag:/app/rag/rag:ro
+
+      # A named volume rather than a bind mount to ./agent/qdrant_data.
+      #
+      # Embedded Qdrant takes an exclusive file lock on its storage folder, and
+      # file locking across a Windows bind mount goes through a translation
+      # layer that does not always honour it. A named volume is ordinary Linux
+      # filesystem and behaves predictably.
+      #
+      # The cost is real and worth stating: this is a *different* index from
+      # the one in ./agent/qdrant_data. Documents indexed before this change
+      # are not in it, and anything on the host — the stage 3.1 evaluation
+      # harness, for instance — cannot read it directly.
+      - agent_qdrant_data:/app/agent/qdrant_data
+
+    healthcheck:
+      # No curl in the slim image, and adding one for a health check is 10 MB
+      # for a line of Python that is already present.
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request;urllib.request.urlopen('http://localhost:8001/health').read()",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+    restart: unless-stopped
+
 volumes:
   postgres_data:
     name: myrag_postgres_data
+  agent_qdrant_data:
+    name: myrag_agent_qdrant_data

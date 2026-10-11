@@ -13,7 +13,7 @@ and a real future trigger: enough concurrent uploads will exhaust it, and that
 observation is part of what earns the queue at stage 1.3.
 """
 
-from fastapi import APIRouter, File, UploadFile
+from fastapi import APIRouter, File, Form, UploadFile
 
 from app.core.config import get_settings
 from app.errors import UploadTooLargeError
@@ -24,7 +24,10 @@ router = APIRouter()
 
 
 @router.post("/documents", response_model=IngestResponse)
-def ingest_document(file: UploadFile = File(...)) -> IngestResponse:
+def ingest_document(
+    file: UploadFile = File(...),
+    document_id: str | None = Form(default=None),
+) -> IngestResponse:
     """Extract, chunk, embed and index one PDF.
 
     Blocks until the whole document is indexed. A 300-page PDF will hold this
@@ -33,6 +36,11 @@ def ingest_document(file: UploadFile = File(...)) -> IngestResponse:
 
     Failures are translated to status codes by the exception handlers in
     `main.py`, so there is no try/except here.
+
+    `document_id` is an optional multipart field, not a path or query
+    parameter, because it travels with the file in the same request. The
+    backend sends the id it has already committed; a direct `curl` omits it and
+    the agent mints one, which keeps the agent independently testable.
     """
     settings = get_settings()
 
@@ -50,4 +58,8 @@ def ingest_document(file: UploadFile = File(...)) -> IngestResponse:
             f"{settings.max_upload_bytes // (1024 * 1024)} MB."
         )
 
-    return ingest_upload(data, filename=file.filename or "upload.pdf")
+    return ingest_upload(
+        data,
+        filename=file.filename or "upload.pdf",
+        document_id=document_id,
+    )

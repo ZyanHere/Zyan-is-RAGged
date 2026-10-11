@@ -11,6 +11,8 @@ those land in a place that already exists.
 """
 
 import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,19 +20,69 @@ from fastapi.responses import JSONResponse
 
 from app.api.routes import documents, health, query
 from app.core.config import get_settings
+from app.db.session import create_database, verify_connectivity
 from app.errors import (
     AgentUnavailableError,
     BackendError,
     BadUploadError,
+    NotFoundError,
     UploadTooLargeError,
 )
 
 logger = logging.getLogger(__name__)
 
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Create the database connection pool, and dispose of it on shutdown.
+
+    The engine is built here rather than at module import for two reasons.
+
+    An async engine binds its pooled connections to the event loop that opened
+    them, and this module is imported by uvicorn, by pytest and (indirectly) by
+    Alembic — each running its own loop. A module-level engine eventually hands
+    a connection made on one loop to code running on another, and the error
+    says "attached to a different loop" without naming anything that caused it.
+
+    And a pool created at import has no shutdown. Every `uvicorn --reload`
+    would abandon its open connections, and after enough reloads Postgres
+    starts answering "sorry, too many clients already" to a process that is
+    barely doing anything.
+
+    The `SELECT 1` turns a stopped database into a refusal to start, with a
+    sentence that says so — instead of an opaque 500 on the first upload, with
+    a stack trace about connection pools.
+    """
+    settings = get_settings()
+    database = create_database(settings)
+
+    try:
+        await verify_connectivity(database.engine)
+    except Exception as exc:
+        logger.error(
+            "Cannot reach the database. Is Postgres running? "
+            "`docker compose up -d` from the repository root. (%s)",
+            exc,
+        )
+        await database.engine.dispose()
+        raise
+
+    app.state.database = database
+    logger.info("database pool ready")
+
+    try:
+        yield
+    finally:
+        # Runs on normal shutdown and on a failed startup alike, so a crash
+        # does not leave connections held open against the server.
+        await database.engine.dispose()
+        logger.info("database pool disposed")
+
+
 app = FastAPI(
     title="myRAG backend",
     description="The reliability layer. Owns durability, not intelligence.",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(
@@ -49,6 +101,7 @@ app.include_router(query.router)
 # ── Failures ──────────────────────────────────────────────────────────────────
 #
 #   BadUploadError         400   the caller sent something unusable
+#   NotFoundError          404
 #   UploadTooLargeError    413
 #   AgentUnavailableError  503   our dependency is down, not us
 #   BackendError           500   registered last; catches what nothing named
@@ -65,6 +118,11 @@ def _error(status_code: int, message: str) -> JSONResponse:
 @app.exception_handler(BadUploadError)
 async def _bad_upload(request: Request, exc: BadUploadError):
     return _error(400, str(exc))
+
+
+@app.exception_handler(NotFoundError)
+async def _not_found(request: Request, exc: NotFoundError):
+    return _error(404, str(exc))
 
 
 @app.exception_handler(UploadTooLargeError)

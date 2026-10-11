@@ -31,6 +31,7 @@ import asyncio
 from collections.abc import AsyncIterator
 
 import asyncpg
+import httpx
 import pytest
 import pytest_asyncio
 from alembic import command
@@ -175,3 +176,53 @@ async def session(connection: AsyncConnection) -> AsyncIterator[AsyncSession]:
     )
     async with factory() as s:
         yield s
+
+
+# ── HTTP-level fixtures ──────────────────────────────────────────────────────
+#
+# Everything below exists so a request can be driven end to end through the
+# real FastAPI app while still sharing the test's transaction — which is what
+# lets a test assert on rows the request wrote and still have them rolled back.
+
+
+@pytest_asyncio.fixture
+async def app(connection: AsyncConnection, session: AsyncSession):
+    """The real application, wired to this test's session.
+
+    `dependency_overrides` replaces `get_session` so routes receive the very
+    same session the test holds. Without that, the route would open its own
+    connection, commit for real, and the test's rollback would have nothing to
+    undo — every test would leak rows into the next one.
+
+    `lifespan` is deliberately bypassed: `ASGITransport` does not run it, so no
+    second engine is created and the startup `SELECT 1` does not fire. The
+    tests are exercising routes, not process startup.
+    """
+    from app.api.deps import get_session
+    from app.main import app as fastapi_app
+
+    async def _session_override():
+        yield session
+
+    fastapi_app.dependency_overrides[get_session] = _session_override
+    try:
+        yield fastapi_app
+    finally:
+        # Cleared unconditionally: a leaked override would silently point the
+        # next test's app at a closed session.
+        fastapi_app.dependency_overrides.clear()
+
+
+@pytest_asyncio.fixture
+async def client(app) -> AsyncIterator[httpx.AsyncClient]:
+    """An HTTP client that talks to the app in-process.
+
+    `ASGITransport` calls the application directly — no socket, no port, no
+    server. Requests go through the real routing, dependency injection,
+    validation and exception handlers, which is the part worth testing.
+    """
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test"
+    ) as c:
+        yield c

@@ -12,6 +12,18 @@ stops being fine at stage 1.3, when a separate worker process appears, and that
 is a real trigger rather than a design flaw — set `QDRANT_URL` at that point and
 this file needs no other change.
 
+**`qdrant_client` is imported inside functions, not at module scope.** That is
+unusual enough to need a reason: the vendor library pulls in gRPC, which ships
+a large compiled binary, and importing it at module level makes `import rag`
+depend on that binary loading successfully. Anything that touches `rag` at all
+— the chunking unit tests, the extraction unit tests, the evaluation harness at
+stage 3.1 — then fails for a reason that has nothing to do with vectors.
+
+Deferring the import means the dependency is paid for only by the code that
+genuinely needs a vector store, and the failure, when it comes, names the
+operation that caused it. It is the same pattern `agent/app/providers/base.py`
+already uses for chat providers.
+
 **Point ids are random** (decision D3). Stage 2.2 replaces them with
 `uuid5(document_id, chunk_index)`. Doing it now would pre-fix the duplicate-chunk
 corruption that 2.2 exists to make you reproduce, and a stage whose trigger you
@@ -20,13 +32,16 @@ have quietly prevented is a stage you cannot learn from.
 
 import uuid
 from functools import lru_cache
-
-from qdrant_client import QdrantClient
-from qdrant_client import models as qmodels
+from typing import TYPE_CHECKING
 
 from rag.config import get_settings
 from rag.errors import VectorStoreError
 from rag.models import Chunk, RetrievedChunk
+
+if TYPE_CHECKING:
+    # Type-checking only: this branch never runs, so the annotations below cost
+    # nothing at import time.
+    from qdrant_client import QdrantClient
 
 # Points per upsert call. Large enough that a 300-page document is a handful of
 # round trips, small enough that one failure does not lose everything.
@@ -34,12 +49,14 @@ _UPSERT_BATCH = 256
 
 
 @lru_cache
-def get_client() -> QdrantClient:
+def get_client() -> "QdrantClient":
     """Open the vector store once and reuse it.
 
     Cached because in embedded mode the client holds a lock on the storage
     folder — opening a second one in the same process fails outright.
     """
+    from qdrant_client import QdrantClient
+
     settings = get_settings()
     try:
         if settings.qdrant_url:
@@ -69,6 +86,8 @@ def ensure_collection() -> None:
     is a migration, not a config edit. This is the check that makes the mistake
     loud instead of silent.
     """
+    from qdrant_client import models as qmodels
+
     settings = get_settings()
     client = get_client()
 
@@ -129,6 +148,8 @@ def upsert_chunks(
     """
     if not chunks:
         return
+
+    from qdrant_client import models as qmodels
 
     settings = get_settings()
     client = get_client()

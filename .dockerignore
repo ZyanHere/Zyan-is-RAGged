@@ -1,0 +1,28 @@
+# Keep the build context small and the image clean.
+#
+# The context is the repository root, so without this every node_modules and
+# .venv on disk is uploaded to the daemon before the build even starts.
+
+**/.venv
+**/venv
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+
+# Secrets never enter an image. The agent's keys arrive at runtime through
+# `env_file` in docker-compose.yml.
+**/.env
+**/.env.local
+**/.env.*.local
+
+# Local vector index — the container gets its own volume.
+**/qdrant_data
+
+frontend/
+backend/
+docs/
+todos/
+tools/
+.git
+**/node_modules
+**/.next
