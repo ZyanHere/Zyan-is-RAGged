@@ -13,3 +13,8 @@ sqlalchemy[asyncio]>=2.0,<3.0
 # The async Postgres driver. SQLAlchemy selects it from the `+asyncpg` in the
 # DSN scheme; `postgresql://` alone would mean psycopg2, which is not here.
 asyncpg>=0.30
+alembic>=1.13,<2.0
+
+# ── Testing (stage 1.2) ──────────────────────────────────────────────────────
+# Integration tests run against a real Postgres, so they are async.
+pytest-asyncio>=0.24
