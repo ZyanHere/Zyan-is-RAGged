@@ -1,0 +1,90 @@
+# Local infrastructure for myRAG.
+#
+# Postgres only, at stage 1.2. Qdrant stays embedded — it runs as a library
+# writing to `agent/qdrant_data`, which needs no container and has the useful
+# property of being single-process. That constraint is not a flaw to design
+# around: it is what forces `QDRANT_URL` at stage 1.3, when a separate worker
+# process needs concurrent access to the index. Adding Qdrant here then is a
+# dozen lines against a file that already exists.
+#
+# The services themselves (backend, agent, frontend) are deliberately absent.
+# Containerising them is stage 15.1, and doing it now would mean rebuilding an
+# image on every code change for no benefit — `uvicorn --reload` against a
+# containerised database is the faster development loop.
+#
+#   docker compose up -d      start Postgres in the background
+#   docker compose ps         check health
+#   docker compose logs -f    follow its output
+#   docker compose down       stop, keeping data
+#   docker compose down -v    stop and DELETE the data volume
+
+services:
+  postgres:
+    # Pinned to a major version, never `latest`. A silent jump from 17 to 18
+    # on someone else's machine is a class of bug that costs a day to find,
+    # and the alpine variant is roughly a quarter the size.
+    image: postgres:17-alpine
+
+    container_name: myrag-postgres
+
+    environment:
+      # Defaults so `docker compose up` works with no setup at all. These are
+      # throwaway local development credentials for a container reachable only
+      # from this machine — they are not secrets, and they are visible in this
+      # file by design.
+      #
+      # Real credentials arrive at stage 15.3, which names secret handling and
+      # rotation explicitly. Nothing here should ever be reused there.
+      POSTGRES_USER: ${POSTGRES_USER:-myrag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-myrag_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-myrag}
+
+    ports:
+      # host:container. Bound so psql, Alembic and the backend can all reach it
+      # from Windows directly. At stage 15.1, when the backend is itself a
+      # container on this network, this mapping becomes a development
+      # convenience rather than a requirement.
+      - "${POSTGRES_PORT:-5432}:5432"
+
+    volumes:
+      # A *named* volume, not a bind mount into the repository.
+      #
+      # A bind mount would put Postgres's data directory inside the working
+      # tree, where it would need gitignoring, would break on Windows file
+      # permissions, and would be destroyed by a careless `git clean`. The
+      # named volume is managed by Docker and survives `docker compose down`.
+      #
+      # `docker compose down -v` is the only thing that deletes it — which is
+      # also how you get a clean database when a migration goes wrong.
+      - postgres_data:/var/lib/postgresql/data
+
+    healthcheck:
+      # `pg_isready` answers "is the server accepting connections?" — which is
+      # not the same as "is the container running". Postgres takes a few
+      # seconds to initialise on first start, and without this check anything
+      # depending on it would race the startup and fail with a confusing
+      # connection error.
+      #
+      # At stage 15.1, when the backend is a service in this file, it gains
+      # `depends_on: postgres: condition: service_healthy` and this check
+      # becomes the thing that makes the ordering correct.
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-myrag} -d ${POSTGRES_DB:-myrag}",
+        ]
+      interval: 5s
+      timeout: 5s
+      # Generous: the *first* start initialises the data directory, which is
+      # much slower than later ones. A tight retry count here fails the first
+      # `docker compose up` on a slow machine and looks like a broken config.
+      retries: 10
+      start_period: 10s
+
+    # Survives a Docker Desktop restart, but not a `docker compose down`.
+    # `always` would restart it even after you deliberately stopped it.
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    name: myrag_postgres_data

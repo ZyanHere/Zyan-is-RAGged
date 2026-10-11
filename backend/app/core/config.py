@@ -1,9 +1,10 @@
 """Backend configuration.
 
 The backend holds no model keys and no engine settings. It knows where the
-agent is, how long to wait for it, who may call it, and how large an upload it
-will accept. That is the whole list, and it is short on purpose — the day it
-grows an LLM setting is the day the layering has broken.
+agent is, how long to wait for it, who may call it, how large an upload it will
+accept, and — from stage 1.2 — where its database is. It still holds nothing
+about prompts, models or embeddings: the day it grows an LLM setting is the day
+the layering has broken.
 
 No module-level instance, for the same reason as the agent: importing a module
 should not require a configured environment.
@@ -11,7 +12,7 @@ should not require a configured environment.
 
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -39,6 +40,58 @@ class Settings(BaseSettings):
 
     host: str = "127.0.0.1"
     port: int = 8000
+
+    # ── Database (stage 1.2) ──────────────────────────────────────────────────
+
+    # One DSN rather than separate host/port/user/password fields.
+    #
+    # Twelve-factor, and it is the shape every managed provider hands you — AWS
+    # RDS, Neon, Railway and Fly all give a single connection string. Assembling
+    # one from five variables means five places for an environment to be half
+    # configured, and a URL that exists nowhere you can paste into psql.
+    #
+    # The default points at the local Compose service. That is a deliberate
+    # exception to "no secrets in defaults": these credentials are for a
+    # throwaway container reachable only from this machine, they are written in
+    # `docker-compose.yml` in this same repository, and anything resembling a
+    # real deployment overrides the whole DSN. Stage 15.3 is where secret
+    # handling becomes a real subject.
+    #
+    # Note the duplication: this default and the defaults in
+    # `docker-compose.yml` must agree, and nothing enforces that. Change one and
+    # you get a connection refused with no explanation of why.
+    database_url: str = (
+        "postgresql+asyncpg://myrag:myrag_dev_password@localhost:5432/myrag"
+    )
+
+    # Log every SQL statement the ORM generates.
+    #
+    # On in development on purpose. Stage 1.2's stated subject is relational
+    # modelling, transactions and indexes, and an ORM's whole job is to hide the
+    # SQL those are made of. Reading what SQLAlchemy actually emits — including
+    # the BEGIN and COMMIT around each unit of work — is most of the lesson.
+    #
+    # It is noisy and it belongs off anywhere that matters, which is why it is a
+    # setting rather than a hard-coded `True`.
+    db_echo: bool = False
+
+    @field_validator("database_url")
+    @classmethod
+    def _require_async_driver(cls, value: str) -> str:
+        """Upgrade a bare `postgresql://` DSN to the asyncpg driver.
+
+        SQLAlchemy picks its driver from the URL scheme, and `postgresql://`
+        means psycopg2 — which is not installed here and would not work with an
+        async engine if it were. The failure is a `ModuleNotFoundError` about a
+        package nobody mentioned, several layers from the cause.
+
+        This matters because the DSN a managed provider gives you at stage 15.3
+        will say `postgresql://`, and pasting it in verbatim is the obvious
+        thing to do. Normalising here means that works.
+        """
+        if value.startswith("postgresql://"):
+            return value.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return value
 
     @property
     def allowed_origins(self) -> list[str]:

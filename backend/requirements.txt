@@ -6,3 +6,10 @@ python-dotenv>=1.0,<2.0
 pytest>=8.0,<9.0
 httpx>=0.27,<1.0
 python-multipart>=0.0.9
+
+# ── Database (stage 1.2) ─────────────────────────────────────────────────────
+# The [asyncio] extra pulls in SQLAlchemy's async engine and session.
+sqlalchemy[asyncio]>=2.0,<3.0
+# The async Postgres driver. SQLAlchemy selects it from the `+asyncpg` in the
+# DSN scheme; `postgresql://` alone would mean psycopg2, which is not here.
+asyncpg>=0.30
