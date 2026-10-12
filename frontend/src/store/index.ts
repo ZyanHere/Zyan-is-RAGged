@@ -26,8 +26,13 @@
  *
  *   state.api      server state — the RTK Query cache
  *   state.chat     client/domain state — the transcript
- *   state.uploads  client/domain state — what this session uploaded
  *   state.ui       UI state — application chrome
+ *
+ * `state.uploads` used to sit here too, holding what this tab had uploaded. It
+ * went away at stage 1.2: once `GET /documents` existed, the server list
+ * covered everything it tracked — failures included — and survived a refresh
+ * besides. A client mirror of server data is the duplication this split exists
+ * to prevent.
  *
  * Anything that changes at interaction rate (a composer's text, a scroll
  * position) is in none of them: it stays local to its component.
@@ -36,7 +41,6 @@
 import { configureStore } from "@reduxjs/toolkit";
 
 import { chatSlice } from "@/features/chat/chatSlice";
-import { uploadsSlice } from "@/features/documents/uploadsSlice";
 import { uiSlice } from "@/features/ui/uiSlice";
 import { baseApi } from "@/services/baseApi";
 
@@ -58,7 +62,6 @@ export function makeStore() {
       // work until someone renamed the slice, at which point every selector
       // would silently read `undefined`.
       [chatSlice.reducerPath]: chatSlice.reducer,
-      [uploadsSlice.reducerPath]: uploadsSlice.reducer,
       [uiSlice.reducerPath]: uiSlice.reducer,
     },
 

@@ -2,9 +2,7 @@
 
 import { useRef } from "react";
 
-import { selectLatestUpload } from "@/features/documents/uploadsSlice";
 import { useUploadDocumentMutation } from "@/services/documentsApi";
-import { useAppSelector } from "@/store/hooks";
 
 /**
  * The file picker, and the report of what ingestion actually did.
@@ -28,16 +26,22 @@ import { useAppSelector } from "@/store/hooks";
  * to put `pagesWithText` next to `pageCount` and let a human see the gap.
  */
 export function UploadPanel() {
-  const [uploadDocument, { isLoading, error }] = useUploadDocumentMutation();
-  const latestUpload = useAppSelector(selectLatestUpload);
+  // `data` is the mutation's own result — the last upload this component
+  // performed. It replaces what used to come from an `uploads` slice: the
+  // slice was a client-side copy of information RTK Query already holds, and
+  // of a list the server now owns outright.
+  const [uploadDocument, { isLoading, error, data: lastUpload }] =
+    useUploadDocumentMutation();
 
   const inputRef = useRef<HTMLInputElement>(null);
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
-      // No `.unwrap()`: `uploadsSlice` records success via `matchFulfilled`,
-      // and the failure is already in `error` below.
+      // No `.unwrap()`. On success the `invalidatesTags` on this mutation
+      // marks the document list stale and `DocumentList` refetches itself —
+      // nothing here needs to know that happened. On failure the message is
+      // already in `error` below.
       void uploadDocument(file);
     }
 
@@ -47,8 +51,11 @@ export function UploadPanel() {
     e.target.value = "";
   };
 
-  const document = latestUpload?.document ?? null;
-  const pagesLost = document ? document.pageCount - document.pagesWithText : 0;
+  const document = lastUpload ?? null;
+  const pagesLost =
+    document && document.pageCount !== null && document.pagesWithText !== null
+      ? document.pageCount - document.pagesWithText
+      : 0;
 
   return (
     <div className="flex flex-col gap-2">
@@ -137,7 +144,7 @@ export function UploadPanel() {
             <dd className="text-right tabular-nums">{document.chunkCount}</dd>
             <dt>Characters</dt>
             <dd className="text-right tabular-nums">
-              {document.charactersExtracted.toLocaleString()}
+              {document.charactersExtracted?.toLocaleString() ?? "—"}
             </dd>
           </dl>
 

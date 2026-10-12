@@ -12,7 +12,7 @@ import { useAppDispatch, useAppSelector } from "@/store/hooks";
  * Connects to `uiSlice` for its own open/closed state, and takes everything
  * else as `children`. That split is the feature boundary doing real work:
  * `features/ui` owns chrome and knows nothing about documents, so it never
- * imports `SessionUpload` or a documents selector.
+ * imports a document type or a documents query.
  *
  * The alternative — rendering `<UploadPanel/>` and `<DocumentList/>` in here
  * directly — would be fewer lines in `page.tsx` and would make the ui feature
@@ -83,9 +83,8 @@ export function Sidebar({ children }: { children?: ReactNode }) {
 
         <div className="border-t border-neutral-200 px-4 py-3">
           <p className="text-xs leading-relaxed text-neutral-400">
-            This list is local to the browser tab and clears on refresh. The
-            index itself persists — a durable document record arrives with
-            Postgres at stage 1.2.
+            Documents and their ingestion history are stored in Postgres, so
+            this list survives a refresh — including attempts that failed.
           </p>
         </div>
       </aside>

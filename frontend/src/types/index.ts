@@ -65,36 +65,73 @@ export interface Answer {
 
 // ── Documents ────────────────────────────────────────────────────────────────
 
+/** Where an ingestion attempt is. Mirrors the backend's `IngestionStatus`. */
+export type IngestionStatus = "processing" | "done" | "failed";
+
 /**
- * What ingestion reported about one uploaded file.
+ * A document the server knows about, with the state of its latest attempt.
  *
- * Numbers rather than a success boolean, because the dangerous outcome at this
- * stage is not a crash — it is a scanned PDF that indexes nothing and reports
- * success. The gap between `pageCount` and `pagesWithText` is the tell, and
- * surfacing it is the whole reason these fields cross the wire.
+ * **Server state.** It lives in the RTK Query cache, not in a slice — it is a
+ * view of rows in Postgres, and the browser's copy can go stale the moment
+ * anything else writes one.
  *
- * No derived `isProbablyScanned` flag: deciding what counts as suspicious is a
- * policy, and policy belongs in the component that renders the warning.
+ * ── What used to be here, and why it is gone ────────────────────────────────
  *
- * Purely the server's view of one ingest. When the upload *happened* is not on
- * this type: that is a fact about this browser session, not about the
- * document, and it belongs on the `SessionUpload` wrapper in the uploads slice
- * (layer 3). Keeping them apart is what makes stage 1.2 additive — a real
- * `GET /documents` returns exactly this shape, and the session record stays
- * where it is.
+ * Until stage 1.2 this type was `IngestedDocument`, paired with a
+ * `SessionUpload` wrapper in an `uploads` slice that recorded what *this tab*
+ * had uploaded. The argument for keeping them separate was that an upload tray
+ * is not a file browser: one is a log of your activity, the other is the
+ * contents of the server.
+ *
+ * That argument assumed the server's list would hold only successes. It does
+ * not — stage 1.2 records a failed ingestion as a document with a failed job,
+ * so a rejected PDF appears here with its reason. The server list turned out
+ * to cover everything the session log tracked, and to survive a refresh as
+ * well.
+ *
+ * So the slice is gone. Keeping it would have meant a client-side mirror of
+ * server data, which is the duplication the client/server split exists to
+ * prevent.
  */
-export interface IngestedDocument {
+export interface DocumentRecord {
   documentId: string;
   filename: string;
 
-  /** Pages in the PDF. */
-  pageCount: number;
+  /** ISO 8601, from the database clock. */
+  createdAt: string;
 
-  /** Pages that yielded any text. Less than `pageCount` means pages were lost. */
-  pagesWithText: number;
+  /**
+   * `null` means the document exists with no ingestion attempt recorded.
+   *
+   * That should be impossible — both rows are written in one transaction — and
+   * it is representable because the server's query uses an outer join. Hiding
+   * such a row would conceal exactly the inconsistency the record exists to
+   * expose.
+   */
+  status: IngestionStatus | null;
 
-  charactersExtracted: number;
-  chunkCount: number;
+  pageCount: number | null;
+  pagesWithText: number | null;
+  charactersExtracted: number | null;
+  chunkCount: number | null;
+
+  /**
+   * Why it failed, in the engine's words.
+   *
+   * Durable now. Before stage 1.2 these messages lived only in the response to
+   * the upload request, so a failure you scrolled past was gone.
+   */
+  error: string | null;
+
+  /**
+   * `null` while an attempt is still running.
+   *
+   * The database guarantees that reading: a CHECK constraint forbids a
+   * terminal job without a finish time and a running one with one. So
+   * `status: "processing"` with `finishedAt: null` means precisely *started,
+   * never finished* — a document whose ingestion was interrupted.
+   */
+  finishedAt: string | null;
 }
 
 // ── Transcript ───────────────────────────────────────────────────────────────
@@ -133,40 +170,4 @@ export interface Message {
    * than generated inside a reducer, which must stay pure.
    */
   createdAt: number;
-}
-
-// ── Session activity ─────────────────────────────────────────────────────────
-
-/**
- * One upload made by *this browser session*.
- *
- * Distinct from `IngestedDocument`, and the distinction is the point.
- * `IngestedDocument` is the server's view of one ingest — exactly what
- * `GET /documents` will return at stage 1.2. A `SessionUpload` is a record of
- * something *you did here*: which attempt it was, and when.
- *
- * Today they look like the same thing because the server list does not exist.
- * Keeping them apart means stage 1.2 is purely additive — a query endpoint
- * appears and this type does not move. Had the document list itself been
- * modelled as client state, 1.2 would force a migration.
- *
- * The analogy worth holding: an upload tray is not a file browser. One is a
- * log of your activity, the other is the contents of the server, and they stay
- * separate concepts even once both exist.
- */
-export interface SessionUpload {
-  /**
-   * The RTK Query `requestId` — unique per upload *attempt*.
-   *
-   * Deliberately not `document.documentId`. At stage 2.2 content-addressed
-   * idempotency makes re-uploading the same file return the *same* document
-   * id, so two entries in this list would collide on a React key. The request
-   * id has no such problem and needs no change then.
-   */
-  id: string;
-
-  document: IngestedDocument;
-
-  /** Epoch milliseconds, from the fulfilled action's `fulfilledTimeStamp`. */
-  uploadedAt: number;
 }

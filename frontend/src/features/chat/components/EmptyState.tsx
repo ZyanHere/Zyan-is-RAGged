@@ -1,8 +1,7 @@
 "use client";
 
-import { selectHasUploads } from "@/features/documents/uploadsSlice";
 import { useAskQuestion } from "@/features/chat/useAskQuestion";
-import { useAppSelector } from "@/store/hooks";
+import { useListDocumentsQuery } from "@/services/documentsApi";
 
 /**
  * Shown before the first question.
@@ -13,16 +12,16 @@ import { useAppSelector } from "@/store/hooks";
  *
  * ── A cross-feature read, on purpose ────────────────────────────────────────
  *
- * This lives in `features/chat` and reads `selectHasUploads` from
- * `features/documents`. That is fine and worth stating plainly: **feature
- * folders organise code, they do not forbid reads.** Trying to enforce
- * isolation here would mean threading a boolean down from `page.tsx` purely to
- * avoid an import — reintroducing the prop drilling layer 4 exists to remove.
+ * This lives in `features/chat` and queries the documents endpoint. That is
+ * fine and worth stating plainly: **feature folders organise code, they do not
+ * forbid reads.** Enforcing isolation here would mean threading a boolean down
+ * from `page.tsx` purely to avoid an import, reintroducing the prop drilling
+ * that moving to feature components removed.
  *
  * What a feature boundary *should* prevent is one feature mutating another's
- * state. Reading a selector is a dependency on a shape; dispatching another
- * feature's actions is a dependency on its behaviour. The first is cheap, the
- * second is where coupling hurts.
+ * state. Reading is a dependency on a shape; dispatching another feature's
+ * actions is a dependency on its behaviour. The first is cheap, the second is
+ * where coupling hurts.
  *
  * The prompts themselves are deliberately generic. Document-aware suggestions
  * would mean asking a model what a document contains before the user asks
@@ -36,7 +35,12 @@ const SUGGESTED_PROMPTS = [
 ];
 
 export function EmptyState() {
-  const hasDocuments = useAppSelector(selectHasUploads);
+  // The same query `DocumentList` uses. RTK Query caches by endpoint and
+  // argument, so these two components share one cache entry and one request —
+  // each asks for what it needs and the library notices they are the same.
+  const { data: documents } = useListDocumentsQuery();
+  const hasDocuments = (documents?.length ?? 0) > 0;
+
   const { askQuestion } = useAskQuestion();
 
   return (
