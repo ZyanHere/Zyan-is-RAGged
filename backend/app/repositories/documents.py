@@ -23,6 +23,7 @@ place where it matters.
 """
 
 from collections.abc import Sequence
+from typing import NamedTuple
 from uuid import UUID
 
 from sqlalchemy import func, select, update
@@ -30,9 +31,33 @@ from sqlalchemy.dialects.postgresql import distinct_on
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from app.db.models import Document, IngestionJob, IngestionStatus
+from app.db.models import (
+    Document,
+    DocumentUpload,
+    IngestionJob,
+    IngestionStatus,
+)
 
 DocumentWithJob = tuple[Document, IngestionJob | None]
+
+
+class ClaimedJob(NamedTuple):
+    """What a worker gets when it successfully claims a job. Stage 1.3.
+
+    **Two ids and nothing else, deliberately.** The claim is an `UPDATE …
+    RETURNING`, so these values come back from the statement that performed it
+    and are true by construction. Returning the whole `IngestionJob` entity
+    would hand back an object the bulk UPDATE has already made stale — the 1.2
+    lesson that cost an afternoon — and the worker would be reading a `status`
+    of `queued` from a row the database now calls `processing`.
+
+    Everything the worker needs to do its job is here: the `job_id` to record
+    the outcome against, and the `document_id` to fetch the bytes and to pass
+    down into `rag.ingest`.
+    """
+
+    job_id: UUID
+    document_id: UUID
 
 
 class DocumentRepository:
@@ -47,7 +72,7 @@ class DocumentRepository:
         self,
         *,
         filename: str,
-        byte_size: int,
+        content: bytes,
         content_type: str | None,
     ) -> tuple[Document, IngestionJob]:
         """Record that a document exists and that we are about to index it.
@@ -60,25 +85,155 @@ class DocumentRepository:
         INSERTs and gets the server-side defaults back **without committing**,
         so the caller still owns the transaction boundary.
 
-        The job starts as `processing` rather than `queued`. Nothing queues
-        anything yet — ingestion is synchronous, so a `queued` state would last
-        microseconds. It becomes meaningful at stage 1.3.
+        **Three rows now, not two** — the upload joins them at stage 1.3.
+
+        `byte_size` is no longer a parameter: it is `len(content)`, and taking
+        both invited them to disagree. A caller that passed a stale size would
+        have produced a document whose recorded size did not match its stored
+        bytes, with nothing to catch it.
+
+        **All three in one transaction, which is the point.** A job with no
+        upload is a job a worker cannot run; an upload with no job is bytes
+        nobody will ever look at. The pair being atomic is what lets the worker
+        treat "I claimed a job" as "its input exists".
+
+        **The job starts `queued` with no `started_at`.** Until stage 1.3 it
+        started `processing`, because the request that created it was about to
+        do the work itself — there was no interval during which "waiting" was
+        a true description.
+
+        Now there is, and `started_at IS NULL` is what says so. A worker stamps
+        it when it claims the job, so the gap between `queued_at` and
+        `started_at` is the queue's wait time, measurable per job.
+
+        Nothing in this call starts any work. That is the point: after it
+        returns and the caller commits, the only thing that exists is a
+        promise.
         """
         document = Document(
             filename=filename,
-            byte_size=byte_size,
+            byte_size=len(content),
             content_type=content_type,
         )
         job = IngestionJob(
             document=document,
-            status=IngestionStatus.PROCESSING,
+            status=IngestionStatus.QUEUED,
+            # Explicit, and it has to be: the column has no server default, and
+            # SQLAlchemy would otherwise omit it from the INSERT. Passing None
+            # is what writes NULL — see the column's docstring.
+            started_at=None,
         )
+        upload = DocumentUpload(document=document, content=content)
 
         self._session.add(document)
         self._session.add(job)
+        self._session.add(upload)
         await self._session.flush()
 
         return document, job
+
+    async def claim_next_queued_job(self) -> ClaimedJob | None:
+        """Take the oldest queued job, or return `None` if there is nothing.
+
+        **This is the mechanism the whole stage turns on.** Two workers polling
+        the same table must never take the same job: the document would be
+        ingested twice, embedded twice — real money — and chunked twice, so the
+        same fact would be cited twice from the same page.
+
+        ── The SQL, and why it is one statement ────────────────────────────────
+
+            UPDATE ingestion_jobs
+               SET status = 'processing', started_at = now()
+             WHERE id = (SELECT id FROM ingestion_jobs
+                          WHERE status = 'queued'
+                          ORDER BY queued_at, id
+                          LIMIT 1
+                          FOR UPDATE SKIP LOCKED)
+            RETURNING id, document_id
+
+        `FOR UPDATE` locks the chosen row until this transaction ends.
+        **`SKIP LOCKED` is the part that matters**: without it a second worker
+        *blocks* on the row the first is holding, so ten workers process one
+        job at a time and the queue is correct but pointless. With it, a locked
+        row is treated as though it were not there and the second worker takes
+        the next one. No collisions and no waiting.
+
+        ── Why not two statements ─────────────────────────────────────────────
+
+        The obvious shape is `SELECT … FOR UPDATE SKIP LOCKED`, then `UPDATE`.
+        It is correct, and it was the first version here. One statement is
+        better for two reasons:
+
+        * **one round trip instead of two**, which matters when the loop does
+          nothing else;
+        * **no stale object.** A separate bulk UPDATE leaves the entity the
+          SELECT returned describing a row that no longer exists in that
+          state — the bug stage 1.2 spent an afternoon on. `RETURNING` hands
+          back values produced by the statement that wrote them.
+
+        ── What this deliberately does not do ─────────────────────────────────
+
+        **No lease, no heartbeat, no expiry.** A worker that dies after
+        claiming leaves the job at `processing` forever and nothing reclaims
+        it. That is stage 2.1, and it is only buildable once there is a stuck
+        row to observe — so this method creates the problem on purpose.
+
+        The caller commits. The lock is released at that commit, by which point
+        the row is `processing` and no longer matches the `queued` filter, so
+        nobody else can select it regardless.
+        """
+        next_queued = (
+            select(IngestionJob.id)
+            .where(IngestionJob.status == IngestionStatus.QUEUED)
+            # Oldest first, with `id` as a tiebreaker because `queued_at` is
+            # `transaction_timestamp()` and a batch upload shares one value.
+            # Without it the order within a batch is whatever the planner
+            # chooses, which is not wrong but is not FIFO either.
+            .order_by(IngestionJob.queued_at, IngestionJob.id)
+            .limit(1)
+            .with_for_update(skip_locked=True)
+            .scalar_subquery()
+        )
+
+        claimed = (
+            await self._session.execute(
+                update(IngestionJob)
+                .where(IngestionJob.id == next_queued)
+                # Same reason as `mark_job_done`: this is a bulk UPDATE and the
+                # ORM must not try to reconcile it against the identity map.
+                .execution_options(synchronize_session=False)
+                .values(
+                    status=IngestionStatus.PROCESSING,
+                    started_at=func.now(),
+                )
+                .returning(IngestionJob.id, IngestionJob.document_id)
+            )
+        ).one_or_none()
+
+        if claimed is None:
+            return None
+
+        return ClaimedJob(job_id=claimed.id, document_id=claimed.document_id)
+
+    async def get_upload_content(self, document_id: UUID) -> bytes | None:
+        """The stored bytes for a document, or `None` if there are none.
+
+        Selects the **column**, not the entity. Loading a `DocumentUpload`
+        would put a 25 MB object in the session's identity map where it would
+        stay until the session closed; this returns the bytes and keeps nothing.
+
+        `None` means no upload row, which after stage 1.3 should be impossible
+        for a job that exists — they are written in one transaction. The worker
+        treats it as a failure rather than a crash, because a job whose input
+        has vanished is a real state to record and a stack trace is not.
+        """
+        return (
+            await self._session.execute(
+                select(DocumentUpload.content).where(
+                    DocumentUpload.document_id == document_id
+                )
+            )
+        ).scalar_one_or_none()
 
     async def mark_job_done(
         self,
@@ -164,12 +319,27 @@ class DocumentRepository:
         adding it now would be an index justified by a guess. Stage 11.3's rule
         is indexes justified by `EXPLAIN ANALYZE` — revisit when the table has
         enough rows for the plan to mean anything.
+
+        **Ordered by `queued_at`, not `started_at` — stage 1.3.** `started_at`
+        became nullable when `queued` arrived, and it is NULL for exactly the
+        newest job. Ordering by it would decide "latest" using a column the
+        latest row does not have, and where that row lands then depends on the
+        database's NULLS default rather than on anything intended.
+
+        `id DESC` is a tiebreaker for the same reason it appears in
+        `list_documents_with_latest_job`: `now()` is `transaction_timestamp()`,
+        so two jobs written in one transaction share an identical `queued_at`.
+        With `DISTINCT ON` that is worse than an unstable sort — the tie
+        decides *which row survives*, so without the tiebreaker the endpoint
+        can report a different job's status on different days.
         """
         return (
             select(IngestionJob)
             .ext(distinct_on(IngestionJob.document_id))
             .order_by(
-                IngestionJob.document_id, IngestionJob.started_at.desc()
+                IngestionJob.document_id,
+                IngestionJob.queued_at.desc(),
+                IngestionJob.id.desc(),
             )
             .subquery()
         )

@@ -1,8 +1,19 @@
-"""The ordering invariant, tested.
+"""The ordering invariant, tested — now across three transactions.
 
 Stage 1.2's measure is **interrupted ingests that are detectable: 0% → 100%**,
 and these tests are where that number comes from. The question each one asks is
 not "did the upload work" but "**what survives if it does not**".
+
+Stage 1.3 split the work, so the sequence under test is now:
+
+    accept_upload  →  COMMIT      what a request does
+    claim          →  COMMIT      what a worker does to take ownership
+    process_job    →  COMMIT      what a worker does with it
+
+The `ingest` helper below runs all three with their commits, because that is
+the only faithful way to test the parts. A test that skipped the claim would be
+testing a sequence the system never performs — and would fail anyway, since
+completing a `queued` job violates a constraint.
 
 ── The fake agent ───────────────────────────────────────────────────────────
 
@@ -24,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from app.db.models import IngestionStatus
 from app.errors import AgentUnavailableError
 from app.repositories.documents import DocumentRepository
+from app.schemas.documents import DocumentRead
 from app.services.ingestion import IngestionService
 
 PDF = b"%PDF-1.4 pretend this is a real document"
@@ -82,16 +94,48 @@ def service(session, repo, agent) -> IngestionService:
     return IngestionService(session, repo, agent)
 
 
-async def ingest(svc: IngestionService, filename: str = "zephyr-test.pdf"):
-    """The response body. Use `ingest_outcome` when the status code matters."""
-    outcome = await ingest_outcome(svc, filename)
-    return outcome.response
-
-
-async def ingest_outcome(svc: IngestionService, filename: str = "zephyr-test.pdf"):
-    return await svc.ingest(
+async def accept(svc: IngestionService, filename: str = "zephyr-test.pdf"):
+    """Only the request's half: record it, store the bytes, commit."""
+    return await svc.accept_upload(
         filename=filename, content=PDF, content_type="application/pdf"
     )
+
+
+async def ingest(
+    session: AsyncSession,
+    repo: DocumentRepository,
+    agent,
+    filename: str = "zephyr-test.pdf",
+):
+    """Accept, claim, process — and commit between each, as the system does.
+
+    **The claim is not optional scaffolding.** `process_job` requires a job
+    that is already `processing` with a `started_at`, because completing a
+    `queued` row would violate
+    `ck_ingestion_jobs_started_at_matches_status`. Skipping it would be testing
+    a sequence that cannot happen.
+
+    Returns the document as the database holds it afterwards — re-read, not
+    assembled from what was sent, so a write that silently failed to apply
+    shows up here rather than being papered over.
+    """
+    svc = IngestionService(session, repo, agent)
+
+    accepted = await accept(svc, filename)
+
+    claimed = await repo.claim_next_queued_job()
+    assert claimed is not None, "the job just accepted should be claimable"
+    assert claimed.job_id is not None
+    # The worker commits the claim before starting work, so that a crash
+    # leaves a `processing` row rather than rolling the claim back.
+    await session.commit()
+
+    await svc.process_job(claimed)
+
+    found = await repo.get_document_with_latest_job(accepted.document_id)
+    assert found is not None
+    document, job = found
+    return DocumentRead.from_rows(document, job)
 
 
 # ── Success ──────────────────────────────────────────────────────────────────
@@ -101,7 +145,7 @@ async def test_a_successful_ingest_is_recorded_as_done(
     session: AsyncSession, repo: DocumentRepository
 ) -> None:
     agent = FakeAgent()
-    response = await ingest(service(session, repo, agent))
+    response = await ingest(session, repo, agent)
 
     assert response.status is IngestionStatus.DONE
     assert response.chunk_count == 3
@@ -133,7 +177,7 @@ async def test_the_backend_sends_its_own_document_id_downstream(
     establish would be impossible.
     """
     agent = FakeAgent()
-    response = await ingest(service(session, repo, agent))
+    response = await ingest(session, repo, agent)
 
     assert len(agent.calls) == 1
     assert agent.calls[0]["document_id"] == str(response.document_id)
@@ -155,7 +199,7 @@ async def test_an_agent_error_is_recorded_with_its_message(
     detail = "'notes.txt' is not a PDF. It starts with b'just som'."
     agent = FakeAgent(status_code=400, body={"detail": detail})
 
-    response = await ingest(service(session, repo, agent), filename="notes.txt")
+    response = await ingest(session, repo, agent, filename="notes.txt")
 
     assert response.status is IngestionStatus.FAILED
     assert response.error == detail
@@ -180,7 +224,7 @@ async def test_a_failure_with_no_detail_still_records_something(
     transient failures from permanent ones.
     """
     agent = FakeAgent(status_code=502, body={})
-    response = await ingest(service(session, repo, agent))
+    response = await ingest(session, repo, agent)
 
     assert response.status is IngestionStatus.FAILED
     assert response.error == "unknown"
@@ -194,7 +238,7 @@ async def test_an_unreachable_agent_is_recorded_as_a_failed_attempt(
     Before this stage, an agent that was simply not running meant an upload
     that left no trace whatsoever.
     """
-    response = await ingest(service(session, repo, UnreachableAgent()))
+    response = await ingest(session, repo, UnreachableAgent())
 
     assert response.status is IngestionStatus.FAILED
     assert "Could not reach the agent" in (response.error or "")
@@ -224,10 +268,8 @@ async def test_an_interrupted_ingest_leaves_a_visible_row(
     *detectable*, not *recovered* — leases and a reaper are stage 2.1, and they
     are only buildable once there is a stuck row to look at.
     """
-    svc = service(session, repo, CrashingAgent())
-
     with pytest.raises(KeyboardInterrupt):
-        await ingest(svc)
+        await ingest(session, repo, CrashingAgent())
 
     # The session is still usable: the crash happened after the commit, so
     # there is no failed transaction to clean up.
@@ -252,9 +294,9 @@ async def test_stuck_jobs_can_be_found_by_query(
     state visible has to come first.
     """
     with pytest.raises(KeyboardInterrupt):
-        await ingest(service(session, repo, CrashingAgent()), filename="stuck.pdf")
+        await ingest(session, repo, CrashingAgent(), filename="stuck.pdf")
 
-    await ingest(service(session, repo, FakeAgent()), filename="fine.pdf")
+    await ingest(session, repo, FakeAgent(), filename="fine.pdf")
 
     stuck = (
         await session.execute(
@@ -272,46 +314,34 @@ async def test_stuck_jobs_can_be_found_by_query(
 # ── The commit really is before the call ─────────────────────────────────────
 
 
-async def test_the_row_is_durable_before_the_agent_is_called(
+async def test_another_connection_can_see_the_job_the_instant_it_is_accepted(
     test_database_url: str,
 ) -> None:
-    """The invariant, proved from outside the transaction.
+    """**The invariant, and now also the proof that a queue is possible.**
 
-    Every other test in this file shares the service's session, so it would see
-    the row whether or not it had been committed — an uncommitted INSERT is
-    perfectly visible to the transaction that made it. Asserting durability
-    from inside is asserting nothing.
+    Every other test in this file shares one session, so it would see the row
+    whether or not it had been committed — an uncommitted INSERT is perfectly
+    visible to the transaction that made it. Asserting durability from inside
+    is asserting nothing.
 
-    So this test runs the service on its own connection and has the fake agent,
-    **at the moment it is called**, open a *second* connection and look for the
-    row. A second connection can only see committed data.
+    So this test accepts an upload on its own connection and then looks for the
+    job from a *second* connection, which can only see committed data.
 
-    If someone later moves the commit to after the agent call, every other test
-    here still passes and this one fails.
+    ── Why this replaced the stage-1.2 version ────────────────────────────────
 
-    It opts out of the shared-transaction fixtures and cleans up after itself,
-    which is the price of being the one test that needs real commits.
+    That version had the fake agent probe for the row at the moment it was
+    called, proving the commit came first. After the split the agent is called
+    by `process_job`, two commits later, so the probe would pass trivially and
+    would no longer be testing the ordering at all.
+
+    What matters now is stronger and simpler: **the moment `accept_upload`
+    returns, another process can see the job.** That is not a detail of this
+    service, it is the entire premise of handing work to a worker. If the
+    commit moved after the response, the worker would be polling for rows that
+    do not exist yet and the queue would silently lose uploads.
     """
     engine = create_async_engine(test_database_url)
     probe_engine = create_async_engine(test_database_url)
-    seen: dict[str, int] = {}
-
-    class ProbingAgent:
-        async def ingest_document(self, *, document_id: str, **kwargs):
-            async with probe_engine.connect() as other:
-                count = (
-                    await other.execute(
-                        text("SELECT count(*) FROM documents WHERE id = :id"),
-                        {"id": uuid.UUID(document_id)},
-                    )
-                ).scalar_one()
-                seen["rows"] = count
-            return 200, {
-                "page_count": 1,
-                "pages_with_text": 1,
-                "characters_extracted": 10,
-                "chunk_count": 1,
-            }
 
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -319,15 +349,37 @@ async def test_the_row_is_durable_before_the_agent_is_called(
     document_id = None
     try:
         async with factory() as s:
-            svc = IngestionService(s, DocumentRepository(s), ProbingAgent())
-            outcome = await svc.ingest(
-                filename="durable.pdf", content=PDF, content_type="application/pdf"
-            )
-            document_id = outcome.response.document_id
+            svc = IngestionService(s, DocumentRepository(s), FakeAgent())
+            accepted = await accept(svc, "durable.pdf")
+            document_id = accepted.document_id
 
-        assert seen.get("rows") == 1, (
-            "a separate connection could not see the document when the agent "
-            "was called — the commit is not happening before the work starts"
+            # Still inside the service's session, and deliberately *before*
+            # anything else happens. A separate connection, no shared
+            # transaction.
+            async with probe_engine.connect() as other:
+                row = (
+                    await other.execute(
+                        text(
+                            "SELECT j.status, j.started_at IS NULL AS not_started, "
+                            "       length(u.content) AS stored_bytes "
+                            "  FROM ingestion_jobs j "
+                            "  JOIN document_uploads u ON u.document_id = j.document_id "
+                            " WHERE j.document_id = :id"
+                        ),
+                        {"id": document_id},
+                    )
+                ).one_or_none()
+
+        assert row is not None, (
+            "a separate connection could not see the job after accept_upload "
+            "returned — the commit is not happening before the response, and a "
+            "worker would never find this upload"
+        )
+        assert row.status == "queued"
+        assert row.not_started is True, "a queued job has not started"
+        assert row.stored_bytes == len(PDF), (
+            "the bytes must be committed with the job, or the worker has "
+            "nothing to ingest"
         )
     finally:
         if document_id is not None:
@@ -340,62 +392,73 @@ async def test_the_row_is_durable_before_the_agent_is_called(
         await probe_engine.dispose()
 
 
-# ── HTTP status codes ────────────────────────────────────────────────────────
+# ── What the route says, and what it no longer knows ─────────────────────────
+#
+# Stage 1.2 had three tests here asserting that the service reported the
+# agent's status code — 400 for a rejected PDF, 503 for an unreachable agent,
+# 200 for success — so that the frontend could not render a failure as a silent
+# success.
+#
+# **All three are gone, and nothing was lost.** The route cannot know any of
+# those things any more: it answers before the work happens. The outcomes they
+# protected are asserted directly against the recorded job by
+# `test_an_agent_error_is_recorded_with_its_message` and
+# `test_an_unreachable_agent_is_recorded_as_a_failed_attempt`, which is a
+# better place for them — they are facts about the record, not about a
+# response.
+#
+# What the route says instead is below.
 
 
-async def test_a_rejected_document_keeps_the_agent_status_code(
-    session: AsyncSession, repo: DocumentRepository
+async def test_the_route_returns_202_with_a_location_header(
+    app, client, repo: DocumentRepository
 ) -> None:
-    """A failed ingestion is not an HTTP 200.
+    """`202 Accepted`, a queued record, and where to look for the outcome.
 
-    The attempt is recorded either way — that is the stage's point — but the
-    caller asked for a document to be indexed and it was not. Returning 200
-    with `status: "failed"` in the body means every client has to remember to
-    look, and the frontend does not: it shows an error only when the response
-    is not ok. A rejected PDF would render as a silent success.
+    202 is the whole contract of this stage. 200 would claim the document is
+    indexed; 202 says the request was valid, has been recorded, and has not
+    happened yet — and `Location` says where the answer will appear, so the
+    client does not have to reconstruct the URL from an id.
     """
-    agent = FakeAgent(status_code=400, body={"detail": "not a PDF"})
-    outcome = await ingest_outcome(service(session, repo, agent))
+    response = await client.post(
+        "/documents",
+        files={"file": ("zephyr-test.pdf", PDF, "application/pdf")},
+    )
 
-    assert outcome.http_status == 400
-    assert outcome.response.status is IngestionStatus.FAILED
+    assert response.status_code == 202
+    body = response.json()
+    assert body["status"] == "queued"
+    assert body["finished_at"] is None
+    assert body["chunk_count"] is None, "nothing has been attempted yet"
+    assert response.headers["location"] == f"/documents/{body['document_id']}"
+
+    found = await repo.get_document_with_latest_job(uuid.UUID(body["document_id"]))
+    assert found is not None
+    _document, job = found
+    assert job is not None
+    assert job.status is IngestionStatus.QUEUED
+    assert job.started_at is None
 
 
-async def test_an_unreachable_agent_is_a_503(
-    session: AsyncSession, repo: DocumentRepository
+async def test_the_route_accepts_an_upload_while_the_agent_is_down(
+    app, client, repo: DocumentRepository
 ) -> None:
-    """503, not 500: nothing is wrong with *this* service.
+    """**A capability this stage creates**, not merely a behaviour it preserves.
 
-    The distinction is what lets an error rate later answer "whose fault was
-    the outage?" without reading logs.
-    """
-    outcome = await ingest_outcome(service(session, repo, UnreachableAgent()))
-    assert outcome.http_status == 503
+    At stage 1.2 this test asserted a 503: the route called the agent inline,
+    so an agent outage was an upload failure. The upload was *recorded*, which
+    was the point of that stage, but the user still got an error and had to
+    try again later.
 
+    Now the route never touches the agent, so an outage is invisible at upload
+    time. The document is accepted, queued, and sits there until a worker and
+    a healthy agent exist — which is what a queue is for.
 
-async def test_success_is_a_200(
-    session: AsyncSession, repo: DocumentRepository
-) -> None:
-    outcome = await ingest_outcome(service(session, repo, FakeAgent()))
-    assert outcome.http_status == 200
-
-
-async def test_the_route_records_an_upload_when_the_agent_is_down(
-    app, client, session: AsyncSession, repo: DocumentRepository
-) -> None:
-    """The whole path, over HTTP, through the real app.
-
-    Everything else in this file calls the service directly. This one goes
-    through routing, dependency injection, multipart parsing, the response
-    model and the exception handlers — the wiring service-level tests cannot
-    see.
-
-    **The agent is overridden rather than simply absent.** The first version of
-    this test relied on no agent happening to be running, which passed on a
-    laptop with nothing started and failed the instant `docker compose up`
-    started one. A test whose result depends on what else is running is not a
-    test — so the failure is injected here, deterministically, and the test
-    gives the same answer either way.
+    The agent override is left in place deliberately even though nothing
+    should call it. If the route ever starts talking to the agent again, this
+    test fails, and it fails deterministically rather than depending on
+    whether something happens to be running on port 8001 — a mistake the
+    stage-1.2 version of this test actually made.
     """
     from app.api.deps import get_agent_client
 
@@ -406,18 +469,19 @@ async def test_the_route_records_an_upload_when_the_agent_is_down(
         files={"file": ("zephyr-test.pdf", PDF, "application/pdf")},
     )
 
-    assert response.status_code == 503
+    assert response.status_code == 202, (
+        "an upload must not fail because the agent is unavailable"
+    )
     body = response.json()
-    assert body["status"] == "failed"
-    assert "Could not reach the agent" in body["detail"]
+    assert body["status"] == "queued"
+    assert body["error"] is None, "nothing has failed; nothing has been tried"
 
-    document_id = body["document_id"]
-    found = await repo.get_document_with_latest_job(uuid.UUID(document_id))
-    assert found is not None, "the upload must be recorded even when the agent is down"
+    found = await repo.get_document_with_latest_job(uuid.UUID(body["document_id"]))
+    assert found is not None
     document, job = found
     assert document.filename == "zephyr-test.pdf"
     assert job is not None
-    assert job.status is IngestionStatus.FAILED
+    assert job.status is IngestionStatus.QUEUED
 
 
 async def test_the_route_rejects_an_empty_upload_without_recording_it(

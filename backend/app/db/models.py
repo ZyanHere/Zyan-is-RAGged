@@ -32,6 +32,7 @@ from sqlalchemy import (
     Enum,
     ForeignKey,
     Integer,
+    LargeBinary,
     String,
     Text,
     func,
@@ -45,26 +46,44 @@ from app.db.base import Base
 class IngestionStatus(StrEnum):
     """Where an ingestion attempt is.
 
-        processing  ──▶  done
-                    ──▶  failed
+        queued  ──▶  processing  ──▶  done
+                                 ──▶  failed
 
-    **Three states, not four.** The curriculum's stage 2.1 describes
-    `queued → processing → done / failed`, and `queued` is deliberately absent
-    here: at stage 1.2 ingestion is synchronous, so a job would hold that state
-    for microseconds. It becomes meaningful at 1.3, when a queue puts a real
-    wait between creation and execution.
+    **`queued` arrived at stage 1.3**, and the three original values were
+    chosen so that it would be an *addition* rather than a rename — nothing
+    existing changed meaning, and no data had to be rewritten.
 
-    The vocabulary matches the curriculum, so adding `queued` later is a new
-    value rather than a rename of existing ones.
+    The two non-terminal states are not interchangeable, and the difference is
+    the whole point of the stage:
+
+        queued      written by the API. Nobody has picked it up.
+                    `started_at IS NULL`.
+        processing  claimed by a worker, which is now doing the work.
+                    `started_at` is when it was claimed.
+
+    That distinction is what makes a backlog measurable
+    (`count(*) WHERE status = 'queued'`) and what will let stage 2.1 tell
+    "waiting" from "abandoned".
 
     `StrEnum` rather than `Enum` so the member *is* its string: it compares
     equal to `"processing"`, serialises to JSON without a custom encoder, and
     needs no `.value` at call sites.
     """
 
+    QUEUED = "queued"
     PROCESSING = "processing"
     DONE = "done"
     FAILED = "failed"
+
+    @property
+    def is_terminal(self) -> bool:
+        """True when nothing further will happen to this job on its own.
+
+        A property rather than a set comparison at each call site, so "is this
+        finished?" has one spelling. The client polls until this is true, and
+        stage 2.1's reaper will look for the opposite.
+        """
+        return self in (IngestionStatus.DONE, IngestionStatus.FAILED)
 
 
 def new_id() -> uuid.UUID:
@@ -162,13 +181,47 @@ class Document(Base):
     else writes — stage 2.1's reaper might — this needs a database trigger.
     """
 
+    upload: Mapped["DocumentUpload | None"] = relationship(
+        back_populates="document",
+        cascade="all, delete-orphan",
+        lazy="raise",
+        # One row, not a list. Without this SQLAlchemy infers a collection
+        # from the foreign key and `document.upload` would be `[upload]`.
+        uselist=False,
+    )
+    """The bytes this document was uploaded as. Stage 1.3.
+
+    `| None` in the type because the row can legitimately be absent — nothing
+    deletes uploads yet, but something will, and a document whose bytes have
+    been reclaimed is still a document.
+
+    Declaring the relationship is what lets `DocumentUpload(document=...)`
+    work before the document has an id: SQLAlchemy orders the two INSERTs and
+    fills the foreign key in itself. The alternative is flushing the document
+    first to get its id, which is a second round trip to avoid one line of
+    mapping.
+
+    `lazy="raise"` for the same reason as `jobs`, and it matters more here —
+    an accidental lazy load of this attribute pulls the whole file into memory.
+    """
+
     jobs: Mapped[list["IngestionJob"]] = relationship(
         back_populates="document",
         cascade="all, delete-orphan",
         lazy="raise",
-        order_by="IngestionJob.started_at.desc()",
+        order_by="(IngestionJob.queued_at.desc(), IngestionJob.id.desc())",
     )
     """Every attempt at this document, newest first.
+
+    **Ordered by `queued_at`, not `started_at`** — stage 1.3 made `started_at`
+    nullable, and a queued job has none. Sorting by a column that is NULL for
+    the newest row puts it at an end that depends on the database's NULLS
+    default, which is not a thing to rely on.
+
+    The `id` tiebreaker is load-bearing for the same reason it is in
+    `list_documents_with_latest_job`: Postgres's `now()` is
+    `transaction_timestamp()`, so two jobs written in one transaction share an
+    identical `queued_at` and the planner is free to return them in any order.
 
     `lazy="raise"` is not pedantry. Under async SQLAlchemy, touching an
     unloaded relationship raises `MissingGreenlet` — an error that names
@@ -250,9 +303,50 @@ class IngestionJob(Base):
         nullable=False,
     )
 
-    started_at: Mapped[datetime] = mapped_column(
+    queued_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+    """When this attempt was enqueued. Stage 1.3.
+
+    **Why a new column rather than reusing `started_at`.** They are different
+    events now. A job is created by the API and picked up by a worker some time
+    later — that gap is the queue, and its length is the thing an operator
+    wants to see. One column cannot mean both "written down" and "work began"
+    without lying about one of them.
+
+    It is also the only creation timestamp this table has: `documents` has
+    `created_at`, `ingestion_jobs` never did, and `started_at` had been
+    standing in for it.
+
+    `server_default` so the database clock decides, for the same reason as
+    everywhere else here — at stage 12.1 there are several API instances with
+    independent clocks.
+    """
+
+    started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    """When a worker claimed this job — **nullable since stage 1.3.**
+
+    `NULL` means `queued`: written down, nobody working on it. The
+    `started_at_matches_status` constraint below makes that equivalence a
+    database guarantee rather than a convention.
+
+    **The `server_default` of `now()` had to be dropped, not merely made
+    optional**, and the reason is a SQLAlchemy behaviour worth knowing:
+    assigning `None` to a column that has a server default does *not* write
+    NULL. SQLAlchemy reads it as "I have no opinion", omits the column from the
+    INSERT, and fetches the generated value back in a RETURNING clause. So
+    while the default existed, a queued row was not merely inconvenient to
+    write — it was **unwritable**, and the first test to try produced a
+    constraint violation rather than a NULL.
+
+    The consequence is that every writer now says what it means: the repository
+    stamps `func.now()` when it creates a `processing` job, and stage 1.3's
+    claim stamps it when a worker takes a `queued` one. Which is the honest
+    arrangement anyway — "when did work begin" is not a question the database
+    can answer by itself.
+    """
 
     finished_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -298,12 +392,16 @@ class IngestionJob(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('processing', 'done', 'failed')",
+            "status IN ('queued', 'processing', 'done', 'failed')",
             name="status_allowed",
         ),
         CheckConstraint(
-            "(status = 'processing') = (finished_at IS NULL)",
+            "(status IN ('queued', 'processing')) = (finished_at IS NULL)",
             name="finished_at_matches_status",
+        ),
+        CheckConstraint(
+            "(status = 'queued') = (started_at IS NULL)",
+            name="started_at_matches_status",
         ),
         CheckConstraint(
             "finished_at IS NULL OR finished_at >= started_at",
@@ -314,29 +412,45 @@ class IngestionJob(Base):
             name="failed_requires_error",
         ),
     )
-    """Four invariants, enforced by the database rather than by convention.
+    """Five invariants, enforced by the database rather than by convention.
 
     **`status_allowed`** — the set of legal states, as a CHECK on a VARCHAR
-    rather than a native Postgres enum type. Adding `queued` at stage 1.3 is
-    then an ordinary migration that drops and recreates this constraint;
-    `ALTER TYPE ... ADD VALUE` on a native enum cannot be reversed, and values
-    can never be removed without rebuilding the type.
+    rather than a native Postgres enum type. **This is the decision paying
+    off:** adding `queued` at stage 1.3 was an ordinary migration that drops
+    and recreates this constraint. `ALTER TYPE ... ADD VALUE` on a native enum
+    cannot be reversed, so the downgrade would have been impossible to write.
 
     **`finished_at_matches_status`** — a job is finished exactly when it has a
     finish time. Both sides of the equality are booleans that can never be
     NULL (`status` is NOT NULL, and `IS NULL` always yields true or false), so
     the check is total:
 
-        processing + no finish time   ✅
-        processing + a finish time    ❌
-        done/failed + no finish time  ❌
-        done/failed + a finish time   ✅
+        queued/processing + no finish time   ✅
+        queued/processing + a finish time    ❌
+        done/failed + no finish time         ❌
+        done/failed + a finish time          ✅
 
     This is what makes "stuck in processing" a structurally visible state —
     which stage 1.2 exists to create and stage 2.1 exists to fix with leases
     and a reaper. Leave it broken for now.
 
+    **`started_at_matches_status`** — the 1.3 addition, and the one that makes
+    `queued` mean something enforceable rather than advisory:
+
+        queued + no start time          ✅
+        queued + a start time           ❌   "nobody picked it up, and it began"
+        processing/done/failed + start  ✅
+        processing/done/failed + none   ❌   "it is running, and never started"
+
+    Without it, a bug in the claim could leave a row that is `processing` with
+    no record of when — and the first thing stage 2.1's reaper needs is to ask
+    "how long has this been running?"
+
     **`finished_after_started`** — catches clock skew and reversed arguments.
+    Still safe with a nullable `started_at`: a row with a `finished_at` is
+    `done` or `failed`, which `started_at_matches_status` already requires to
+    have a `started_at`. The two constraints lean on each other, so neither
+    needs a NULL branch.
 
     **`failed_requires_error`** — a failure with no explanation is a failure
     you cannot diagnose. If the cause is genuinely unknown the code must store
@@ -345,4 +459,103 @@ class IngestionJob(Base):
     Every constraint is named, because the naming convention in `base.py` uses
     `%(constraint_name)s`. An unnamed CheckConstraint raises at table-definition
     time rather than producing an unnameable constraint — the right failure.
+    """
+
+
+class DocumentUpload(Base):
+    """The uploaded bytes, kept until something else owns them. Stage 1.3.
+
+    ── Why this table has to exist at all ───────────────────────────────────────
+
+    Until 1.3 the file lived in one place: a `bytes` object inside the request
+    that carried it. That was sufficient because the work happened inside that
+    same request.
+
+    `202 Accepted` breaks it. The response goes out, the request object is
+    collected, and *then* a worker gets around to the job — by which point the
+    only copy of the file is gone. So the bytes need a home that outlives the
+    request, and it has to be written in the same transaction as the job, or a
+    crash between the two produces a job whose input does not exist.
+
+    ── Why a separate table rather than a column on `documents` ────────────────
+
+    Two reasons, one of them a real bug avoided.
+
+    `documents` is the table the list endpoint reads, and it reads it with the
+    ORM. A `bytea` column on a mapped class is loaded whenever the entity is
+    loaded unless every query remembers to defer it — and the one that forgets
+    pulls 25 MB per row into memory to render a sidebar. Postgres TOASTs large
+    values out of line, so the *storage* would have been fine; it is the ORM's
+    default eagerness that is the hazard.
+
+    It also separates lifetimes. Deleting the bytes while keeping the document
+    and its history becomes a `DELETE` from one table rather than an `UPDATE`
+    setting a column to NULL, and the FK with `ON DELETE CASCADE` still means
+    deleting a document takes its upload with it.
+
+    ── Kept after success, deliberately ────────────────────────────────────────
+
+    Nothing deletes these rows yet, and the storage grows without bound. That
+    is a known cost accepted for one reason: stage 2.2 re-indexes documents,
+    and a re-index with no stored input is a re-upload. Throwing the bytes away
+    on success would make the next stage impossible without one.
+
+    The honest consequence is that the database now grows with the corpus
+    rather than with its metadata. **Object storage is the fix** and its
+    trigger is named: when the database size becomes a problem, or when stage
+    12.1 puts the backend and the worker on different machines. Not before.
+    """
+
+    __tablename__ = "document_uploads"
+
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        PgUUID(as_uuid=True),
+        ForeignKey("documents.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    """One upload per document, enforced by making the FK the primary key.
+
+    No surrogate id: there is nothing to identify here that `document_id` does
+    not already identify, and a second row for the same document would be a
+    bug with no meaning. The PK gives the uniqueness and the index that the
+    worker's lookup needs, in one declaration.
+
+    Note this is the one foreign key in the schema that does **not** need an
+    explicit `index=True` — Postgres does not index FK columns automatically,
+    but a primary key is indexed by definition.
+    """
+
+    content: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    """The file, exactly as it arrived.
+
+    `LargeBinary` maps to `bytea`. Not `NULL`-able and not empty: the route
+    rejects a zero-byte upload before reaching here, so a row that exists
+    always has something to ingest.
+
+    **Stored unvalidated beyond its size.** `rag.extraction` checks the PDF
+    magic bytes, and it does so in the worker — so these bytes may well be
+    something that will fail to parse. That is correct: the job records the
+    attempt, and the failure belongs on the job rather than at the door.
+    """
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    """When the bytes were stored.
+
+    Not the same question as `documents.created_at`, even though today they
+    are written in one transaction and will hold identical values. They answer
+    different things once anything ever re-uploads, and this is the column a
+    future cleanup job would sort by.
+    """
+
+    document: Mapped["Document"] = relationship(
+        back_populates="upload", lazy="raise"
+    )
+    """The document these bytes belong to.
+
+    Adds no column — the foreign key above is the whole storage story. What it
+    adds is the ability to construct the pair in one go, before either row has
+    been flushed, which is why `create_document_with_job` can write document,
+    job and upload in a single transaction without an intermediate round trip.
     """

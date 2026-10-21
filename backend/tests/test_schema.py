@@ -13,12 +13,18 @@ cannot.
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError, InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.db.models import Document, IngestionJob, IngestionStatus, new_id
+from app.db.models import (
+    Document,
+    DocumentUpload,
+    IngestionJob,
+    IngestionStatus,
+    new_id,
+)
 
 
 def make_document(**overrides: object) -> Document:
@@ -30,6 +36,30 @@ def make_document(**overrides: object) -> Document:
     return Document(**{**defaults, **overrides})
 
 
+def make_job(**overrides: object) -> IngestionJob:
+    """A job that satisfies every constraint unless a test overrides one.
+
+    **`started_at` is explicit, and has to be.** It lost its `server_default`
+    at stage 1.3 so that a `queued` job could be written with NULL — see the
+    column's docstring — which means a job built directly in a test now
+    inserts NULL and violates `started_at_matches_status`.
+
+    Defaulting it here keeps each test violating only the constraint it names.
+    Without it, five existing tests failed for a reason none of them was about:
+    the same trap stage 1.2 hit from the other direction, where a test named
+    one constraint and broke two. **Adding a constraint can break a correct
+    test just as easily as changing one.**
+
+    `queued` jobs pass `started_at=None` explicitly, which reads as the
+    deliberate choice it is.
+    """
+    defaults = {
+        "status": IngestionStatus.PROCESSING,
+        "started_at": func.now(),
+    }
+    return IngestionJob(**{**defaults, **overrides})
+
+
 # ── Round trip ───────────────────────────────────────────────────────────────
 
 
@@ -39,7 +69,7 @@ async def test_a_document_and_its_job_round_trip(session: AsyncSession) -> None:
     await session.flush()
 
     session.add(
-        IngestionJob(document_id=document.id, status=IngestionStatus.PROCESSING)
+        make_job(document_id=document.id)
     )
     await session.commit()
 
@@ -115,8 +145,9 @@ async def test_an_unknown_status_is_rejected(session: AsyncSession) -> None:
     with pytest.raises(IntegrityError, match="status_allowed"):
         await session.execute(
             text(
-                "INSERT INTO ingestion_jobs (id, document_id, status, finished_at) "
-                "VALUES (:id, :doc, 'cancelled', now())"
+                "INSERT INTO ingestion_jobs "
+                "(id, document_id, status, started_at, finished_at) "
+                "VALUES (:id, :doc, 'cancelled', now(), now())"
             ),
             {"id": new_id(), "doc": document.id},
         )
@@ -230,7 +261,7 @@ async def test_a_successful_job_records_its_numbers(session: AsyncSession) -> No
     session.add(document)
     await session.flush()
 
-    job = IngestionJob(
+    job = make_job(
         document_id=document.id,
         status=IngestionStatus.DONE,
         finished_at=datetime.now(timezone.utc),
@@ -252,7 +283,7 @@ async def test_a_job_cannot_reference_a_missing_document(
     session: AsyncSession,
 ) -> None:
     session.add(
-        IngestionJob(document_id=new_id(), status=IngestionStatus.PROCESSING)
+        make_job(document_id=new_id())
     )
 
     with pytest.raises(IntegrityError, match="fk_ingestion_jobs_document_id"):
@@ -273,7 +304,7 @@ async def test_deleting_a_document_deletes_its_jobs(
     session.add(document)
     await session.flush()
     session.add(
-        IngestionJob(document_id=document.id, status=IngestionStatus.PROCESSING)
+        make_job(document_id=document.id)
     )
     await session.commit()
 
@@ -316,3 +347,214 @@ async def test_an_unloaded_relationship_raises_instead_of_lazy_loading(
 
     with pytest.raises(InvalidRequestError, match="lazy='raise'"):
         _ = fetched.jobs
+
+
+# ── The queued state (stage 1.3) ─────────────────────────────────────────────
+
+
+async def test_a_queued_job_round_trips(session: AsyncSession) -> None:
+    """The state the API writes and a worker later claims.
+
+    **This test is why `started_at` has no `server_default`.** The first
+    version of the migration kept one, reasoning that existing writers would
+    then need no change. This test failed: SQLAlchemy reads `started_at=None`
+    on a defaulted column as "no opinion", omits it from the INSERT, and lets
+    `now()` fill it in — so the row came back with a start time and violated
+    `started_at_matches_status`. A queued job was unwritable.
+    """
+    document = make_document()
+    session.add(document)
+    await session.flush()
+
+    job = IngestionJob(
+        document_id=document.id,
+        status=IngestionStatus.QUEUED,
+        started_at=None,
+    )
+    session.add(job)
+    await session.flush()
+
+    fetched = (
+        await session.execute(
+            select(IngestionJob).where(IngestionJob.id == job.id)
+        )
+    ).scalar_one()
+
+    assert fetched.status is IngestionStatus.QUEUED
+    assert fetched.started_at is None
+    assert fetched.finished_at is None
+    assert fetched.queued_at is not None, "the database clock should set this"
+
+
+async def test_a_queued_job_may_not_have_a_start_time(
+    session: AsyncSession,
+) -> None:
+    """`ck_ingestion_jobs_started_at_matches_status`, first half.
+
+    "Queued" means nobody has picked it up. A start time says otherwise, and
+    the pair is incoherent rather than merely untidy — stage 2.1's reaper asks
+    "how long has this been running?", and this row would answer for a job that
+    never started.
+
+    Every other constraint is satisfied: the status is legal, `finished_at` is
+    NULL as a non-terminal state requires, and nothing is failed. So Postgres
+    can only report this one.
+    """
+    document = make_document()
+    session.add(document)
+    await session.flush()
+
+    session.add(
+        IngestionJob(
+            document_id=document.id,
+            status=IngestionStatus.QUEUED,
+            started_at=datetime.now(timezone.utc),
+        )
+    )
+
+    with pytest.raises(IntegrityError, match="started_at_matches_status"):
+        await session.flush()
+
+
+@pytest.mark.parametrize(
+    ("status", "finished_at", "error"),
+    [
+        (IngestionStatus.PROCESSING, None, None),
+        (IngestionStatus.DONE, datetime.now(timezone.utc), None),
+        (IngestionStatus.FAILED, datetime.now(timezone.utc), "not a PDF"),
+    ],
+)
+async def test_a_job_past_queued_must_have_a_start_time(
+    session: AsyncSession,
+    status: IngestionStatus,
+    finished_at: datetime | None,
+    error: str | None,
+) -> None:
+    """`ck_ingestion_jobs_started_at_matches_status`, second half.
+
+    Each case is constructed to violate **only** this constraint — the lesson
+    from stage 1.2, where a test named one constraint, broke two, and passed on
+    whichever Postgres reported first:
+
+        processing  finished_at NULL      satisfies finished_at_matches_status
+        done        finished_at set       satisfies it the other way
+        failed      finished_at + error   also satisfies failed_requires_error
+
+    `finished_after_started` survives a NULL `started_at` on purpose:
+    `finished_at >= NULL` evaluates to NULL, and a CHECK only rejects FALSE.
+    The two constraints lean on each other rather than each carrying a NULL
+    branch.
+    """
+    document = make_document()
+    session.add(document)
+    await session.flush()
+
+    session.add(
+        IngestionJob(
+            document_id=document.id,
+            status=status,
+            started_at=None,
+            finished_at=finished_at,
+            error=error,
+        )
+    )
+
+    with pytest.raises(IntegrityError, match="started_at_matches_status"):
+        await session.flush()
+
+
+def test_only_done_and_failed_are_terminal() -> None:
+    """What the client polls on, and what stage 2.1's reaper looks for.
+
+    A pure function over the enum, so no database: the point is that `queued`
+    and `processing` are both non-terminal but are *not* interchangeable, which
+    is the distinction the stage exists to create.
+    """
+    assert IngestionStatus.QUEUED.is_terminal is False
+    assert IngestionStatus.PROCESSING.is_terminal is False
+    assert IngestionStatus.DONE.is_terminal is True
+    assert IngestionStatus.FAILED.is_terminal is True
+
+
+# ── Stored uploads (stage 1.3) ───────────────────────────────────────────────
+
+
+async def test_an_upload_round_trips_byte_for_byte(
+    session: AsyncSession,
+) -> None:
+    """The bytes a worker will read after the request that carried them is gone.
+
+    Asserted byte-for-byte rather than by length: `bytea` round-tripping
+    through asyncpg is the sort of thing that works until a NUL or a high byte
+    appears, and a PDF is full of both.
+    """
+    document = make_document()
+    session.add(document)
+    await session.flush()
+
+    content = b"%PDF-1.7\x00\xff\n binary \x80\x81 payload \x00"
+    session.add(DocumentUpload(document_id=document.id, content=content))
+    await session.flush()
+
+    fetched = (
+        await session.execute(
+            select(DocumentUpload).where(
+                DocumentUpload.document_id == document.id
+            )
+        )
+    ).scalar_one()
+
+    assert fetched.content == content
+    assert fetched.created_at is not None
+
+
+async def test_a_document_can_have_only_one_upload(
+    session: AsyncSession,
+) -> None:
+    """Enforced by making the foreign key the primary key.
+
+    A second row for the same document has no meaning — there is one file —
+    and without the constraint the worker's lookup would have to decide which
+    of two inputs was the real one.
+    """
+    document = make_document()
+    session.add(document)
+    await session.flush()
+
+    session.add(DocumentUpload(document_id=document.id, content=b"%PDF-1.7 a"))
+    await session.flush()
+
+    session.add(DocumentUpload(document_id=document.id, content=b"%PDF-1.7 b"))
+
+    with pytest.raises(IntegrityError, match="pk_document_uploads"):
+        await session.flush()
+
+
+async def test_deleting_a_document_deletes_its_upload(
+    session: AsyncSession,
+) -> None:
+    """`ON DELETE CASCADE`, so the bytes cannot outlive the document.
+
+    This matters more than it looks: the uploads table is the only place in
+    this system that grows with the size of the corpus rather than with its
+    metadata, and an orphaned 25 MB row that nothing references is invisible
+    until a disk fills.
+    """
+    document = make_document()
+    session.add(document)
+    await session.flush()
+    session.add(DocumentUpload(document_id=document.id, content=b"%PDF-1.7 x"))
+    await session.flush()
+
+    await session.delete(document)
+    await session.flush()
+
+    remaining = (
+        await session.execute(
+            select(DocumentUpload).where(
+                DocumentUpload.document_id == document.id
+            )
+        )
+    ).scalar_one_or_none()
+
+    assert remaining is None

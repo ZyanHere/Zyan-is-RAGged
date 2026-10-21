@@ -1,52 +1,75 @@
-"""Ingesting a document, durably.
+"""Ingesting a document, durably — in two halves.
 
-This module exists for one line of code, and everything else here is in service
-of making that line obvious:
+Stage 1.2 built this as one method: record the attempt, commit, do the work,
+record the outcome. Stage 1.3 cuts it in two at the commit, and the cut is the
+whole stage:
 
-    await session.commit()        # before the agent is called, not after
+    accept_upload()     record the attempt, store the bytes, COMMIT, return
+                        ← this is all a request does now
 
-── Why that ordering is the whole of stage 1.2 ──────────────────────────────
+    process_job()       fetch the bytes, call the agent, record the outcome
+                        ← this runs in a worker, some time later
 
-Before this stage, the only evidence a document existed was its chunks in
-Qdrant. That is a *result*, not a record of intent. Kill the process halfway
-through a 300-page PDF and you are left with some chunks and no way to tell
-whether the document was half-indexed, fully indexed, or never uploaded at all.
-"Partially indexed" and "never happened" looked identical.
+── Why cutting there ───────────────────────────────────────────────────────────
 
-Committing the intent *first* separates them. After the commit there is a row
-saying **this arrived and we started work on it**, and it survives anything
-that happens next — a crash, a timeout, a power cut, a rate limit from the
-embedding provider halfway through.
+Because that commit was already the boundary between "we know about this
+document" and "we are working on it". Stage 1.2 put it in the right place for a
+reason it could not yet collect on; 1.3 collects.
 
-If the two commits were one — if the row were written in the same transaction
-as the result — a crash would roll back both and the system would be exactly as
-blind as before the database existed. The database would be decoration.
+The 1.2 invariant is not weakened by the split, it is strengthened. The commit
+still precedes any work — and now the work is not even in the same process, so
+there is no way for a future edit to accidentally reorder them.
 
-── What this deliberately does not fix ──────────────────────────────────────
+── Why the halves cannot be run back-to-back ───────────────────────────────────
 
-A job whose process dies stays `processing` forever. Nothing retries it,
-nothing reclaims it, nothing notices.
+They can, and that is exactly what the system did until this layer. What
+changed is that `accept_upload` now writes a **`queued`** job with no
+`started_at`, and `process_job` expects an already-claimed `processing` one.
+The transition between them belongs to `claim_next_queued_job`, which is also
+what makes it safe for two workers to run at once.
 
-That is correct for now. Stage 1.2's measure is *interrupted ingests that are
-detectable: 0% → 100%* — detectable, not recovered. The lease, the heartbeat
-and the reaper that requeues abandoned work are stage 2.1, and they are only
+So the sequence is three steps, not two, and the middle one is the queue:
+
+    accept_upload  →  COMMIT  ···  claim  →  COMMIT  ···  process_job  →  COMMIT
+
+Each `···` is an arbitrary amount of time, possibly a process restart.
+
+── What this deliberately does not fix ─────────────────────────────────────────
+
+A job whose worker dies stays `processing` forever. Nothing retries it, nothing
+reclaims it, nothing notices — and now nobody is even waiting on a request to
+find out, which makes it worse and more realistic.
+
+That is correct for now. Stage 2.1's lease, heartbeat and reaper are only
 buildable once there is a stuck row to observe. Leave it broken; make it
 visible.
+
+── `IngestOutcome` is gone ─────────────────────────────────────────────────────
+
+Stage 1.2 introduced it so a failed ingestion could keep the agent's status
+code — 400 for "not a PDF", 422 for "nothing to index" — instead of returning
+HTTP 200 with the failure buried in the body, which the frontend would have
+rendered as silent success.
+
+The route no longer learns an outcome at all. It returns `202 Accepted` before
+any work happens, so there is no status code to carry and nothing to decide.
+The failure reaches the user through the document's `error` field, which the
+client has displayed since 1.2 — so the problem that type solved has moved
+rather than returned.
 """
 
 import logging
-from dataclasses import dataclass
-from http import HTTPStatus
 from typing import Protocol
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.errors import AgentUnavailableError
-from app.repositories.documents import DocumentRepository
+from app.repositories.documents import ClaimedJob, DocumentRepository
 from app.schemas.documents import DocumentRead
 from app.services import agent_client
 
 logger = logging.getLogger(__name__)
+
 
 class AgentClient(Protocol):
     """What the ingestion service needs from the agent.
@@ -71,34 +94,6 @@ class AgentClient(Protocol):
         ...
 
 
-@dataclass(slots=True)
-class IngestOutcome:
-    """What happened, and what the HTTP layer should say about it.
-
-    The status code travels with the response instead of being inferred from
-    it, because the two answer different questions and only the route should
-    decide the second.
-
-    **Why a failed ingestion is not an HTTP 200.** The attempt is recorded
-    either way — that is this stage's whole point — but the caller asked for a
-    document to be indexed and it was not. Returning 200 with `status:
-    "failed"` buried in the body means every client has to remember to look,
-    and the one we have does not: the frontend shows an error only when the
-    response is not ok. A rejected PDF would render as a success with no
-    message at all.
-
-    So the failure keeps the status code the agent gave it — 400 for "not a
-    PDF", 422 for "nothing to index", 502 for a provider outage — and the body
-    carries `detail` where every existing client already looks.
-
-    At stage 1.3 this becomes `202 Accepted` plus a job id, and the outcome
-    stops being known at response time at all.
-    """
-
-    http_status: int
-    response: "DocumentRead"
-
-
 UNKNOWN_ERROR = "unknown"
 """Stored when a failure arrives with no message.
 
@@ -108,15 +103,38 @@ honest, and stage 2.3 will want to know how often it happens when it starts
 classifying failures as transient or permanent.
 """
 
+MISSING_UPLOAD_ERROR = (
+    "The stored upload for this document is missing, so there is nothing to "
+    "ingest. The job cannot be retried without re-uploading the file."
+)
+"""Recorded when a claimed job's bytes are not there.
+
+**This should be unreachable.** The document, its job and its upload are
+written in one transaction, and the foreign key cascades, so a job without an
+upload would mean someone deleted the bytes while leaving the job behind.
+
+It is handled rather than asserted because the honest response to "the input
+vanished" is a failed job with a readable reason — something an operator can
+see in the list — not a stack trace in a log nobody is reading. A worker is not
+a request; there is no caller to hand an exception to.
+"""
+
 
 class IngestionService:
-    """Orchestrates one upload: record it, attempt it, record the outcome.
+    """Accepts uploads, and processes claimed jobs.
 
     Takes the session *and* the repository. The repository stages writes; the
     session owns transaction boundaries, and this class is the only place that
     decides where those boundaries fall. That split is why neither the
     dependency nor the repository commits on anyone's behalf — if they did, the
-    ordering above would be a property of some other file.
+    ordering this module exists to guarantee would be a property of some other
+    file.
+
+    **One class, two callers, and they use different halves.** The route calls
+    `accept_upload` and never touches the agent; the worker calls `process_job`
+    and never accepts anything. They are together because they share the
+    session-and-repository wiring and because reading them side by side is how
+    the cut between them stays obvious.
 
     `agent` is injected so tests can supply a fake. That is not only for speed:
     testing "does the backend record a failure when the agent fails?" against a
@@ -134,75 +152,107 @@ class IngestionService:
         self._repository = repository
         self._agent = agent
 
-    async def ingest(
-        self, *, filename: str, content: bytes, content_type: str | None
-    ) -> IngestOutcome:
-        """Index one document, leaving a durable record either way."""
+    # ── The request's half ────────────────────────────────────────────────────
 
-        # ── 1. Record the intent ──────────────────────────────────────────────
+    async def accept_upload(
+        self, *, filename: str, content: bytes, content_type: str | None
+    ) -> DocumentRead:
+        """Record that a document arrived, and that it needs indexing.
+
+        Everything a request does. Two INSERTs, one blob, one COMMIT — bounded
+        work whose duration depends on the size of the upload and nothing else.
+        No agent call, no embedding, no vector store.
+
+        Returns the document as it now stands: `status = "queued"`, every count
+        `null`, because nothing has been attempted yet. The caller turns that
+        into a `202`.
+        """
         document, job = await self._repository.create_document_with_job(
             filename=filename,
-            byte_size=len(content),
+            content=content,
             content_type=content_type,
         )
 
-        # ── 2. Make it durable, before any work starts ───────────────────────
-        #
-        # Everything after this line can fail, hang or be killed. None of it can
-        # erase the fact that this document was uploaded and an attempt began.
+        # The invariant, inherited from 1.2 and now load-bearing for a second
+        # reason: a worker in another process can only see committed rows, so
+        # this commit is also what *publishes* the job to the queue.
         await self._session.commit()
 
-        document_id = document.id
-        job_id = job.id
         logger.info(
-            "ingestion started document_id=%s job_id=%s filename=%s bytes=%d",
-            document_id,
-            job_id,
+            "ingestion queued document_id=%s job_id=%s filename=%s bytes=%d",
+            document.id,
+            job.id,
             filename,
             len(content),
         )
 
-        # ── 3. Do the work ───────────────────────────────────────────────────
-        #
-        # Synchronous and unbounded: a 300-page PDF holds this open for minutes
-        # and may hit the agent timeout. That is stage 1.1's known defect and
-        # the trigger for 1.3's `202 Accepted` and job polling. It is left in
-        # place on purpose — but from now on, when it happens, there is a row
-        # that says so.
+        return DocumentRead.from_rows(document, job)
+
+    # ── The worker's half ─────────────────────────────────────────────────────
+
+    async def process_job(self, claimed: ClaimedJob) -> None:
+        """Run one already-claimed job to a terminal state.
+
+        **Takes a `ClaimedJob`, not a job id**, and that is a contract rather
+        than a convenience: the job must already be `processing` with a
+        `started_at`, because `mark_job_done` on a `queued` row would violate
+        `ck_ingestion_jobs_started_at_matches_status`. The type makes it
+        impossible to call this on something nobody claimed.
+
+        Returns nothing. There is no caller waiting for a result — the outcome's
+        only destination is the database, and the client reads it by polling.
+        Any exception that escapes here reaches the worker loop, which is where
+        the decision about retrying lives (and at this stage, does not).
+        """
+        found = await self._repository.get_document_with_latest_job(
+            claimed.document_id
+        )
+        if found is None:
+            # The foreign key makes this impossible, so treat it as a failure
+            # rather than crashing the worker on an invariant violation.
+            await self._record_failure(claimed.job_id, MISSING_UPLOAD_ERROR)
+            return
+
+        document, _ = found
+
+        content = await self._repository.get_upload_content(claimed.document_id)
+        if content is None:
+            await self._record_failure(claimed.job_id, MISSING_UPLOAD_ERROR)
+            return
+
+        # Unbounded, and no longer a problem for anyone waiting. The agent
+        # timeout still applies — it is the worker that now absorbs it, and
+        # `AGENT_TIMEOUT` stops being a guess about a user's patience and
+        # becomes a measured decision at stage 7.1.
         try:
             status_code, body = await self._agent.ingest_document(
-                document_id=str(document_id),
-                filename=filename,
+                document_id=str(claimed.document_id),
+                filename=document.filename,
                 content=content,
-                content_type=content_type,
+                content_type=document.content_type,
             )
         except AgentUnavailableError as exc:
             # No response at all — the agent is down, or did not answer in
             # time. Still a failed attempt, and still worth recording.
-            return await self._record_failure(
-                document, job_id, str(exc), HTTPStatus.SERVICE_UNAVAILABLE
-            )
+            await self._record_failure(claimed.job_id, str(exc))
+            return
 
-        # ── 4. Record the outcome ────────────────────────────────────────────
         if status_code >= 400:
             detail = body.get("detail")
             message = detail if isinstance(detail, str) and detail else UNKNOWN_ERROR
-            return await self._record_failure(
-                document, job_id, message, status_code
-            )
+            await self._record_failure(claimed.job_id, message)
+            return
 
-        return await self._record_success(document, job_id, body)
+        await self._record_success(claimed.job_id, body)
 
-    async def _record_success(
-        self, document: object, job_id: object, body: dict
-    ) -> IngestOutcome:
+    async def _record_success(self, job_id: object, body: dict) -> None:
         """Mark the attempt done and store its numbers.
 
         The counts are read from the agent's body with `.get(..., 0)` rather
         than indexed. A missing field here would be a contract mismatch between
-        two services, and failing the whole upload over it — *after* the
-        document has already been indexed in Qdrant — would turn a cosmetic
-        problem into a lost document.
+        two services, and failing the whole job over it — *after* the document
+        has already been indexed in Qdrant — would turn a cosmetic problem into
+        a lost document.
         """
         await self._repository.mark_job_done(
             job_id,
@@ -214,36 +264,22 @@ class IngestionService:
         await self._session.commit()
 
         logger.info("ingestion done job_id=%s", job_id)
-        return IngestOutcome(HTTPStatus.OK, await self._respond(document, job_id))
 
-    async def _record_failure(
-        self, document: object, job_id: object, error: str, http_status: int
-    ) -> IngestOutcome:
+    async def _record_failure(self, job_id: object, error: str) -> None:
         """Mark the attempt failed, with the reason the engine gave.
 
         `status` and `finished_at` move together in one UPDATE because
         `ck_ingestion_jobs_finished_at_matches_status` permits nothing else —
         the repository handles that, and the constraint is what guarantees a
         `processing` row genuinely means "still running".
+
+        **No `http_status` any more.** The failure is no longer travelling back
+        up a request; it is being written down for whoever asks later. Which
+        status code the agent used is still captured, inside `error`, where it
+        belongs as diagnostic text rather than as a response code nobody will
+        read.
         """
         await self._repository.mark_job_failed(job_id, error=error)
         await self._session.commit()
 
-        logger.warning(
-            "ingestion failed job_id=%s status=%s error=%s",
-            job_id,
-            http_status,
-            error,
-        )
-        return IngestOutcome(http_status, await self._respond(document, job_id))
-
-    async def _respond(self, document: object, job_id: object) -> DocumentRead:
-        """Build the response from the database, not from what we just sent.
-
-        One extra read, and it means the response cannot claim something the
-        database does not hold. A write that silently failed to apply shows up
-        here instead of being papered over by the values still in memory.
-        """
-        job = await self._repository.get_job(job_id)
-        assert job is not None, "the job was committed moments ago"
-        return DocumentRead.from_rows(document, job)
+        logger.warning("ingestion failed job_id=%s error=%s", job_id, error)

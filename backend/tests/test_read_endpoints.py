@@ -42,12 +42,40 @@ def repo(session: AsyncSession) -> DocumentRepository:
 
 
 async def seed(session, repo, filename: str, agent: FakeAgent | None = None):
-    """Put one document through the real ingestion path."""
+    """Put one document through the real ingestion path, end to end.
+
+    Three steps now, with their commits: accept, claim, process. The claim is
+    required rather than decorative — `process_job` expects a job that is
+    already `processing`, and completing a `queued` one violates
+    `ck_ingestion_jobs_started_at_matches_status`.
+
+    Use `seed_queued` for a document that has been accepted and not yet picked
+    up, which is the state these endpoints must now also be able to report.
+    """
     service = IngestionService(session, repo, agent or FakeAgent())
-    outcome = await service.ingest(
+    accepted = await service.accept_upload(
         filename=filename, content=PDF, content_type="application/pdf"
     )
-    return outcome.response
+
+    claimed = await repo.claim_next_queued_job()
+    assert claimed is not None and claimed.document_id == accepted.document_id
+    await session.commit()
+
+    await service.process_job(claimed)
+    return accepted
+
+
+async def seed_queued(session, repo, filename: str):
+    """A document accepted but not yet claimed — the new intermediate state.
+
+    This is what every upload looks like for however long the queue is deep,
+    so an endpoint that cannot describe it is an endpoint that lies during
+    normal operation.
+    """
+    service = IngestionService(session, repo, FakeAgent())
+    return await service.accept_upload(
+        filename=filename, content=PDF, content_type="application/pdf"
+    )
 
 
 # ── The list ─────────────────────────────────────────────────────────────────
@@ -210,3 +238,64 @@ async def test_an_interrupted_ingest_is_visible_through_the_api(
     assert item["status"] == IngestionStatus.PROCESSING.value
     assert item["finished_at"] is None
     assert item["error"] is None
+
+
+# ── The queued state, over HTTP (stage 1.3) ──────────────────────────────────
+
+
+async def test_a_queued_document_is_reported_as_queued(
+    client, session, repo: DocumentRepository
+) -> None:
+    """**The state the client polls on.**
+
+    Between the `202` and a worker picking the job up, this is what every
+    upload looks like — and for however long the queue is deep, it is what the
+    user is staring at. An endpoint that could not describe it would be lying
+    during normal operation.
+
+    Every result field is `null`, and that is the honest answer rather than a
+    gap: nothing has been attempted, so there is nothing to report. `null` is
+    distinguishable from `0`, which would wrongly claim a document with no
+    pages.
+    """
+    accepted = await seed_queued(session, repo, "waiting.pdf")
+    await session.commit()
+
+    response = await client.get(f"/documents/{accepted.document_id}")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "queued"
+    assert body["finished_at"] is None
+    assert body["error"] is None
+    assert body["page_count"] is None
+    assert body["chunk_count"] is None
+
+
+async def test_the_list_distinguishes_queued_from_processing_from_done(
+    client, session, repo: DocumentRepository
+) -> None:
+    """Three documents, three states, one request.
+
+    This is the query the sidebar makes, and the reason `queued` had to be a
+    separate status rather than reusing `processing`: "nobody has started this"
+    and "a worker is working on it right now" look identical to a user
+    otherwise, and only one of them is a reason to worry when it lasts.
+    """
+    await seed(session, repo, "finished.pdf")
+
+    accepted = await seed_queued(session, repo, "running.pdf")
+    claimed = await repo.claim_next_queued_job()
+    assert claimed is not None and claimed.document_id == accepted.document_id
+
+    await seed_queued(session, repo, "waiting.pdf")
+    await session.commit()
+
+    items = (await client.get("/documents")).json()["items"]
+    by_name = {item["filename"]: item["status"] for item in items}
+
+    assert by_name == {
+        "finished.pdf": "done",
+        "running.pdf": "processing",
+        "waiting.pdf": "queued",
+    }

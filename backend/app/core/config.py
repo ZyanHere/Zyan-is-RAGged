@@ -94,6 +94,29 @@ class Settings(BaseSettings):
     db_max_overflow: int = Field(default=10, ge=0)
     """Extra connections opened under load, then closed again."""
 
+    # ── Worker (stage 1.3) ────────────────────────────────────────────────────
+
+    worker_poll_seconds: float = Field(default=1.0, gt=0)
+    """How long the worker waits before asking for work again, when idle.
+
+    **Polling, not notification.** Postgres has `LISTEN`/`NOTIFY`, which would
+    wake the worker the instant a job is enqueued instead of up to a second
+    later. It is not used, for a reason worth stating rather than defaulting
+    into: `NOTIFY` is fire-and-forget, so a worker that is restarting when the
+    notification fires misses it permanently and the job waits forever. Any
+    correct design still needs the poll as a backstop — at which point the
+    notification is a latency optimisation on top, not the mechanism.
+
+    So the poll is the mechanism, and this number is the worst-case delay
+    before a queued job is noticed. One second costs one query per idle worker
+    per second against a local Postgres, which is nothing; `NOTIFY` becomes
+    worth adding when the idle cost or the added latency is measured and
+    matters.
+
+    `gt=0` because zero would be a busy loop that pins a core and hammers the
+    database for no benefit.
+    """
+
     db_pool_pre_ping: bool = True
     """Check a pooled connection is alive before handing it out.
 
