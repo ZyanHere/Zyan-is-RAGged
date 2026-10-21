@@ -65,8 +65,21 @@ export interface Answer {
 
 // ── Documents ────────────────────────────────────────────────────────────────
 
-/** Where an ingestion attempt is. Mirrors the backend's `IngestionStatus`. */
-export type IngestionStatus = "processing" | "done" | "failed";
+/**
+ * Where an ingestion attempt is. Mirrors the backend's `IngestionStatus`.
+ *
+ * `"queued"` arrived at stage 1.3, when upload stopped doing the work. The two
+ * non-terminal states are **not** interchangeable and the UI must not treat
+ * them as one:
+ *
+ *   queued      recorded, nobody has picked it up. A deep queue is normal.
+ *   processing   a worker is on it — or died holding it, which looks identical
+ *                until stage 2.1 adds a lease.
+ *
+ * Collapsing them into one "in progress" badge would hide the only signal a
+ * user has that nothing is draining the queue.
+ */
+export type IngestionStatus = "queued" | "processing" | "done" | "failed";
 
 /**
  * A document the server knows about, with the state of its latest attempt.
@@ -124,12 +137,18 @@ export interface DocumentRecord {
   error: string | null;
 
   /**
-   * `null` while an attempt is still running.
+   * `null` until the attempt reaches a terminal state.
    *
    * The database guarantees that reading: a CHECK constraint forbids a
-   * terminal job without a finish time and a running one with one. So
-   * `status: "processing"` with `finishedAt: null` means precisely *started,
-   * never finished* — a document whose ingestion was interrupted.
+   * terminal job without a finish time and a non-terminal one with one.
+   *
+   * Since stage 1.3 there is a companion guarantee worth knowing, because it
+   * is what lets the UI tell waiting from working: a second constraint ties
+   * `started_at` to the status, so `queued` always has no start time and
+   * `processing` always has one. A `processing` job with no finish time is
+   * therefore precisely *claimed by a worker, not yet finished* — which is
+   * either normal or a dead worker, and nothing here can tell the difference
+   * until stage 2.1.
    */
   finishedAt: string | null;
 }

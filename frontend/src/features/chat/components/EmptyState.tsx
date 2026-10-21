@@ -1,7 +1,7 @@
 "use client";
 
 import { useAskQuestion } from "@/features/chat/useAskQuestion";
-import { useListDocumentsQuery } from "@/services/documentsApi";
+import { useDocuments } from "@/features/documents/useDocuments";
 
 /**
  * Shown before the first question.
@@ -35,11 +35,16 @@ const SUGGESTED_PROMPTS = [
 ];
 
 export function EmptyState() {
-  // The same query `DocumentList` uses. RTK Query caches by endpoint and
+  // The same hook `DocumentList` uses. RTK Query caches by endpoint and
   // argument, so these two components share one cache entry and one request —
   // each asks for what it needs and the library notices they are the same.
-  const { data: documents } = useListDocumentsQuery();
-  const hasDocuments = (documents?.length ?? 0) > 0;
+  //
+  // Going through `useDocuments` rather than the query directly means this
+  // component inherits the polling decision without participating in it: when
+  // the sidebar starts polling because something is queued, the suggestions
+  // here appear the moment that document finishes.
+  const { documents } = useDocuments();
+  const hasDocuments = documents.length > 0;
 
   const { askQuestion } = useAskQuestion();
 
@@ -93,8 +98,8 @@ export function EmptyState() {
           <p className="max-w-sm text-sm text-neutral-500">
             Nothing is indexed yet. Use{" "}
             <span className="font-medium text-neutral-700">Upload PDF</span> in
-            the sidebar — the document is extracted, chunked, embedded and
-            indexed before the upload returns.
+            the sidebar. The upload returns immediately and a background worker
+            does the indexing, so watch the document&apos;s row for progress.
           </p>
         </div>
       )}

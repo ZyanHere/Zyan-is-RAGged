@@ -102,23 +102,29 @@ export const documentsApi = baseApi.injectEndpoints({
     }),
 
     /**
-     * Upload one PDF and wait for it to be indexed.
+     * Hand one PDF to the server. **Does not wait for it to be indexed.**
      *
      * A mutation rather than a query: it changes server state, and its result
      * is not something the UI would look up again by key.
      *
-     * **This blocks for as long as ingestion takes** — extraction, an
-     * embedding call per batch of chunks, then the vector write. Ten pages is
-     * a few seconds; three hundred will sit here for minutes and eventually
-     * hit the backend's 120-second timeout.
+     * ── What changed at stage 1.3 ──────────────────────────────────────────
      *
-     * That is not an oversight to paper over in the UI. It is stage 1.1's
-     * known defect and the trigger for the `202 Accepted` plus job-polling
-     * design at stage 1.3 — where this becomes a mutation returning a job id,
-     * and a *query* polling its status with `pollingInterval`.
+     * This used to block for the whole ingest — extraction, an embedding call
+     * per batch, the vector write — so a large PDF sat here for minutes and
+     * eventually hit the backend's 120-second timeout.
      *
-     * Since stage 1.2 a failure is recorded too, so a rejected PDF appears in
-     * the list with its reason rather than vanishing.
+     * The server now answers `202 Accepted` as soon as the upload is recorded,
+     * in tens of milliseconds regardless of size. **So the resolved value of
+     * this mutation is a document with `status: "queued"` and every count
+     * `null`** — not a result, a receipt.
+     *
+     * The outcome arrives through `listDocuments`, which `useDocuments` polls
+     * while anything is unfinished. That is why `invalidatesTags` matters more
+     * than it used to: it is what starts the polling.
+     *
+     * A component reading `pageCount` from this mutation's `data` would
+     * therefore render blanks forever and look broken. The numbers belong to
+     * the list row now, which is where they actually arrive.
      */
     uploadDocument: builder.mutation<DocumentRecord, File>({
       query: (file) => {

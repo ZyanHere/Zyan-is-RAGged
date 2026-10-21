@@ -48,8 +48,12 @@ export function AppHeader() {
 
       <h1 className="text-sm font-medium text-neutral-500">myRAG</h1>
 
+      {/* A deliberate reminder of what this build actually is, so nobody —
+          including me — mistakes a curriculum stage for a finished product.
+          It changes when the architecture does: stage 1.3 moved ingestion out
+          of the request, so "synchronous" stopped being true. */}
       <span className="ml-auto text-xs text-neutral-400">
-        stage 1.1 · synchronous
+        stage 1.3 · queued ingestion
       </span>
     </header>
   );

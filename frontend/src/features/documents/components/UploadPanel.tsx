@@ -5,7 +5,7 @@ import { useRef } from "react";
 import { useUploadDocumentMutation } from "@/services/documentsApi";
 
 /**
- * The file picker, and the report of what ingestion actually did.
+ * The file picker, and confirmation that the server took the file.
  *
  * Takes no props. It calls the mutation directly rather than going through a
  * feature hook the way chat does — **because it is the only uploader.** The
@@ -17,19 +17,28 @@ import { useUploadDocumentMutation } from "@/services/documentsApi";
  * empty state, say — this becomes a `useUploadDocument` hook with a
  * `fixedCacheKey`, for exactly the reason spelled out in `useAskQuestion`.
  *
- * ── Why the numbers, not a success message ──────────────────────────────────
+ * ── Why this panel no longer reports what ingestion did ─────────────────────
  *
- * The dangerous outcome at this stage is not a crash. It is a scanned PDF that
- * opens cleanly, yields no text, and reports success having indexed nothing.
- * The engine refuses that outright — but the *partial* case, ten pages with
- * three yielding text, is a real and quiet loss. The only way to notice it is
- * to put `pagesWithText` next to `pageCount` and let a human see the gap.
+ * It used to show page count, pages-with-text, chunks and characters, with a
+ * warning when pages yielded no text. All of that came from the upload
+ * response, because the request stayed open until the document was indexed.
+ *
+ * Stage 1.3 ended that. The response is now a `202` receipt: `status:
+ * "queued"` and every count `null`. Rendering those fields here would show
+ * blanks forever and look broken.
+ *
+ * **So the numbers moved to the document row**, which is where they now
+ * arrive — including the pages-with-text gap, the one that catches a scanned
+ * PDF indexing almost nothing. Nothing was lost, and a duplicate display went
+ * away with it.
+ *
+ * What is left here is the only thing this component can still truthfully say:
+ * the file reached the server and is recorded.
  */
 export function UploadPanel() {
-  // `data` is the mutation's own result — the last upload this component
-  // performed. It replaces what used to come from an `uploads` slice: the
-  // slice was a client-side copy of information RTK Query already holds, and
-  // of a list the server now owns outright.
+  // `data` is this component's last upload — now a receipt rather than a
+  // result. `isLoading` covers only the upload itself, which is milliseconds,
+  // so the spinner is honest about what it is waiting for.
   const [uploadDocument, { isLoading, error, data: lastUpload }] =
     useUploadDocumentMutation();
 
@@ -39,9 +48,10 @@ export function UploadPanel() {
     const file = e.target.files?.[0];
     if (file) {
       // No `.unwrap()`. On success the `invalidatesTags` on this mutation
-      // marks the document list stale and `DocumentList` refetches itself —
-      // nothing here needs to know that happened. On failure the message is
-      // already in `error` below.
+      // marks the document list stale, `DocumentList` refetches, and because
+      // the new row is `queued`, `useDocuments` starts polling. Nothing here
+      // needs to know any of that happened. On failure the message is already
+      // in `error` below.
       void uploadDocument(file);
     }
 
@@ -50,12 +60,6 @@ export function UploadPanel() {
     // server-side silently does nothing, which is baffling to debug.
     e.target.value = "";
   };
-
-  const document = lastUpload ?? null;
-  const pagesLost =
-    document && document.pageCount !== null && document.pagesWithText !== null
-      ? document.pageCount - document.pagesWithText
-      : 0;
 
   return (
     <div className="flex flex-col gap-2">
@@ -90,7 +94,10 @@ export function UploadPanel() {
             >
               <path d="M21 12a9 9 0 1 1-6.219-8.56" />
             </svg>
-            Indexing…
+            {/* "Uploading", not "Indexing". The request only carries the file
+                now, and claiming otherwise would be the UI lying about which
+                part is slow. */}
+            Uploading…
           </>
         ) : (
           <>
@@ -112,52 +119,22 @@ export function UploadPanel() {
         )}
       </button>
 
-      {/* Ingestion is synchronous at this stage, so the wait is real and can be
-          minutes on a large document. Saying so beats a spinner that looks
-          stuck — and the backend's 120s timeout is stage 1.3's trigger. */}
-      {isLoading && (
-        <p className="px-1 text-xs leading-relaxed text-neutral-400">
-          Extracting, embedding and indexing. This runs synchronously, so a
-          large PDF can take minutes.
-        </p>
-      )}
-
       {error && (
         <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs leading-relaxed text-red-700">
           {error.message}
         </p>
       )}
 
-      {document && !isLoading && (
-        <div className="rounded-lg border border-neutral-200 bg-white px-3 py-2 text-xs">
-          <p className="truncate font-medium text-neutral-700">
-            {document.filename}
-          </p>
-          <dl className="mt-1.5 grid grid-cols-2 gap-x-2 gap-y-0.5 text-neutral-500">
-            <dt>Pages</dt>
-            <dd className="text-right tabular-nums">{document.pageCount}</dd>
-            <dt>With text</dt>
-            <dd className="text-right tabular-nums">
-              {document.pagesWithText}
-            </dd>
-            <dt>Chunks</dt>
-            <dd className="text-right tabular-nums">{document.chunkCount}</dd>
-            <dt>Characters</dt>
-            <dd className="text-right tabular-nums">
-              {document.charactersExtracted?.toLocaleString() ?? "—"}
-            </dd>
-          </dl>
-
-          {/* The policy decision the type deliberately does not encode: any gap
-              at all is worth flagging, because those pages are not in the index
-              and no question will ever find them. */}
-          {pagesLost > 0 && (
-            <p className="mt-2 rounded border border-amber-200 bg-amber-50 px-2 py-1.5 leading-relaxed text-amber-800">
-              {pagesLost} of {document.pageCount} pages yielded no text and were
-              not indexed — likely scanned images. OCR arrives at stage 16.2.
-            </p>
-          )}
-        </div>
+      {/* The receipt. Deliberately says nothing about the document's contents,
+          because at this point the server does not know them either. */}
+      {lastUpload && !isLoading && !error && (
+        <p className="rounded-lg border border-neutral-200 bg-white px-3 py-2 text-xs leading-relaxed text-neutral-500">
+          <span className="font-medium text-neutral-700">
+            {lastUpload.filename}
+          </span>{" "}
+          is queued. Indexing happens in the background — watch its row below
+          for the result.
+        </p>
       )}
     </div>
   );
