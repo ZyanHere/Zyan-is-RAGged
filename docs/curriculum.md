@@ -2175,19 +2175,42 @@ Recognising that is most of the lesson.
 **Audit verdict:** correctly sequenced, with **one stage badly late** and **one
 reclassification**. 15.1 is also partly done already.
 
-> ### 15.2 (CI) is overdue *now*, not at Module 15
+> ### 15.2 (CI) — deferred on 2026-10-21, with a trigger
 >
-> `[measured]` There are **84 tests** across three suites and **no automated
-> gate**. Nothing runs them except a human remembering to. Every stage from here
-> adds tests whose value depends on something running them, and 3.3's regression
-> gate is explicitly *"a one-command run that fails on regression"* — which is
-> worth very little if the one command is run by hand.
+> `[measured]` There are **113 checks** — 78 backend tests, 35 rag tests,
+> `tsc` and `eslint` — and **no automated gate**. Nothing runs them except a
+> human remembering to.
 >
-> **Recommendation:** a minimal CI (the three suites plus a lint) is worth doing
-> as soon as convenient — it is an afternoon, and it protects everything after.
-> The full 15.2 (staging deploys, artifacts, the quality gate) stays here.
+> **Deferred deliberately.** Not because the argument against it won, but
+> because the cost of adding it later is roughly flat — a workflow file and a
+> Postgres service container — while the stages between here and then produce
+> more interesting work. Recorded here so it does not become a thing nobody
+> decided.
 >
-> **This is a decision for you**, flagged rather than taken.
+> **The trigger, named rather than vague:**
+>
+> | Condition | Why it forces the issue |
+> |---|---|
+> | **3.3's regression gate exists** | it is specified as *"a one-command run that compares to baseline and fails on regression"*. A gate nobody runs blocks nothing — a chunking change that drops recall 8% would merge unnoticed, which is the exact failure 3.3 exists to prevent |
+> | **or: a broken commit reaches `main`** | the constitutional rule's own shape — an observed problem rather than an anticipated one. The first time `git bisect` lands on a commit whose tests never passed, the argument is over |
+>
+> Whichever comes first. **3.3 is the likely one**, and it is four stages away.
+>
+> ── The risk being accepted ───────────────────────────────────────────────────
+>
+> Every commit between now and then is green only because someone chose to
+> check. Six commits for stage 1.3 were verified that way; nothing enforces the
+> seventh. The failure is silent and found later, usually while debugging
+> something unrelated.
+>
+> **The cheap mitigation, if that bites before the trigger fires:** a single
+> `make check` or a `pre-push` git hook running the same four commands. Ten
+> lines, no infrastructure, no GitHub Actions, and it converts "remembering" into
+> "opting out". It is not CI — it runs on one machine and can be skipped with
+> `--no-verify` — but it closes most of the gap for a solo developer.
+>
+> The full 15.2 (staging deploys, artifacts, the quality gate) stays here
+> regardless.
 
 ### 15.1 — Containerisation and configuration · `[required-when]` *(it must run elsewhere)*
 

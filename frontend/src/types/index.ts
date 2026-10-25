@@ -137,6 +137,30 @@ export interface DocumentRecord {
   error: string | null;
 
   /**
+   * How many times this document has been claimed for ingestion.
+   *
+   * Added at stage 2.1, because without it two very different situations are
+   * both `status: "queued"` and look identical:
+   *
+   *     attempts === 0   nobody has tried this yet
+   *     attempts  >  0   it has failed and is waiting to try again
+   *
+   * Showing the same badge for both would hide a repeated failure behind a
+   * patient-looking label.
+   */
+  attempts: number;
+
+  /**
+   * When a waiting job becomes claimable again. `null` means "now".
+   *
+   * The backoff, which lives in the database row rather than in a worker's
+   * sleep. Because the list is already polled every two seconds while
+   * anything is unfinished, rendering this as a countdown costs no timer —
+   * each poll re-renders it.
+   */
+  nextAttemptAt: string | null;
+
+  /**
    * `null` until the attempt reaches a terminal state.
    *
    * The database guarantees that reading: a CHECK constraint forbids a

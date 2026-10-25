@@ -7,7 +7,7 @@
  */
 
 import { baseApi } from "./baseApi";
-import type { DocumentRecord } from "@/types";
+import type { DocumentRecord, IngestionStatus } from "@/types";
 
 /**
  * Exactly what the backend returns, snake_case and all.
@@ -22,12 +22,26 @@ interface DocumentWire {
   document_id: string;
   filename: string;
   created_at: string;
-  status: "processing" | "done" | "failed" | null;
+
+  /**
+   * **This said `"processing" | "done" | "failed"` until stage 2.1**, which
+   * was wrong from the moment `queued` shipped at 1.3 — and TypeScript could
+   * not catch it, because this interface is an assertion about JSON rather
+   * than something the compiler checks against the server.
+   *
+   * It is `IngestionStatus` now, so the two cannot drift again without the
+   * shared type changing. A generated client from the backend's OpenAPI
+   * schema would remove the possibility entirely; that is stage 19.1's job.
+   */
+  status: IngestionStatus | null;
+
   page_count: number | null;
   pages_with_text: number | null;
   characters_extracted: number | null;
   chunk_count: number | null;
   error: string | null;
+  attempts: number;
+  next_attempt_at: string | null;
   finished_at: string | null;
 }
 
@@ -47,6 +61,8 @@ function toRecord(wire: DocumentWire): DocumentRecord {
     charactersExtracted: wire.characters_extracted,
     chunkCount: wire.chunk_count,
     error: wire.error,
+    attempts: wire.attempts,
+    nextAttemptAt: wire.next_attempt_at,
     finishedAt: wire.finished_at,
   };
 }

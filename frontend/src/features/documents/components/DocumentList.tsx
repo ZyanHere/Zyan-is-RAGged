@@ -134,10 +134,23 @@ function DocumentRow({ document }: { document: DocumentRecord }) {
       {/* ── The two non-terminal states, kept apart ───────────────────────────
           They mean different things to a user, and conflating them would hide
           the only clue that the queue is not draining. */}
-      {document.status === "queued" && (
+      {/* ── The two kinds of "queued" ──────────────────────────────────────
+          Identical over the wire until stage 2.1 added `attempts`. One is a
+          document nobody has got to; the other is one that has failed and is
+          waiting to try again. Showing the same text for both would hide a
+          repeated failure behind a patient-looking label. */}
+      {document.status === "queued" && document.attempts === 0 && (
         <p className="mt-1 text-xs leading-relaxed text-neutral-500">
           Waiting for a worker. If this does not change, nothing is draining
           the queue.
+        </p>
+      )}
+
+      {document.status === "queued" && document.attempts > 0 && (
+        <p className="mt-1 text-xs leading-relaxed text-amber-700">
+          Attempt {document.attempts} failed — retrying
+          {retryIn(document.nextAttemptAt)}. Nothing is lost; the document is
+          still queued.
         </p>
       )}
 
@@ -153,6 +166,23 @@ function DocumentRow({ document }: { document: DocumentRecord }) {
       )}
     </li>
   );
+}
+
+/**
+ * "in 12s", " shortly", or "" when there is nothing useful to say.
+ *
+ * No timer and no `setInterval`: the list is polled every two seconds while
+ * anything is unfinished, so each poll re-renders this and the number counts
+ * down on its own. The backoff being *data in a row* rather than a sleep
+ * inside a worker is what makes that possible.
+ */
+function retryIn(nextAttemptAt: string | null): string {
+  if (nextAttemptAt === null) return " shortly";
+
+  const seconds = Math.round(
+    (new Date(nextAttemptAt).getTime() - Date.now()) / 1000,
+  );
+  return seconds > 0 ? ` in ${seconds}s` : " shortly";
 }
 
 function StatusBadge({ status }: { status: DocumentRecord["status"] }) {
