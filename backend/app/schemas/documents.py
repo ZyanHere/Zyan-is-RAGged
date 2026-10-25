@@ -70,6 +70,33 @@ class DocumentRead(BaseModel):
     them.
     """
 
+    attempts: int = 0
+    """How many times this document has been claimed for ingestion.
+
+    Exposed at stage 2.1 because without it the client cannot tell two very
+    different situations apart — they are both `status: "queued"`:
+
+        attempts = 0   nobody has tried this yet
+        attempts = 2   it has failed twice and is waiting to try again
+
+    A user watching the first one should be patient. A user watching the second
+    one is watching something go wrong repeatedly, and showing them an
+    identical badge would be hiding it.
+
+    Defaults to `0` rather than `None`: a document with no job at all has
+    genuinely been attempted zero times, so there is no missing-value case to
+    represent.
+    """
+
+    next_attempt_at: datetime | None = None
+    """When a waiting job becomes claimable again. `None` means "now".
+
+    This is the backoff, which lives in the row rather than in a worker's
+    sleep. Exposing it lets the client count down — and because the list is
+    already polled every two seconds while anything is unfinished, the
+    countdown is live for free, with no timer in the UI.
+    """
+
     finished_at: datetime | None = None
     """`None` while an attempt is still running.
 
@@ -101,6 +128,8 @@ class DocumentRead(BaseModel):
             characters_extracted=job.characters_extracted if job else None,
             chunk_count=job.chunk_count if job else None,
             error=job.error if job else None,
+            attempts=job.attempts if job else 0,
+            next_attempt_at=job.next_attempt_at if job else None,
             finished_at=job.finished_at if job else None,
         )
 

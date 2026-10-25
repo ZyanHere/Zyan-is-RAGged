@@ -34,33 +34,149 @@ jobs per second and cannot fan one message out to several consumers. Both are
 orders of magnitude from anything here, and the Evolution Map names the trigger
 for a broker rather than assuming one.
 
-── What this deliberately does not do ──────────────────────────────────────────
+── The two background jobs this process does besides ingesting ─────────────────
 
-**No lease, no heartbeat, no reaper, no retry.** Kill this process mid-ingest and
-the job stays `processing` forever. Nothing reclaims it, and — unlike the
-synchronous version — no request is open for anyone to notice.
+**A heartbeat**, for the job it is holding. A lease is a deadline, and the only
+thing that distinguishes a slow worker from a dead one is whether it keeps
+pushing that deadline forward. It runs on its own database session, because the
+session doing the ingest is in the middle of a transaction and cannot be used
+concurrently.
 
-That is stage 2.1's trigger, and it is only buildable once there is a stuck row
-to observe. The loop below creates that state on purpose and does not clean up
-after itself.
+**A reaper**, before every claim. It finds jobs whose worker stopped renewing
+and puts them back on the queue. Every worker runs it, so it is redundant by
+construction — with one worker, recovery waits for the current job to finish,
+which is acceptable because a single busy worker could not have processed the
+stranded job anyway.
+
+── What this still deliberately does not do ───────────────────────────────────
+
+**It does not cancel work when the lease is lost.** A worker that discovers
+mid-ingest that it has been reaped carries on to the end, and its final write
+is rejected by the conditional UPDATE. The work is wasted but nothing is
+corrupted. Cancelling an in-flight agent call needs real drain semantics and is
+stage 12.3.
+
+**It does not classify failures.** Everything retries until the attempts run
+out — see `RetryPolicy`.
 """
 
 import asyncio
 import logging
 import signal
-from contextlib import suppress
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 
 from app.core.config import Settings, get_settings
 from app.db.session import Database, create_database, session_scope, verify_connectivity
-from app.repositories.documents import DocumentRepository
+from app.repositories.documents import (
+    ClaimedJob,
+    DocumentRepository,
+    ReapResult,
+)
 from app.services import agent_client
-from app.services.ingestion import AgentClient, IngestionService
+from app.services.ingestion import AgentClient, IngestionService, RetryPolicy
 
 logger = logging.getLogger(__name__)
 
 
+@asynccontextmanager
+async def _heartbeat(
+    database: Database, claimed: ClaimedJob, settings: Settings
+) -> AsyncIterator[asyncio.Event]:
+    """Keep renewing this job's lease until the block exits.
+
+    ── Why a third of the lease ────────────────────────────────────────────────
+
+    At `lease_seconds / 3`, two consecutive renewals can fail — a slow query, a
+    brief network blip — before anyone is entitled to call this worker dead.
+    Renewing once per lease period would make a single hiccup look like a
+    death, and the job would be taken away from a worker that was fine.
+
+    ── Why its own session ────────────────────────────────────────────────────
+
+    The session doing the ingest is inside a transaction for the whole
+    operation, and a SQLAlchemy session is not safe to use from two places at
+    once. More importantly a renewal must be **visible to other processes
+    immediately**, which means committing — and committing on the ingest's
+    session would end its transaction half way through the job.
+
+    So each beat opens its own short-lived session, writes, commits, closes.
+
+    ── Why a failed beat does not stop the heartbeat ──────────────────────────
+
+    A database blip is not a lost lease. If the renewals keep failing the lease
+    lapses on its own and a reaper takes the job, which is the correct outcome
+    arrived at without this loop having to decide anything. Giving up after one
+    error would turn a one-second outage into a lost job.
+
+    What *does* stop it is `renew_lease` returning `False` — a definite answer
+    that the job now belongs to someone else.
+
+    The returned event is set in that case. Nothing currently acts on it beyond
+    logging: the ingest is already in flight and cancelling it is stage 12.3.
+    """
+    lost = asyncio.Event()
+    interval = settings.lease_seconds / 3
+
+    async def beat() -> None:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                async with session_scope(database.session_factory) as session:
+                    alive = await DocumentRepository(session).renew_lease(
+                        claimed.job_id,
+                        claimed.lease_token,
+                        lease_seconds=settings.lease_seconds,
+                    )
+                    await session.commit()
+            except Exception:
+                logger.exception(
+                    "could not renew the lease for job_id=%s; will try again",
+                    claimed.job_id,
+                )
+                continue
+
+            if not alive:
+                logger.warning(
+                    "lost the lease for job_id=%s while still working on it — "
+                    "a reaper gave it to someone else. The lease may be too "
+                    "short for this workload.",
+                    claimed.job_id,
+                )
+                lost.set()
+                return
+
+    task = asyncio.create_task(beat())
+    try:
+        yield lost
+    finally:
+        task.cancel()
+        # Awaiting the cancelled task is what makes this deterministic: without
+        # it the beat can outlive the block and renew a lease for a job that
+        # has already finished.
+        with suppress(asyncio.CancelledError):
+            await task
+
+
+async def reap(database: Database, settings: Settings) -> ReapResult:
+    """Reclaim jobs whose worker stopped renewing.
+
+    Its own session and transaction, so a failure here cannot poison the claim
+    that follows — a reaper that cannot run is a degraded system, not a broken
+    one, and the worker should carry on ingesting.
+    """
+    async with session_scope(database.session_factory) as session:
+        result = await DocumentRepository(session).reap_expired_leases(
+            max_attempts=settings.max_attempts
+        )
+        await session.commit()
+    return result
+
+
 async def process_one(
-    database: Database, agent: AgentClient = agent_client
+    database: Database,
+    settings: Settings,
+    agent: AgentClient = agent_client,
 ) -> bool:
     """Claim one job and run it. Returns whether there was anything to do.
 
@@ -85,7 +201,9 @@ async def process_one(
     invisible until something is slow.
     """
     async with session_scope(database.session_factory) as session:
-        claimed = await DocumentRepository(session).claim_next_queued_job()
+        claimed = await DocumentRepository(session).claim_next_queued_job(
+            lease_seconds=settings.lease_seconds
+        )
         if claimed is None:
             return False
         # Publish the claim before doing any work. After this commit the row
@@ -93,13 +211,23 @@ async def process_one(
         await session.commit()
 
     logger.info(
-        "claimed job_id=%s document_id=%s", claimed.job_id, claimed.document_id
+        "claimed job_id=%s document_id=%s attempt=%d",
+        claimed.job_id,
+        claimed.document_id,
+        claimed.attempts,
     )
 
-    async with session_scope(database.session_factory) as session:
-        repository = DocumentRepository(session)
-        service = IngestionService(session, repository, agent)
-        await service.process_job(claimed)
+    async with _heartbeat(database, claimed, settings):
+        async with session_scope(database.session_factory) as session:
+            repository = DocumentRepository(session)
+            service = IngestionService(session, repository, agent)
+            await service.process_job(
+                claimed,
+                RetryPolicy(
+                    max_attempts=settings.max_attempts,
+                    base_seconds=settings.retry_base_seconds,
+                ),
+            )
 
     return True
 
@@ -144,7 +272,23 @@ async def run(
 
     while not stop.is_set():
         try:
-            did_work = await process_one(database, agent)
+            # Before claiming, give back anything a dead worker was holding.
+            # Running it here rather than in its own process means it is
+            # redundant across however many workers exist, and that no extra
+            # thing has to be deployed and watched for this one to keep
+            # working.
+            reclaimed = await reap(database, settings)
+            if reclaimed.total:
+                # `warning`, not `info`: reclaiming always means something
+                # died. It is the system recovering, and it is still evidence.
+                logger.warning(
+                    "reclaimed %d abandoned job(s): %d requeued, %d given up on",
+                    reclaimed.total,
+                    reclaimed.requeued,
+                    reclaimed.abandoned,
+                )
+
+            did_work = await process_one(database, settings, agent)
         except Exception:
             # `exception()` rather than `error()`: the traceback is the only
             # thing that makes an unforeseen failure diagnosable, and there is

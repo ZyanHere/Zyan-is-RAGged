@@ -31,11 +31,13 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    Index,
     Integer,
     LargeBinary,
     String,
     Text,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import UUID as PgUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -359,6 +361,77 @@ class IngestionJob(Base):
     statements fails on the first one.
     """
 
+    # ── The lease (stage 2.1) ─────────────────────────────────────────────────
+    #
+    # Together these are the difference between "a worker owns this" and "a
+    # worker owned this at some point and may be dead". Before 2.1 a claim was
+    # permanent, so `processing` meant both and could be told apart by nothing.
+
+    lease_token: Mapped[uuid.UUID | None] = mapped_column(
+        PgUUID(as_uuid=True), nullable=True
+    )
+    """Which *claim* owns this job right now. Minted fresh on every claim.
+
+    **Not a worker id — a claim id.** That distinction is the whole mechanism.
+    If it identified the worker, a worker that lost its lease and re-claimed
+    the same job later could not tell its two attempts apart. Identifying the
+    claim means every completing write can say "the attempt I started", and
+    anything else is stale by definition.
+
+    Every write that finishes a job carries `AND lease_token = :mine`, so a
+    worker that was reaped affects **zero rows** and finds out. The alternative
+    — checking only that *some* live lease exists — is the trap: after a reaper
+    requeues and another worker re-claims, the row is `processing` with a fresh
+    expiry, so the check passes and the stale worker silently overwrites.
+
+    This is the small version of the fencing-token problem in stage 6.4, where
+    the same idea has to work across two datastores. Here one table has
+    atomicity, so the conditional UPDATE is the whole implementation.
+    """
+
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    """When this claim lapses unless the worker renews it.
+
+    **Staying alive is something a worker has to keep doing.** You cannot ask a
+    dead process whether it is dead, so the design inverts it: a live worker
+    pushes this forward every few seconds, and a dead one stops, which is
+    exactly the signal a reaper needs.
+
+    It is a deadline, not a promise. A worker past this time is still running —
+    nothing kills it — it has simply lost the right to finish, and the
+    conditional write is what enforces that.
+    """
+
+    attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default="0"
+    )
+    """How many times this job has been claimed.
+
+    Incremented by the claim, not by the failure, so it counts *tries* rather
+    than *errors* — a worker that died silently still used one up. That is the
+    conservative reading and the one that stops a job which crashes its worker
+    from cycling forever.
+
+    It is also what stage 2.3 will slice on when it starts classifying failures
+    as transient or permanent.
+    """
+
+    next_attempt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    """Not claimable before this moment. `NULL` means claimable now.
+
+    The backoff, expressed as data rather than as a sleep. A worker that slept
+    between retries would hold a process doing nothing and would lose the delay
+    entirely on restart; a timestamp survives both, and any worker can honour
+    it with one extra clause in the claim.
+
+    Set when a failed job is requeued. Deliberately **not** set by the reaper:
+    a crashed worker is not a failing job, and recovery should be prompt.
+    """
+
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     """Why it failed, in the words the engine used.
 
@@ -411,8 +484,25 @@ class IngestionJob(Base):
             "status <> 'failed' OR error IS NOT NULL",
             name="failed_requires_error",
         ),
+        CheckConstraint(
+            "(status = 'processing') = (lease_token IS NOT NULL)",
+            name="lease_matches_status",
+        ),
+        CheckConstraint(
+            "(lease_token IS NULL) = (lease_expires_at IS NULL)",
+            name="lease_expiry_matches_token",
+        ),
+        CheckConstraint(
+            "attempts >= 0",
+            name="attempts_non_negative",
+        ),
+        Index(
+            "ix_ingestion_jobs_expired_leases",
+            "lease_expires_at",
+            postgresql_where=text("status = 'processing'"),
+        ),
     )
-    """Five invariants, enforced by the database rather than by convention.
+    """Eight invariants, enforced by the database rather than by convention.
 
     **`status_allowed`** — the set of legal states, as a CHECK on a VARCHAR
     rather than a native Postgres enum type. **This is the decision paying
@@ -455,6 +545,31 @@ class IngestionJob(Base):
     **`failed_requires_error`** — a failure with no explanation is a failure
     you cannot diagnose. If the cause is genuinely unknown the code must store
     `"unknown"`, which is at least honest about it.
+
+    **`lease_matches_status`** — the stage-2.1 addition, and the one that makes
+    a lease a guarantee rather than a habit:
+
+        processing + a lease     ✅
+        processing + no lease    ❌   "being worked on, by nobody"
+        queued/done/failed + a lease  ❌   a lease outliving its work
+
+    The second row is the interesting one. Without this, a bug in the claim
+    could produce a `processing` job that no reaper would ever notice, because
+    `lease_expires_at < now()` is false for NULL — the job would be invisible
+    to the very mechanism built to find it. The constraint makes that
+    unrepresentable.
+
+    The third stops the opposite leak: a completed job still holding a lease,
+    which would let a stale worker's conditional write succeed against a job
+    that finished minutes ago.
+
+    **`lease_expiry_matches_token`** — the two lease columns move together or
+    not at all. A token with no expiry never lapses, so nothing reclaims it; an
+    expiry with no token has nothing to check ownership against. Either alone
+    is a silent hole in the recovery path.
+
+    **`attempts_non_negative`** — cheap, and it catches the decrement nobody
+    meant to write.
 
     Every constraint is named, because the naming convention in `base.py` uses
     `%(constraint_name)s`. An unnamed CheckConstraint raises at table-definition

@@ -26,7 +26,9 @@ from collections.abc import Sequence
 from typing import NamedTuple
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+import uuid
+
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import distinct_on
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -39,6 +41,42 @@ from app.db.models import (
 )
 
 DocumentWithJob = tuple[Document, IngestionJob | None]
+
+
+def _db_now_plus(seconds: float):
+    """`now() + N seconds`, computed by the **database** clock. Stage 2.1.
+
+    Not `datetime.now(timezone.utc) + timedelta(...)`, and the difference
+    matters more here than anywhere else in this file. A lease is a comparison
+    between a stored deadline and `now()` — made by a reaper that may be
+    running on a different machine. If the deadline were written using one
+    process's clock and compared against another's, a few seconds of skew would
+    reap live workers or ignore dead ones, and the bug would appear only under
+    load and never reproduce.
+
+    `make_interval` takes positional `(years, months, weeks, days, hours, mins,
+    secs)`, hence the six zeroes. Postgres has no `now() + :n * interval '1
+    second'` that binds cleanly through SQLAlchemy, and string-concatenating an
+    interval literal would be an injection site for a number.
+    """
+    return func.now() + func.make_interval(0, 0, 0, 0, 0, 0, seconds)
+
+
+class ReapResult(NamedTuple):
+    """What one pass of the reaper did. Stage 2.1.
+
+    Two numbers rather than one, because they mean opposite things to whoever
+    is reading the logs: `requeued` is the system recovering, `abandoned` is
+    the system giving up. A single total would hide the second inside the
+    first.
+    """
+
+    requeued: int
+    abandoned: int
+
+    @property
+    def total(self) -> int:
+        return self.requeued + self.abandoned
 
 
 class ClaimedJob(NamedTuple):
@@ -58,6 +96,21 @@ class ClaimedJob(NamedTuple):
 
     job_id: UUID
     document_id: UUID
+
+    lease_token: UUID
+    """Proof that this claim, specifically, owns the job. Stage 2.1.
+
+    Every write that finishes the job carries it, so a worker whose lease was
+    reaped affects zero rows instead of overwriting whoever has it now.
+    """
+
+    attempts: int
+    """How many times this job has now been claimed, including this one.
+
+    The worker uses it to decide whether a failure is worth retrying, which is
+    why it is on the claim rather than fetched later — the decision happens at
+    the moment of failure, when another query would be one more thing to fail.
+    """
 
 
 class DocumentRepository:
@@ -132,7 +185,9 @@ class DocumentRepository:
 
         return document, job
 
-    async def claim_next_queued_job(self) -> ClaimedJob | None:
+    async def claim_next_queued_job(
+        self, *, lease_seconds: float
+    ) -> ClaimedJob | None:
         """Take the oldest queued job, or return `None` if there is nothing.
 
         **This is the mechanism the whole stage turns on.** Two workers polling
@@ -184,7 +239,20 @@ class DocumentRepository:
         """
         next_queued = (
             select(IngestionJob.id)
-            .where(IngestionJob.status == IngestionStatus.QUEUED)
+            .where(
+                IngestionJob.status == IngestionStatus.QUEUED,
+                # The backoff, honoured here rather than slept on. A worker
+                # that waited in Python would hold a process doing nothing and
+                # would forget the delay entirely on restart; a timestamp
+                # survives both, and any worker can respect it.
+                #
+                # NULL means "no delay was ever set", which is every job that
+                # has not failed yet — hence the OR rather than a default.
+                or_(
+                    IngestionJob.next_attempt_at.is_(None),
+                    IngestionJob.next_attempt_at <= func.now(),
+                ),
+            )
             # Oldest first, with `id` as a tiebreaker because `queued_at` is
             # `transaction_timestamp()` and a batch upload shares one value.
             # Without it the order within a batch is whatever the planner
@@ -205,15 +273,66 @@ class DocumentRepository:
                 .values(
                     status=IngestionStatus.PROCESSING,
                     started_at=func.now(),
+                    # ── The lease ────────────────────────────────────────────
+                    #
+                    # A fresh token per claim, not per worker. If it named the
+                    # worker, a worker that lost a lease and later re-claimed
+                    # the same job could not tell its two attempts apart —
+                    # and the stale write from the first would be accepted by
+                    # the second.
+                    lease_token=uuid.uuid4(),
+                    lease_expires_at=_db_now_plus(lease_seconds),
+                    # Counts claims, not failures: a worker that died silently
+                    # still used one up. The conservative reading, and what
+                    # stops a job that crashes its worker from cycling forever.
+                    attempts=IngestionJob.attempts + 1,
+                    # This claim *is* the attempt that was being waited for.
+                    next_attempt_at=None,
                 )
-                .returning(IngestionJob.id, IngestionJob.document_id)
+                .returning(
+                    IngestionJob.id,
+                    IngestionJob.document_id,
+                    IngestionJob.lease_token,
+                    IngestionJob.attempts,
+                )
             )
         ).one_or_none()
 
         if claimed is None:
             return None
 
-        return ClaimedJob(job_id=claimed.id, document_id=claimed.document_id)
+        return ClaimedJob(
+            job_id=claimed.id,
+            document_id=claimed.document_id,
+            lease_token=claimed.lease_token,
+            attempts=claimed.attempts,
+        )
+
+    async def renew_lease(
+        self, job_id: UUID, lease_token: UUID, *, lease_seconds: float
+    ) -> bool:
+        """Push this claim's deadline forward. `False` means it is gone.
+
+        **The heartbeat.** You cannot ask a dead process whether it is dead, so
+        the design inverts the question: staying alive is something a worker
+        has to keep doing, and a worker that stops doing it is indistinguishable
+        from one that died — which is the point.
+
+        Returning `False` rather than raising, because losing a lease is not an
+        error. It means a reaper decided this worker was gone and gave the job
+        to someone else, which is the system working. The worker's job is to
+        notice and stop, not to panic.
+        """
+        result = await self._session.execute(
+            update(IngestionJob)
+            .where(
+                IngestionJob.id == job_id,
+                IngestionJob.lease_token == lease_token,
+            )
+            .execution_options(synchronize_session=False)
+            .values(lease_expires_at=_db_now_plus(lease_seconds))
+        )
+        return result.rowcount == 1
 
     async def get_upload_content(self, document_id: UUID) -> bytes | None:
         """The stored bytes for a document, or `None` if there are none.
@@ -238,6 +357,7 @@ class DocumentRepository:
     async def mark_job_done(
         self,
         job_id: UUID,
+        lease_token: UUID,
         *,
         page_count: int,
         pages_with_text: int,
@@ -256,22 +376,53 @@ class DocumentRepository:
 
         `func.now()` rather than a Python timestamp keeps the database clock
         authoritative, which matters once there is more than one API instance.
+
+        ── The ownership check, added at stage 2.1 ─────────────────────────────
+
+        `AND lease_token = :lease_token` is what makes a reaper safe to have.
+        Without it the sequence below silently corrupts, and nothing anywhere
+        reports a problem:
+
+            worker A claims job 7
+            A pauses — GC, a VM suspend, a laptop lid
+            the lease expires; a reaper requeues job 7
+            worker B claims it, indexes it, marks it done
+            A wakes up and marks job 7 done
+                → overwrites B's counts with A's
+                → and the document is now indexed twice
+
+        **Returns whether it applied.** `False` is not an error — it means a
+        reaper decided this worker was gone, which is the system working. The
+        worker's job is to notice and stop.
+
+        The lease is cleared in the same statement, because
+        `ck_ingestion_jobs_lease_matches_status` forbids a `done` job from
+        still holding one. A lease outliving its work would let a *later* stale
+        write succeed.
         """
-        await self._session.execute(
+        result = await self._session.execute(
             update(IngestionJob)
-            .where(IngestionJob.id == job_id)
+            .where(
+                IngestionJob.id == job_id,
+                IngestionJob.lease_token == lease_token,
+            )
             .execution_options(synchronize_session=False)
             .values(
                 status=IngestionStatus.DONE,
                 finished_at=func.now(),
+                lease_token=None,
+                lease_expires_at=None,
                 page_count=page_count,
                 pages_with_text=pages_with_text,
                 characters_extracted=characters_extracted,
                 chunk_count=chunk_count,
             )
         )
+        return result.rowcount == 1
 
-    async def mark_job_failed(self, job_id: UUID, *, error: str) -> None:
+    async def mark_job_failed(
+        self, job_id: UUID, lease_token: UUID, *, error: str
+    ) -> bool:
         """Record a failed attempt and why.
 
         `error` is required by `ck_ingestion_jobs_failed_requires_error`: a
@@ -279,16 +430,160 @@ class DocumentRepository:
         genuinely unknown, the caller must say `"unknown"` — which is at least
         honest, and which stage 2.3 will want when it starts classifying
         failures as transient or permanent.
+
+        Carries the same ownership check as `mark_job_done`, for the same
+        reason: a stale worker must not be able to mark someone else's
+        in-progress job as failed. That would be worse than the success case —
+        it destroys work that was going fine.
         """
-        await self._session.execute(
+        result = await self._session.execute(
             update(IngestionJob)
-            .where(IngestionJob.id == job_id)
+            .where(
+                IngestionJob.id == job_id,
+                IngestionJob.lease_token == lease_token,
+            )
             .execution_options(synchronize_session=False)
             .values(
                 status=IngestionStatus.FAILED,
                 finished_at=func.now(),
+                lease_token=None,
+                lease_expires_at=None,
                 error=error,
             )
+        )
+        return result.rowcount == 1
+
+    async def requeue_job(
+        self,
+        job_id: UUID,
+        lease_token: UUID,
+        *,
+        error: str,
+        delay_seconds: float,
+    ) -> bool:
+        """Put a failed job back on the queue, to be retried after a delay.
+
+        Stage 2.1's answer to the defect that an agent restart used to destroy
+        every in-flight document: a failure stops being terminal.
+
+        ── What has to move together ───────────────────────────────────────────
+
+        Four columns, and three of them are forced by constraints rather than
+        chosen:
+
+            status      → queued        the job is claimable again
+            started_at  → NULL          `started_at_matches_status` requires it:
+                                        a queued job has no current attempt
+            lease_*     → NULL          `lease_matches_status` requires it
+            next_attempt_at → now()+d   the backoff
+
+        `started_at` being cleared looks like information loss and is not. It
+        means "when the *current* attempt began", and a requeued job has no
+        current attempt. The history is in `attempts`.
+
+        ── Why the error is kept ───────────────────────────────────────────────
+
+        `failed_requires_error` does not apply to a `queued` row, so this could
+        clear it. It deliberately does not: a job waiting to retry should still
+        say why it is waiting, and the client renders exactly that — "retrying
+        after: the agent did not respond". Clearing it would make a retrying
+        job indistinguishable from a fresh upload.
+        """
+        result = await self._session.execute(
+            update(IngestionJob)
+            .where(
+                IngestionJob.id == job_id,
+                IngestionJob.lease_token == lease_token,
+            )
+            .execution_options(synchronize_session=False)
+            .values(
+                status=IngestionStatus.QUEUED,
+                started_at=None,
+                lease_token=None,
+                lease_expires_at=None,
+                next_attempt_at=_db_now_plus(delay_seconds),
+                error=error,
+            )
+        )
+        return result.rowcount == 1
+
+    async def reap_expired_leases(self, *, max_attempts: int) -> ReapResult:
+        """Reclaim jobs whose worker stopped renewing. Stage 2.1.
+
+        **This is the thing that makes a stuck row temporary.** Before it, a
+        worker that died left a job `processing` forever and nothing in the
+        system would ever look at it again.
+
+        ── Two statements, not one with a CASE ────────────────────────────────
+
+        They answer different questions and the order matters:
+
+        1. **Exhausted** — expired *and* already tried `max_attempts` times.
+           Giving up is the right answer: a job that reliably kills its worker
+           would otherwise cycle forever, and each cycle costs a claim, an
+           ingest attempt and possibly embedding quota. This is the bound on
+           the poison-message problem that stage 2.3 will handle properly.
+
+        2. **Recoverable** — everything else that expired. Straight back to
+           `queued`.
+
+        Exhausted first, because the second statement's filter would otherwise
+        sweep those rows up and requeue them.
+
+        ── No backoff on a reaped job ─────────────────────────────────────────
+
+        `next_attempt_at` is left alone here, deliberately. A crashed worker is
+        not a failing job — the work never got a verdict — so making the
+        document wait is punishing it for someone else's crash. Recovery should
+        be prompt; the bound against cycling is `attempts`, not delay.
+
+        ── Why no `SKIP LOCKED` ───────────────────────────────────────────────
+
+        Every worker runs this, so two reapers can collide on the same row.
+        They do not need to be kept apart: both are writing the same thing, and
+        the second one's UPDATE simply matches nothing because the first
+        already changed the status. Reaping is idempotent in a way claiming is
+        not.
+        """
+        expired = IngestionJob.lease_expires_at < func.now()
+
+        abandoned = await self._session.execute(
+            update(IngestionJob)
+            .where(
+                IngestionJob.status == IngestionStatus.PROCESSING,
+                expired,
+                IngestionJob.attempts >= max_attempts,
+            )
+            .execution_options(synchronize_session=False)
+            .values(
+                status=IngestionStatus.FAILED,
+                finished_at=func.now(),
+                lease_token=None,
+                lease_expires_at=None,
+                error=(
+                    "Abandoned: the worker holding this job stopped responding, "
+                    f"and it has already been attempted {max_attempts} times."
+                ),
+            )
+        )
+
+        requeued = await self._session.execute(
+            update(IngestionJob)
+            .where(
+                IngestionJob.status == IngestionStatus.PROCESSING,
+                expired,
+            )
+            .execution_options(synchronize_session=False)
+            .values(
+                status=IngestionStatus.QUEUED,
+                started_at=None,
+                lease_token=None,
+                lease_expires_at=None,
+            )
+        )
+
+        return ReapResult(
+            requeued=requeued.rowcount, abandoned=abandoned.rowcount
         )
 
     # ── Reads ─────────────────────────────────────────────────────────────────

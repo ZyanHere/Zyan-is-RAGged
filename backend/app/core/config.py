@@ -117,6 +117,58 @@ class Settings(BaseSettings):
     database for no benefit.
     """
 
+    lease_seconds: float = Field(default=60.0, gt=0)
+    """How long a worker's claim on a job lasts before it lapses. Stage 2.1.
+
+    **The number is a bet on two failure modes at once**, and it is wrong in a
+    different way at each end:
+
+        too short   a worker that is merely slow — a long ingest, a GC pause, a
+                    stalled embedding call — gets its job taken away while it is
+                    still working. The work is done twice and the first result
+                    is thrown away.
+
+        too long    a worker that genuinely died holds its job for that long
+                    before anything notices. The document just sits there.
+
+    60s against a heartbeat every 20s (a third of this) means two consecutive
+    renewals can fail before anyone is declared dead, which absorbs a slow query
+    or a brief network blip without a false reclaim.
+
+    It is not a guess about how long ingestion takes — the heartbeat is what
+    covers that, so a four-minute ingest is fine under a one-minute lease. It is
+    a guess about how long a *renewal* can plausibly be delayed. Stage 11.2 is
+    where it stops being a guess.
+    """
+
+    max_attempts: int = Field(default=5, gt=0)
+    """How many times a job may be claimed before the system gives up.
+
+    Counts claims, not errors, so a job that silently kills its worker burns
+    attempts just as a job that fails loudly does. That is deliberate: the
+    thing being bounded is "how much can one document cost us", and a crash
+    costs the same as a rejected PDF.
+
+    Five is small enough that a genuinely broken document cannot consume much,
+    and large enough to ride out a provider outage of several minutes once the
+    backoff is applied. The honest version of this number arrives at stage 2.3,
+    when failures are classified and transient ones can be retried more
+    patiently than permanent ones.
+    """
+
+    retry_base_seconds: float = Field(default=2.0, gt=0)
+    """The first retry delay. Each subsequent attempt doubles the ceiling.
+
+    With the default: 2, 4, 8, 16, 32 seconds — about a minute of patience
+    across five attempts, which covers a container restart comfortably.
+
+    **The delay is a ceiling, not a value.** The service picks a random number
+    between zero and it — full jitter. Without that, every worker that failed
+    against the same outage waits the same number of seconds and returns *in
+    the same instant*, which is how a recovering service gets knocked over by
+    the clients that were waiting for it.
+    """
+
     db_pool_pre_ping: bool = True
     """Check a pooled connection is alive before handing it out.
 

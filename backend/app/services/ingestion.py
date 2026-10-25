@@ -59,6 +59,8 @@ rather than returned.
 """
 
 import logging
+import random
+from dataclasses import dataclass
 from typing import Protocol
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -118,6 +120,59 @@ vanished" is a failed job with a readable reason — something an operator can
 see in the list — not a stack trace in a log nobody is reading. A worker is not
 a request; there is no caller to hand an exception to.
 """
+
+
+@dataclass(frozen=True, slots=True)
+class RetryPolicy:
+    """How many times to try, and how long to wait between tries. Stage 2.1.
+
+    **Passed in rather than read from `get_settings()`**, for the same reason
+    the agent is injected: a test that wants to exercise exhaustion should not
+    have to construct a whole `Settings` or monkeypatch a global. It is three
+    numbers and a function over them.
+
+    ── The failure this exists to fix ──────────────────────────────────────────
+
+    Until now `_record_failure` set `status = 'failed'`, which no code path
+    ever left. A three-second `docker compose restart agent` therefore
+    destroyed every document being processed at that moment, permanently, and
+    the only recovery was a human noticing and re-uploading.
+
+    A failure is now provisional until the attempts run out.
+    """
+
+    max_attempts: int
+    base_seconds: float
+
+    def delay_for(self, attempt: int) -> float:
+        """How long to wait before attempt number `attempt + 1`.
+
+        **Exponential backoff with full jitter.** Two separate ideas, and the
+        second is the one people leave out:
+
+            ceiling = base * 2 ** (attempt - 1)   → 2, 4, 8, 16, 32
+            delay   = uniform(0, ceiling)         → somewhere in that window
+
+        *Backoff* is because retrying a broken thing immediately does not help
+        and costs it capacity it needs to recover.
+
+        *Jitter* is because of what happens without it. Fifty workers that all
+        failed against the same outage compute the same ceiling, wait the same
+        number of seconds, and come back **in the same instant** — so the
+        service that was recovering gets the entire backlog at once and falls
+        over again. The retry storm is caused by the retry policy being
+        correct and identical everywhere.
+
+        Full jitter — uniform across the whole window rather than a small
+        wobble around the ceiling — is the simplest form that actually spreads
+        them, and it is what AWS's own guidance settled on after measuring the
+        alternatives.
+
+        The randomness means this is deliberately **not** deterministic, which
+        is why the tests assert on bounds rather than on a value.
+        """
+        ceiling = self.base_seconds * 2 ** max(0, attempt - 1)
+        return random.uniform(0, ceiling)
 
 
 class IngestionService:
@@ -190,7 +245,9 @@ class IngestionService:
 
     # ── The worker's half ─────────────────────────────────────────────────────
 
-    async def process_job(self, claimed: ClaimedJob) -> None:
+    async def process_job(
+        self, claimed: ClaimedJob, retry: RetryPolicy
+    ) -> None:
         """Run one already-claimed job to a terminal state.
 
         **Takes a `ClaimedJob`, not a job id**, and that is a contract rather
@@ -210,14 +267,14 @@ class IngestionService:
         if found is None:
             # The foreign key makes this impossible, so treat it as a failure
             # rather than crashing the worker on an invariant violation.
-            await self._record_failure(claimed.job_id, MISSING_UPLOAD_ERROR)
+            await self._record_failure(claimed, MISSING_UPLOAD_ERROR, retry)
             return
 
         document, _ = found
 
         content = await self._repository.get_upload_content(claimed.document_id)
         if content is None:
-            await self._record_failure(claimed.job_id, MISSING_UPLOAD_ERROR)
+            await self._record_failure(claimed, MISSING_UPLOAD_ERROR, retry)
             return
 
         # Unbounded, and no longer a problem for anyone waiting. The agent
@@ -234,18 +291,18 @@ class IngestionService:
         except AgentUnavailableError as exc:
             # No response at all — the agent is down, or did not answer in
             # time. Still a failed attempt, and still worth recording.
-            await self._record_failure(claimed.job_id, str(exc))
+            await self._record_failure(claimed, str(exc), retry)
             return
 
         if status_code >= 400:
             detail = body.get("detail")
             message = detail if isinstance(detail, str) and detail else UNKNOWN_ERROR
-            await self._record_failure(claimed.job_id, message)
+            await self._record_failure(claimed, message, retry)
             return
 
-        await self._record_success(claimed.job_id, body)
+        await self._record_success(claimed, body)
 
-    async def _record_success(self, job_id: object, body: dict) -> None:
+    async def _record_success(self, claimed: ClaimedJob, body: dict) -> None:
         """Mark the attempt done and store its numbers.
 
         The counts are read from the agent's body with `.get(..., 0)` rather
@@ -254,8 +311,9 @@ class IngestionService:
         has already been indexed in Qdrant — would turn a cosmetic problem into
         a lost document.
         """
-        await self._repository.mark_job_done(
-            job_id,
+        applied = await self._repository.mark_job_done(
+            claimed.job_id,
+            claimed.lease_token,
             page_count=int(body.get("page_count", 0)),
             pages_with_text=int(body.get("pages_with_text", 0)),
             characters_extracted=int(body.get("characters_extracted", 0)),
@@ -263,23 +321,110 @@ class IngestionService:
         )
         await self._session.commit()
 
-        logger.info("ingestion done job_id=%s", job_id)
+        if not applied:
+            # A reaper decided this worker was gone and the job was given to
+            # someone else. Not an error — the system working. Logged at
+            # warning because it also means the lease is too short for the real
+            # workload, which is a tuning signal.
+            logger.warning(
+                "lost the lease before finishing job_id=%s; another worker owns "
+                "it now and this result was discarded",
+                claimed.job_id,
+            )
+            return
 
-    async def _record_failure(self, job_id: object, error: str) -> None:
-        """Mark the attempt failed, with the reason the engine gave.
+        logger.info("ingestion done job_id=%s", claimed.job_id)
 
-        `status` and `finished_at` move together in one UPDATE because
-        `ck_ingestion_jobs_finished_at_matches_status` permits nothing else —
-        the repository handles that, and the constraint is what guarantees a
-        `processing` row genuinely means "still running".
+    async def _record_failure(
+        self, claimed: ClaimedJob, error: str, retry: RetryPolicy
+    ) -> None:
+        """Record this attempt's failure — and decide whether to try again.
 
-        **No `http_status` any more.** The failure is no longer travelling back
-        up a request; it is being written down for whoever asks later. Which
-        status code the agent used is still captured, inside `error`, where it
-        belongs as diagnostic text rather than as a response code nobody will
-        read.
+        **The decision that stage 2.1 exists for.** Until now this method ended
+        the job: `status = 'failed'`, which nothing ever left. An agent restart
+        of a few seconds therefore destroyed every document in flight, and the
+        only recovery was a human noticing and re-uploading the file.
+
+        Now a failure is provisional. The job goes back on the queue with a
+        delay, and only stops being retried when it has used its attempts.
+
+        ── Everything retries, including things that obviously will not work ───
+
+        There is no classification here: a corrupt PDF is retried exactly as a
+        network blip is, which is deliberate and slightly uncomfortable.
+
+        Classifying failures as transient or permanent is **stage 2.3's whole
+        subject**, and its stated trigger is observing the waste — "a malformed
+        PDF retries every 30s for a day". Pre-empting that here would mean
+        arriving at 2.3 with the lesson half-learned and no evidence behind it.
+
+        The waste is bounded and cheap in the meantime: a rejected PDF fails
+        during extraction, before any embedding is paid for, so the cost of
+        retrying one is five claims and a minute of backoff.
+
+        The same uniformity applies to `MISSING_UPLOAD_ERROR`, which genuinely
+        *cannot* succeed on a retry — nothing ever re-creates a deleted upload
+        row. It is still retried, because carving out exceptions one at a time
+        is how a rule stops being a rule, and because the case is supposed to
+        be unreachable anyway.
+
+        ── Why the lease token is still required ──────────────────────────────
+
+        Both branches go through a conditional write. A worker that has lost
+        its lease must not be able to requeue a job someone else is running,
+        any more than it may complete one — that would reset a healthy
+        in-progress attempt back to `queued` and have it done twice.
         """
-        await self._repository.mark_job_failed(job_id, error=error)
+        give_up = claimed.attempts >= retry.max_attempts
+
+        if give_up:
+            # The suffix only earns its place when retries actually happened.
+            # On a single-attempt failure "gave up after 1 attempts" is noise
+            # *and* bad grammar, and it would make the message the user sees
+            # differ from the engine's own words for no reason.
+            retried = claimed.attempts > 1
+            applied = await self._repository.mark_job_failed(
+                claimed.job_id,
+                claimed.lease_token,
+                error=(
+                    f"{error} (gave up after {claimed.attempts} attempts)"
+                    if retried
+                    else error
+                ),
+            )
+        else:
+            delay = retry.delay_for(claimed.attempts)
+            applied = await self._repository.requeue_job(
+                claimed.job_id,
+                claimed.lease_token,
+                error=error,
+                delay_seconds=delay,
+            )
+
         await self._session.commit()
 
-        logger.warning("ingestion failed job_id=%s error=%s", job_id, error)
+        if not applied:
+            logger.warning(
+                "lost the lease before recording a failure for job_id=%s; "
+                "another worker owns it now",
+                claimed.job_id,
+            )
+            return
+
+        if give_up:
+            logger.warning(
+                "ingestion failed permanently job_id=%s attempts=%d error=%s",
+                claimed.job_id,
+                claimed.attempts,
+                error,
+            )
+        else:
+            logger.warning(
+                "ingestion failed job_id=%s attempt=%d of %d; retrying in "
+                "%.1fs error=%s",
+                claimed.job_id,
+                claimed.attempts,
+                retry.max_attempts,
+                delay,
+                error,
+            )
