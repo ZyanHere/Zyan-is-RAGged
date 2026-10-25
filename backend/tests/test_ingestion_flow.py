@@ -36,9 +36,18 @@ from app.db.models import IngestionStatus
 from app.errors import AgentUnavailableError
 from app.repositories.documents import DocumentRepository
 from app.schemas.documents import DocumentRead
-from app.services.ingestion import IngestionService
+from app.services.ingestion import IngestionService, RetryPolicy
 
 PDF = b"%PDF-1.4 pretend this is a real document"
+
+# These tests are about the flow, not about expiry. A long lease keeps
+# the reaper out of them; its own tests use a deliberately short one.
+LEASE = 60.0
+
+# `max_attempts=1` means "this is the last attempt", so a failure is recorded
+# as terminal immediately. These tests are about *what gets written down* when
+# something fails; retrying is the worker's subject and is tested there.
+NO_RETRY = RetryPolicy(max_attempts=1, base_seconds=0.0)
 
 
 class FakeAgent:
@@ -123,14 +132,14 @@ async def ingest(
 
     accepted = await accept(svc, filename)
 
-    claimed = await repo.claim_next_queued_job()
+    claimed = await repo.claim_next_queued_job(lease_seconds=LEASE)
     assert claimed is not None, "the job just accepted should be claimable"
     assert claimed.job_id is not None
     # The worker commits the claim before starting work, so that a crash
     # leaves a `processing` row rather than rolling the claim back.
     await session.commit()
 
-    await svc.process_job(claimed)
+    await svc.process_job(claimed, NO_RETRY)
 
     found = await repo.get_document_with_latest_job(accepted.document_id)
     assert found is not None

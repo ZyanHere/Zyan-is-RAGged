@@ -42,6 +42,10 @@ CONTENT = b"%PDF-1.7 concurrency probe"
 # that a blocked one is detected quickly rather than hanging the suite.
 PATIENCE_SECONDS = 3.0
 
+# These tests are about locking, not expiry. A long lease keeps the reaper's
+# concerns out of them.
+LEASE = 60.0
+
 
 async def seed_queued_jobs(engine, count: int) -> tuple[list[uuid.UUID], list[uuid.UUID]]:
     """Commit `count` documents each with one `queued` job.
@@ -119,14 +123,15 @@ async def test_two_claimers_cannot_take_the_same_job(
             repo_a = DocumentRepository(session_a)
             repo_b = DocumentRepository(session_b)
 
-            claimed_by_a = await repo_a.claim_next_queued_job()
+            claimed_by_a = await repo_a.claim_next_queued_job(lease_seconds=LEASE)
             assert claimed_by_a is not None, "the only worker to try should win"
             assert claimed_by_a.job_id == job_ids[0]
 
             # A has not committed. The row is locked, and `SKIP LOCKED` is what
             # turns "wait for it" into "there is nothing here".
             claimed_by_b = await asyncio.wait_for(
-                repo_b.claim_next_queued_job(), timeout=PATIENCE_SECONDS
+                repo_b.claim_next_queued_job(lease_seconds=LEASE),
+                timeout=PATIENCE_SECONDS,
             )
             assert claimed_by_b is None, (
                 "a second worker claimed a job another worker already holds — "
@@ -136,7 +141,7 @@ async def test_two_claimers_cannot_take_the_same_job(
             await session_a.commit()
 
             # Now committed as `processing`, so it fails the `queued` filter.
-            assert await repo_b.claim_next_queued_job() is None
+            assert await repo_b.claim_next_queued_job(lease_seconds=LEASE) is None
     finally:
         await delete_documents(engine_a, document_ids)
         await engine_a.dispose()
@@ -167,10 +172,12 @@ async def test_two_claimers_take_different_jobs_without_waiting(
         async with factory_a() as session_a, factory_b() as session_b:
             claimed_by_a = await DocumentRepository(
                 session_a
-            ).claim_next_queued_job()
+            ).claim_next_queued_job(lease_seconds=LEASE)
 
             claimed_by_b = await asyncio.wait_for(
-                DocumentRepository(session_b).claim_next_queued_job(),
+                DocumentRepository(session_b).claim_next_queued_job(
+                    lease_seconds=LEASE
+                ),
                 timeout=PATIENCE_SECONDS,
             )
 

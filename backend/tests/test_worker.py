@@ -32,9 +32,33 @@ from app.db.session import Database, create_database, session_scope
 from app.errors import AgentUnavailableError
 from app.repositories.documents import DocumentRepository
 from app.services.ingestion import IngestionService
-from app.worker import process_one, run
+from app.worker import process_one, reap, run
 
 PDF = b"%PDF-1.4 pretend this is a real document"
+
+# A long lease, because these tests are about the loop rather than
+# about expiry. The reaper's tests set a short one deliberately.
+def _settings(**overrides) -> Settings:
+    """Settings for a worker, with a long lease unless a test says otherwise.
+
+    `lease_seconds` goes through `setdefault` rather than being a keyword
+    argument, so a test can override it without colliding with the default.
+    """
+    defaults = {
+        "database_url": "postgresql+asyncpg://unused/unused",
+        "lease_seconds": 60.0,
+    }
+    return Settings(**{**defaults, **overrides})
+
+
+SETTINGS = _settings()
+
+# Retries with effectively no waiting, for tests that watch a job recover.
+IMPATIENT = _settings(max_attempts=5, retry_base_seconds=0.001)
+
+# A long backoff, for tests proving a requeued job *stays* out of the queue
+# rather than being picked straight back up.
+PATIENT = _settings(max_attempts=5, retry_base_seconds=300.0)
 
 
 class FakeAgent:
@@ -92,7 +116,8 @@ async def read_job(database: Database, document_id: uuid.UUID):
             await conn.execute(
                 text(
                     "SELECT status, started_at IS NULL AS not_started, "
-                    "       finished_at IS NULL AS not_finished, error, chunk_count "
+                    "       finished_at IS NULL AS not_finished, error, chunk_count, "
+                    "       attempts, next_attempt_at "
                     "  FROM ingestion_jobs WHERE document_id = :id"
                 ),
                 {"id": document_id},
@@ -121,7 +146,7 @@ async def test_the_worker_drives_a_queued_job_to_done(database: Database) -> Non
     document_id = await accept(database)
 
     try:
-        assert await process_one(database, agent) is True
+        assert await process_one(database, SETTINGS, agent) is True
 
         job = await read_job(database, document_id)
         assert job.status == "done"
@@ -144,48 +169,110 @@ async def test_the_worker_drives_a_queued_job_to_done(database: Database) -> Non
 
 async def test_an_empty_queue_is_not_an_error(database: Database) -> None:
     """`False`, not an exception. Idle is the normal state of a worker."""
-    assert await process_one(database, FakeAgent()) is False
+    assert await process_one(database, SETTINGS, FakeAgent()) is False
 
 
-async def test_the_worker_records_a_rejected_document_as_failed(
+async def test_a_rejected_document_is_requeued_rather_than_failed(
     database: Database,
 ) -> None:
-    """A 4xx from the agent is a failed job carrying the agent's own reason.
+    """**Changed at stage 2.1, and this is the change.**
 
-    Nobody is waiting on a response, so the error message *is* the user-facing
-    output — it reaches them through the document list, which has rendered
-    `error` since stage 1.2.
+    This test used to assert `failed`. A 4xx ended the job outright.
+
+    Now the first failure is provisional: the job returns to `queued` carrying
+    the agent's reason and a `next_attempt_at` in the future. The message is
+    still the user-facing output, but it now reads as "waiting, because of
+    this" rather than "dead, because of this".
+
+    The second assertion is the backoff doing its job — the delay lives in the
+    row, so the very next poll finds nothing to do rather than retrying
+    instantly in a tight loop.
     """
     document_id = await accept(database, "notes.txt")
 
     try:
         agent = FakeAgent(status_code=400, body={"detail": "'notes.txt' is not a PDF."})
-        assert await process_one(database, agent) is True
+        assert await process_one(database, PATIENT, agent) is True
 
         job = await read_job(database, document_id)
-        assert job.status == "failed"
+        assert job.status == "queued", "a first failure is not the end"
         assert job.error == "'notes.txt' is not a PDF."
-        assert job.not_finished is False
+        assert job.attempts == 1
+        assert job.not_finished is True
+
+        assert await process_one(database, PATIENT, FakeAgent()) is False, (
+            "the backoff must keep it out of the queue until its delay passes"
+        )
     finally:
         await cleanup(database, [document_id])
 
 
-async def test_the_worker_records_an_unreachable_agent_as_failed(
+async def test_a_provider_outage_is_survived_rather_than_fatal(
     database: Database,
 ) -> None:
-    """The job fails; the worker does not.
+    """**The defect stage 2.1 exists to fix, as a test.**
 
-    An outage must not be the end of the worker process — the next job may
-    well be fine, and if it is not, the failures are at least recorded.
+    Before this stage an unreachable agent meant `status = 'failed'`, which
+    nothing ever left. `docker compose restart agent` — three seconds of
+    downtime — therefore destroyed every document being processed at that
+    moment, permanently, and the only recovery was a human noticing and
+    re-uploading the file.
+
+    Now the outage is survivable. The document waits, tries again, and
+    finishes. **No human anywhere in that sentence**, which is the measure of
+    this stage.
     """
     document_id = await accept(database)
 
     try:
-        assert await process_one(database, UnreachableAgent()) is True
+        assert await process_one(database, IMPATIENT, UnreachableAgent()) is True
 
         job = await read_job(database, document_id)
-        assert job.status == "failed"
+        assert job.status == "queued", (
+            "a provider outage must not permanently destroy a document"
+        )
         assert "Could not reach the agent" in job.error
+
+        # The outage ends.
+        assert await process_one(database, IMPATIENT, FakeAgent()) is True
+
+        job = await read_job(database, document_id)
+        assert job.status == "done"
+        assert job.chunk_count == 3
+        assert job.attempts == 2, "it took two tries, and the row says so"
+    finally:
+        await cleanup(database, [document_id])
+
+
+async def test_a_job_that_keeps_failing_is_eventually_given_up_on(
+    database: Database,
+) -> None:
+    """Retrying has to stop somewhere, or a broken document costs forever.
+
+    `max_attempts` is the bound. The error says how many tries it took, which
+    is the difference between "this document is bad" and "we were unlucky" —
+    and it is the signal stage 2.3 will classify on when it builds a
+    dead-letter queue worth inspecting.
+    """
+    document_id = await accept(database, "doomed.pdf")
+    policy = _settings(max_attempts=3, retry_base_seconds=0.001)
+
+    try:
+        for attempt in range(1, 4):
+            assert await process_one(database, policy, UnreachableAgent()) is True
+            job = await read_job(database, document_id)
+            assert job.attempts == attempt
+
+            if attempt < 3:
+                assert job.status == "queued"
+
+        assert job.status == "failed", "the third attempt was the last"
+        assert "gave up after 3 attempts" in job.error
+        assert job.not_finished is False
+
+        assert await process_one(database, policy, FakeAgent()) is False, (
+            "a job that has been given up on must not be claimable again"
+        )
     finally:
         await cleanup(database, [document_id])
 
@@ -215,7 +302,7 @@ async def test_a_crash_after_the_claim_leaves_a_committed_processing_row(
 
     try:
         with pytest.raises(KeyboardInterrupt):
-            await process_one(database, CrashingAgent())
+            await process_one(database, SETTINGS, CrashingAgent())
 
         job = await read_job(database, document_id)
         assert job.status == "processing", (
@@ -242,9 +329,9 @@ async def test_a_stuck_job_is_not_reclaimed_by_the_next_worker(
 
     try:
         with pytest.raises(KeyboardInterrupt):
-            await process_one(database, CrashingAgent())
+            await process_one(database, SETTINGS, CrashingAgent())
 
-        assert await process_one(database, FakeAgent()) is False, (
+        assert await process_one(database, SETTINGS, FakeAgent()) is False, (
             "a stuck job must not be silently picked up again — at this stage "
             "nothing distinguishes 'running' from 'abandoned'"
         )
@@ -377,3 +464,236 @@ async def test_an_unexpected_failure_does_not_kill_the_loop(
         stop.set()
         await asyncio.wait_for(task, timeout=5.0)
         await cleanup(database, document_ids)
+
+
+# ── The heartbeat and the reaper (stage 2.1, layer 4) ────────────────────────
+
+
+class SlowAgent:
+    """An agent that takes longer than one lease period to answer.
+
+    The realistic case, not an edge case: a 300-page PDF is several embedding
+    round trips, and the whole point of a lease is that it must not expire
+    underneath work that is genuinely progressing.
+    """
+
+    def __init__(self, seconds: float) -> None:
+        self.seconds = seconds
+
+    async def ingest_document(self, **kwargs) -> tuple[int, dict]:
+        await asyncio.sleep(self.seconds)
+        return 200, {
+            "page_count": 3,
+            "pages_with_text": 3,
+            "characters_extracted": 1269,
+            "chunk_count": 3,
+        }
+
+
+async def test_an_expired_lease_is_not_a_revoked_one(
+    database: Database,
+) -> None:
+    """A worker whose lease lapsed, but whose job nobody took, still finishes.
+
+    **This was discovered by a test that passed when it should not have.**
+
+    The first version of the heartbeat test ran a slow ingest under a short
+    lease with no reaper anywhere, and asserted the job completed. It passed —
+    and went on passing with the heartbeat deleted entirely, which meant it was
+    proving nothing.
+
+    The reason is a property of the design worth pinning down: **an expired
+    lease does not invalidate the token.** The token changes only when somebody
+    else claims the job. So expiry is *permission for others to take it*, not a
+    revocation of this worker's right to finish.
+
+    That is the right behaviour. If nobody reclaimed the work, throwing it away
+    would be worse than committing it — the result is correct, it was merely
+    produced by a worker that looked slow. The conditional write protects
+    against a *handover*, which is the thing that can actually corrupt.
+
+    The consequence for testing is the important part: a heartbeat can only be
+    proven by a test with a reaper in it. See the next one.
+    """
+    settings = _settings(lease_seconds=0.3)
+    document_id = await accept(database, "slow-but-alone.pdf")
+
+    try:
+        async with session_scope(database.session_factory) as session:
+            claimed = await DocumentRepository(session).claim_next_queued_job(
+                lease_seconds=settings.lease_seconds
+            )
+            await session.commit()
+        assert claimed is not None
+
+        # Let the lease lapse, with nothing around to notice.
+        await asyncio.sleep(settings.lease_seconds + 0.2)
+
+        async with session_scope(database.session_factory) as session:
+            applied = await DocumentRepository(session).mark_job_done(
+                claimed.job_id,
+                claimed.lease_token,
+                page_count=3,
+                pages_with_text=3,
+                characters_extracted=1269,
+                chunk_count=3,
+            )
+            await session.commit()
+
+        assert applied is True, (
+            "an expired lease that nobody acted on must not throw away work "
+            "that was finished correctly"
+        )
+        assert (await read_job(database, document_id)).status == "done"
+    finally:
+        await cleanup(database, [document_id])
+
+
+async def test_without_a_heartbeat_a_slow_job_would_be_reclaimed(
+    database: Database,
+) -> None:
+    """The control for the test above, so it is not passing by luck.
+
+    Here the lease is allowed to lapse — no heartbeat, just a claim and a
+    wait — and a reaper then finds the job. That is the behaviour the previous
+    test proves the heartbeat prevents.
+
+    Without this control, `test_the_heartbeat_keeps_a_slow_job_alive` would
+    still pass if leases never expired at all.
+    """
+    settings = _settings(lease_seconds=0.4)
+    document_id = await accept(database, "abandoned.pdf")
+
+    try:
+        async with session_scope(database.session_factory) as session:
+            claimed = await DocumentRepository(session).claim_next_queued_job(
+                lease_seconds=settings.lease_seconds
+            )
+            await session.commit()
+        assert claimed is not None
+
+        await asyncio.sleep(settings.lease_seconds + 0.2)
+
+        reclaimed = await reap(database, settings)
+
+        assert reclaimed.requeued == 1, (
+            "a lease nobody renewed must lapse, or the heartbeat test above "
+            "proves nothing"
+        )
+        job = await read_job(database, document_id)
+        assert job.status == "queued"
+    finally:
+        await cleanup(database, [document_id])
+
+
+async def test_the_loop_reclaims_an_abandoned_job_and_finishes_it(
+    database: Database,
+) -> None:
+    """**The measure of stage 2.1, in one test.**
+
+    A job is left exactly as a killed worker leaves it: `processing`, holding
+    a lease nobody will ever renew. Then the worker loop is started and does
+    nothing special — it reaps before claiming, as it always does.
+
+    The document ends `done`. **No human, no manual requeue, no intervention.**
+
+    Note `attempts == 2`: the row records that the first attempt was lost,
+    which is the difference between a system that recovered and one that
+    silently did the work once.
+    """
+    settings = _settings(lease_seconds=0.4, retry_base_seconds=0.001)
+    document_id = await accept(database, "stranded.pdf")
+
+    try:
+        # Claim it and walk away — the state a `kill -9` leaves behind.
+        async with session_scope(database.session_factory) as session:
+            claimed = await DocumentRepository(session).claim_next_queued_job(
+                lease_seconds=settings.lease_seconds
+            )
+            await session.commit()
+        assert claimed is not None
+
+        await asyncio.sleep(settings.lease_seconds + 0.2)
+
+        job = await read_job(database, document_id)
+        assert job.status == "processing", "the stranded state, before recovery"
+
+        # An ordinary worker starts. Nothing is told about the stuck job.
+        stop = asyncio.Event()
+        agent = FakeAgent()
+
+        async def stop_when_done() -> None:
+            while True:
+                current = await read_job(database, document_id)
+                if current.status == "done":
+                    stop.set()
+                    return
+                await asyncio.sleep(0.05)
+
+        await asyncio.wait_for(
+            asyncio.gather(
+                run(database, settings, stop, agent), stop_when_done()
+            ),
+            timeout=15.0,
+        )
+
+        job = await read_job(database, document_id)
+        assert job.status == "done"
+        assert job.attempts == 2, (
+            "the recovery should be visible in the row: one lost attempt, one "
+            "that worked"
+        )
+    finally:
+        stop.set()
+        await cleanup(database, [document_id])
+
+
+async def test_the_reaper_does_not_disturb_a_working_worker(
+    database: Database,
+) -> None:
+    """**This is the heartbeat's real test**, and the only one that catches it.
+
+    Reclaiming a job from a worker that is still working means the ingest runs
+    twice and the first result is discarded — wasted embedding spend and, once
+    stage 2.2 exists, a duplicate-chunk hazard.
+
+    One `process_one` is in flight with a slow agent — 1.2s against a 0.6s
+    lease, so two lease periods — while a reaper runs alongside it eight
+    times. The heartbeat keeps the deadline moving and the reaper finds
+    nothing, every time.
+
+    ── Why the obvious heartbeat test does not work ───────────────────────────
+
+    The intuitive version is "slow ingest, short lease, assert it completes".
+    That version **passes with the heartbeat deleted**, because an expired
+    lease does not invalidate the token — see
+    `test_an_expired_lease_is_not_a_revoked_one`. Nothing had taken the job, so
+    finishing it was allowed.
+
+    A heartbeat is only observable when something is competing for the job.
+    Verified by mutation: delete the heartbeat task and this test fails while
+    every other test in the file still passes.
+    """
+    settings = _settings(lease_seconds=0.6)
+    document_id = await accept(database, "busy.pdf")
+    reaped_totals: list[int] = []
+
+    async def reap_repeatedly() -> None:
+        for _ in range(8):
+            await asyncio.sleep(0.15)
+            reaped_totals.append((await reap(database, settings)).total)
+
+    try:
+        await asyncio.gather(
+            process_one(database, settings, SlowAgent(1.2)),
+            reap_repeatedly(),
+        )
+
+        assert reaped_totals and all(total == 0 for total in reaped_totals), (
+            f"a reaper took a job from a live worker: {reaped_totals}"
+        )
+        job = await read_job(database, document_id)
+        assert job.status == "done"
+        assert job.attempts == 1, "the job must not have been done twice"
+    finally:
+        await cleanup(database, [document_id])

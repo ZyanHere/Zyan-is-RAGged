@@ -15,11 +15,22 @@ import uuid
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import IngestionStatus
+from app.db.models import Document, IngestionStatus
 from app.repositories.documents import DocumentRepository
-from app.services.ingestion import IngestionService
+from app.services.ingestion import IngestionService, RetryPolicy
 
 PDF = b"%PDF-1.4 pretend this is a real document"
+
+# These tests are about the flow, not about expiry. A long lease keeps
+# the reaper out of them; its own tests use a deliberately short one.
+LEASE = 60.0
+
+# Incidental when the seeded job succeeds. Where a test wants a *terminal*
+# failure to display, it passes `NO_RETRY` — otherwise stage 2.1 requeues the
+# job and the row is `queued`, not `failed`, which is correct and not what
+# those tests are about.
+RETRY = RetryPolicy(max_attempts=5, base_seconds=0.0)
+NO_RETRY = RetryPolicy(max_attempts=1, base_seconds=0.0)
 
 
 class FakeAgent:
@@ -41,7 +52,13 @@ def repo(session: AsyncSession) -> DocumentRepository:
     return DocumentRepository(session)
 
 
-async def seed(session, repo, filename: str, agent: FakeAgent | None = None):
+async def seed(
+    session,
+    repo,
+    filename: str,
+    agent: FakeAgent | None = None,
+    retry: RetryPolicy = RETRY,
+):
     """Put one document through the real ingestion path, end to end.
 
     Three steps now, with their commits: accept, claim, process. The claim is
@@ -57,11 +74,11 @@ async def seed(session, repo, filename: str, agent: FakeAgent | None = None):
         filename=filename, content=PDF, content_type="application/pdf"
     )
 
-    claimed = await repo.claim_next_queued_job()
+    claimed = await repo.claim_next_queued_job(lease_seconds=LEASE)
     assert claimed is not None and claimed.document_id == accepted.document_id
     await session.commit()
 
-    await service.process_job(claimed)
+    await service.process_job(claimed, retry)
     return accepted
 
 
@@ -103,6 +120,9 @@ async def test_the_list_shows_each_document_with_its_outcome(
         repo,
         "bad.txt",
         FakeAgent(status_code=400, body={"detail": "not a PDF"}),
+        # Terminal, so the list has a `failed` row to show. With retries on
+        # this would be `queued` — see the next test.
+        retry=NO_RETRY,
     )
 
     body = (await client.get("/documents")).json()
@@ -285,7 +305,7 @@ async def test_the_list_distinguishes_queued_from_processing_from_done(
     await seed(session, repo, "finished.pdf")
 
     accepted = await seed_queued(session, repo, "running.pdf")
-    claimed = await repo.claim_next_queued_job()
+    claimed = await repo.claim_next_queued_job(lease_seconds=LEASE)
     assert claimed is not None and claimed.document_id == accepted.document_id
 
     await seed_queued(session, repo, "waiting.pdf")
@@ -299,3 +319,105 @@ async def test_the_list_distinguishes_queued_from_processing_from_done(
         "running.pdf": "processing",
         "waiting.pdf": "queued",
     }
+
+
+async def test_a_document_waiting_to_retry_is_queued_and_says_why(
+    client, session: AsyncSession, repo: DocumentRepository
+) -> None:
+    """**A state that did not exist before stage 2.1.**
+
+    A failure is no longer terminal on the first try, so between attempts a
+    document sits at `queued` — the same status as a fresh upload — while
+    carrying the reason it is waiting.
+
+    That pairing is deliberate. `failed_requires_error` does not apply to a
+    `queued` row, so the repository could have cleared the error on requeue
+    and did not: without it, a document being retried after a provider outage
+    would look identical to one nobody has touched yet, and the user would have
+    no idea anything had gone wrong.
+    """
+    await seed(
+        session,
+        repo,
+        "flaky.pdf",
+        FakeAgent(status_code=502, body={"detail": "the embedding provider failed"}),
+        retry=RETRY,
+    )
+    await session.commit()
+
+    items = (await client.get("/documents")).json()["items"]
+    row = next(item for item in items if item["filename"] == "flaky.pdf")
+
+    assert row["status"] == "queued", (
+        "a job awaiting a retry is back on the queue, not failed"
+    )
+    assert row["error"] == "the embedding provider failed", (
+        "and it still says why it is waiting"
+    )
+    assert row["finished_at"] is None
+    assert row["chunk_count"] is None
+
+
+async def test_a_retrying_document_is_distinguishable_from_a_fresh_one(
+    client, session: AsyncSession, repo: DocumentRepository
+) -> None:
+    """**The gap stage 2.1 left until this layer.**
+
+    Both of these documents are `status: "queued"`. Without `attempts` they
+    are identical over the wire, so the client would show the same badge for
+    "nobody has started this yet" and "this has failed twice and is waiting to
+    try again" — hiding a repeated failure behind a patient-looking label.
+    """
+    # Order matters: `seed` claims the *oldest* queued job, so the document
+    # meant to fail has to be enqueued first. Seeding the fresh one first made
+    # this test claim and fail the wrong document — a reminder that the queue
+    # is FIFO and the helpers are not independent of each other.
+    await seed(
+        session,
+        repo,
+        "flaky.pdf",
+        FakeAgent(status_code=502, body={"detail": "the provider failed"}),
+        retry=RETRY,
+    )
+    await seed_queued(session, repo, "fresh.pdf")
+    await session.commit()
+
+    items = (await client.get("/documents")).json()["items"]
+    by_name = {item["filename"]: item for item in items}
+
+    fresh, flaky = by_name["fresh.pdf"], by_name["flaky.pdf"]
+
+    assert fresh["status"] == flaky["status"] == "queued", (
+        "both are queued — which is exactly why `attempts` has to be sent"
+    )
+    assert fresh["attempts"] == 0
+    assert fresh["error"] is None
+    assert fresh["next_attempt_at"] is None, "nothing is holding it back"
+
+    assert flaky["attempts"] == 1
+    assert flaky["error"] == "the provider failed"
+    assert flaky["next_attempt_at"] is not None, (
+        "a job waiting out its backoff should say when it will be tried again"
+    )
+
+
+async def test_attempts_is_zero_for_a_document_with_no_job(
+    client, session: AsyncSession
+) -> None:
+    """`0`, not `null`.
+
+    A document with no ingestion job should be impossible — both rows are
+    written in one transaction — but the read path tolerates it so the
+    inconsistency is visible rather than hidden. In that case "how many times
+    has this been attempted" has a true answer, and it is zero.
+    """
+    document = Document(
+        filename="orphan.pdf", byte_size=10, content_type="application/pdf"
+    )
+    session.add(document)
+    await session.commit()
+
+    body = (await client.get(f"/documents/{document.id}")).json()
+
+    assert body["status"] is None
+    assert body["attempts"] == 0

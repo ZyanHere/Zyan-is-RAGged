@@ -24,6 +24,11 @@ def repo(session: AsyncSession) -> DocumentRepository:
 # check lives in `rag.extraction`, which these tests never reach.
 CONTENT = b"%PDF-1.7 pretend this is 2649 bytes of document"
 
+# Long enough that nothing in these tests expires mid-assertion.
+# Expiry behaviour belongs to the reaper's own tests, where the
+# lease is deliberately short.
+LEASE = 60.0
+
 
 async def create(
     repo: DocumentRepository,
@@ -52,11 +57,13 @@ async def create_and_claim(
     they exercise the same sequence the worker does.
     """
     document, job = await create(repo, filename)
-    claimed = await repo.claim_next_queued_job()
+    claimed = await repo.claim_next_queued_job(lease_seconds=LEASE)
     assert claimed is not None and claimed.job_id == job.id, (
         "the claim should have taken the job just created"
     )
-    return document, job
+    # Returned so callers can prove ownership: since stage 2.1 every write
+    # that finishes a job needs the token the claim minted.
+    return document, job, claimed
 
 
 # ── Transaction boundaries ───────────────────────────────────────────────────
@@ -145,11 +152,12 @@ async def test_marking_done_sets_status_and_finish_time_together(
     statement and the timestamp in another fails on the first — the constraint
     shapes the code rather than merely validating it.
     """
-    _, job = await create_and_claim(repo)
+    _, job, claimed = await create_and_claim(repo)
     await session.flush()
 
     await repo.mark_job_done(
         job.id,
+        claimed.lease_token,
         page_count=3,
         pages_with_text=3,
         characters_extracted=1269,
@@ -168,11 +176,11 @@ async def test_marking_done_sets_status_and_finish_time_together(
 async def test_marking_failed_records_the_reason(
     repo: DocumentRepository, session: AsyncSession
 ) -> None:
-    _, job = await create_and_claim(repo)
+    _, job, claimed = await create_and_claim(repo)
     await session.flush()
 
     message = "'notes.txt' is not a PDF. It starts with b'just som'."
-    await repo.mark_job_failed(job.id, error=message)
+    await repo.mark_job_failed(job.id, claimed.lease_token, error=message)
     await session.commit()
 
     updated = await repo.get_job(job.id)
@@ -191,11 +199,11 @@ async def test_the_finish_time_comes_from_the_database(
     At stage 12.1 there are several API instances with independent clocks, and
     "which finished first" needs one authority.
     """
-    _, job = await create_and_claim(repo)
+    _, job, claimed = await create_and_claim(repo)
     await session.flush()
 
     before = (await session.execute(text("SELECT now()"))).scalar_one()
-    await repo.mark_job_failed(job.id, error="unknown")
+    await repo.mark_job_failed(job.id, claimed.lease_token, error="unknown")
     await session.commit()
 
     updated = await repo.get_job(job.id)
@@ -252,15 +260,23 @@ async def test_listing_returns_only_the_most_recent_attempt(
 
     Using `now() + interval` keeps one clock and one direction.
     """
-    document, first_job = await create_and_claim(repo)
+    document, first_job, first_claim = await create_and_claim(repo)
     await session.flush()
-    await repo.mark_job_failed(first_job.id, error="transient provider error")
+    await repo.mark_job_failed(
+        first_job.id, first_claim.lease_token, error="transient provider error"
+    )
 
     await session.execute(
         text(
-            "INSERT INTO ingestion_jobs (id, document_id, status, started_at) "
+            # A lease is required of any `processing` row since stage 2.1.
+            # Given explicitly rather than via a helper, because this insert is
+            # deliberately raw — it is constructing a *second* attempt that the
+            # repository has no method for.
+            "INSERT INTO ingestion_jobs "
+            "  (id, document_id, status, started_at, lease_token, lease_expires_at) "
             "VALUES (gen_random_uuid(), :doc, 'processing', "
-            "        now() + interval '1 minute')"
+            "        now() + interval '1 minute', "
+            "        gen_random_uuid(), now() + interval '1 hour')"
         ),
         {"doc": document.id},
     )
@@ -354,7 +370,7 @@ async def test_claiming_returns_nothing_when_the_queue_is_empty(
     The worker loop calls this once per tick forever, so "nothing to do" has
     to be an ordinary return value rather than something to catch.
     """
-    assert await repo.claim_next_queued_job() is None
+    assert await repo.claim_next_queued_job(lease_seconds=LEASE) is None
 
 
 async def test_claiming_moves_the_job_to_processing_and_stamps_a_start_time(
@@ -370,7 +386,7 @@ async def test_claiming_moves_the_job_to_processing_and_stamps_a_start_time(
     job = await enqueue(session)
     document_id = job.document_id
 
-    claimed = await repo.claim_next_queued_job()
+    claimed = await repo.claim_next_queued_job(lease_seconds=LEASE)
 
     assert claimed is not None
     assert claimed.job_id == job.id
@@ -401,7 +417,7 @@ async def test_claiming_ignores_jobs_that_are_not_queued(
     await create_and_claim(repo)  # now `processing`
     await session.flush()
 
-    assert await repo.claim_next_queued_job() is None, (
+    assert await repo.claim_next_queued_job(lease_seconds=LEASE) is None, (
         "a job another worker is already running must not be claimable again"
     )
 
@@ -423,8 +439,8 @@ async def test_claiming_takes_the_oldest_queued_job_first(
     oldest = await enqueue(session, "oldest.pdf", queued_at=base - timedelta(minutes=9))
     await enqueue(session, "newest.pdf", queued_at=base)
 
-    first = await repo.claim_next_queued_job()
-    second = await repo.claim_next_queued_job()
+    first = await repo.claim_next_queued_job(lease_seconds=LEASE)
+    second = await repo.claim_next_queued_job(lease_seconds=LEASE)
 
     assert first is not None and first.job_id == oldest.id
     assert second is not None and second.job_id == middle.id
@@ -450,8 +466,8 @@ async def test_jobs_queued_in_one_transaction_are_claimed_in_creation_order(
         "both should share transaction_timestamp(), or this test proves nothing"
     )
 
-    first_out = await repo.claim_next_queued_job()
-    second_out = await repo.claim_next_queued_job()
+    first_out = await repo.claim_next_queued_job(lease_seconds=LEASE)
+    second_out = await repo.claim_next_queued_job(lease_seconds=LEASE)
 
     assert first_out is not None and first_out.job_id == first_in.id
     assert second_out is not None and second_out.job_id == second_in.id
@@ -503,3 +519,138 @@ async def test_reading_the_upload_of_an_unknown_document_returns_none(
     from app.db.models import new_id
 
     assert await repo.get_upload_content(new_id()) is None
+
+
+# ── Leases and backoff (stage 2.1) ───────────────────────────────────────────
+
+
+async def test_claiming_mints_a_lease_and_counts_the_attempt(
+    repo: DocumentRepository, session: AsyncSession
+) -> None:
+    """A claim is now provisional, and says so in three columns.
+
+    Before 2.1 a claim set a status and a start time and that was the whole of
+    it — permanent by omission. The lease is what makes it temporary, and
+    `attempts` is what stops a job that keeps killing its worker from being
+    retried forever.
+    """
+    job = await enqueue(session)
+
+    claimed = await repo.claim_next_queued_job(lease_seconds=LEASE)
+    assert claimed is not None
+
+    fetched = (
+        await session.execute(
+            select(IngestionJob)
+            .where(IngestionJob.id == job.id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+
+    assert fetched.lease_token == claimed.lease_token
+    assert fetched.lease_expires_at is not None
+    assert fetched.attempts == 1 == claimed.attempts
+    assert fetched.next_attempt_at is None, (
+        "claiming is the attempt that was being waited for"
+    )
+
+
+async def test_each_claim_mints_a_different_token(
+    repo: DocumentRepository, session: AsyncSession
+) -> None:
+    """The token identifies the **claim**, not the worker.
+
+    If it named the worker, a worker that lost a lease and later re-claimed the
+    same job could not tell its two attempts apart — and a write left over from
+    the first would be accepted during the second.
+    """
+    await enqueue(session)
+    first = await repo.claim_next_queued_job(lease_seconds=LEASE)
+    assert first is not None
+
+    await repo.requeue_job(
+        first.job_id, first.lease_token, error="try again", delay_seconds=0
+    )
+    second = await repo.claim_next_queued_job(lease_seconds=LEASE)
+
+    assert second is not None
+    assert second.job_id == first.job_id
+    assert second.lease_token != first.lease_token
+    assert second.attempts == 2
+
+
+async def test_a_requeued_job_waits_for_its_backoff(
+    repo: DocumentRepository, session: AsyncSession
+) -> None:
+    """The delay lives in the row, not in a worker's sleep.
+
+    A worker that slept would hold a process doing nothing and would forget the
+    delay entirely on restart. A timestamp survives both, and every worker
+    honours it with one extra clause in the claim.
+    """
+    await enqueue(session)
+    claimed = await repo.claim_next_queued_job(lease_seconds=LEASE)
+    assert claimed is not None
+
+    await repo.requeue_job(
+        claimed.job_id,
+        claimed.lease_token,
+        error="the agent did not respond",
+        delay_seconds=300,
+    )
+
+    assert await repo.claim_next_queued_job(lease_seconds=LEASE) is None, (
+        "a job still inside its backoff window must not be claimable"
+    )
+
+
+async def test_a_requeued_job_keeps_the_reason_it_is_waiting(
+    repo: DocumentRepository, session: AsyncSession
+) -> None:
+    """`failed_requires_error` does not apply to a `queued` row, so this is a
+    choice rather than a requirement.
+
+    Keeping the error is what lets the client say "retrying after: the agent
+    did not respond" instead of showing a row indistinguishable from a fresh
+    upload.
+    """
+    job = await enqueue(session)
+    claimed = await repo.claim_next_queued_job(lease_seconds=LEASE)
+    assert claimed is not None
+
+    await repo.requeue_job(
+        claimed.job_id, claimed.lease_token, error="provider timeout", delay_seconds=0
+    )
+
+    fetched = (
+        await session.execute(
+            select(IngestionJob)
+            .where(IngestionJob.id == job.id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one()
+
+    assert fetched.status is IngestionStatus.QUEUED
+    assert fetched.error == "provider timeout"
+    assert fetched.started_at is None, (
+        "a requeued job has no current attempt, and the constraint requires it"
+    )
+    assert fetched.lease_token is None
+
+
+async def test_the_reaper_leaves_live_leases_alone(
+    repo: DocumentRepository, session: AsyncSession
+) -> None:
+    """The failure mode nobody tests for: a reaper that is too eager.
+
+    Reclaiming a job from a worker that is still working means the work is done
+    twice and the first result is discarded. The lease is the only thing
+    standing between a long ingest and that, so the reaper must respect it.
+    """
+    await enqueue(session)
+    claimed = await repo.claim_next_queued_job(lease_seconds=LEASE)
+    assert claimed is not None
+
+    reaped = await repo.reap_expired_leases(max_attempts=5)
+
+    assert reaped.total == 0

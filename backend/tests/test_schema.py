@@ -52,12 +52,31 @@ def make_job(**overrides: object) -> IngestionJob:
 
     `queued` jobs pass `started_at=None` explicitly, which reads as the
     deliberate choice it is.
+
+    **The lease defaults are conditional, and that is the point.** Stage 2.1
+    added `lease_matches_status`: a `processing` job holds a lease and nothing
+    else does. A flat default would therefore be wrong for three of the four
+    statuses, so the helper looks at the status it ends up with — which is the
+    same rule the constraint enforces, written once.
+
+    This is the third time a new constraint has broken correct tests for a
+    reason none of them was about. Centralising the "satisfy everything else"
+    knowledge here is what stops it being a fourth.
     """
-    defaults = {
+    merged: dict[str, object] = {
         "status": IngestionStatus.PROCESSING,
         "started_at": func.now(),
+        **overrides,
     }
-    return IngestionJob(**{**defaults, **overrides})
+
+    if merged["status"] is IngestionStatus.PROCESSING:
+        merged.setdefault("lease_token", new_id())
+        merged.setdefault(
+            "lease_expires_at",
+            datetime.now(timezone.utc) + timedelta(seconds=60),
+        )
+
+    return IngestionJob(**merged)
 
 
 # ── Round trip ───────────────────────────────────────────────────────────────
@@ -417,11 +436,11 @@ async def test_a_queued_job_may_not_have_a_start_time(
 
 
 @pytest.mark.parametrize(
-    ("status", "finished_at", "error"),
+    ("status", "finished_at", "error", "lease"),
     [
-        (IngestionStatus.PROCESSING, None, None),
-        (IngestionStatus.DONE, datetime.now(timezone.utc), None),
-        (IngestionStatus.FAILED, datetime.now(timezone.utc), "not a PDF"),
+        (IngestionStatus.PROCESSING, None, None, True),
+        (IngestionStatus.DONE, datetime.now(timezone.utc), None, False),
+        (IngestionStatus.FAILED, datetime.now(timezone.utc), "not a PDF", False),
     ],
 )
 async def test_a_job_past_queued_must_have_a_start_time(
@@ -429,6 +448,7 @@ async def test_a_job_past_queued_must_have_a_start_time(
     status: IngestionStatus,
     finished_at: datetime | None,
     error: str | None,
+    lease: bool,
 ) -> None:
     """`ck_ingestion_jobs_started_at_matches_status`, second half.
 
@@ -456,6 +476,17 @@ async def test_a_job_past_queued_must_have_a_start_time(
             started_at=None,
             finished_at=finished_at,
             error=error,
+            # Stage 2.1 made this parametrisation sharper. A `processing` row
+            # must now *also* hold a lease, so without one this case would
+            # break two constraints and Postgres would report whichever it
+            # reached first — the exact trap this test's docstring describes,
+            # arriving from a third direction.
+            lease_token=new_id() if lease else None,
+            lease_expires_at=(
+                datetime.now(timezone.utc) + timedelta(seconds=60)
+                if lease
+                else None
+            ),
         )
     )
 
@@ -558,3 +589,134 @@ async def test_deleting_a_document_deletes_its_upload(
     ).scalar_one_or_none()
 
     assert remaining is None
+
+
+# ── The lease (stage 2.1) ────────────────────────────────────────────────────
+
+
+async def test_a_processing_job_must_hold_a_lease(
+    session: AsyncSession,
+) -> None:
+    """`ck_ingestion_jobs_lease_matches_status`, first half.
+
+    **The subtle half.** A `processing` row with no lease is not merely untidy
+    — it is *invisible to the reaper*, because `lease_expires_at < now()` is
+    false when the column is NULL. The job would be stuck forever in exactly
+    the state the recovery mechanism was built to find, and the mechanism would
+    never see it.
+
+    That is the state every pre-2.1 row was in, which is why the migration had
+    to give them an already-expired lease rather than leave them alone.
+    """
+    document = make_document()
+    session.add(document)
+    await session.flush()
+
+    session.add(
+        make_job(
+            document_id=document.id,
+            status=IngestionStatus.PROCESSING,
+            lease_token=None,
+            lease_expires_at=None,
+        )
+    )
+
+    with pytest.raises(IntegrityError, match="lease_matches_status"):
+        await session.flush()
+
+
+@pytest.mark.parametrize(
+    ("status", "terminal", "error"),
+    [
+        (IngestionStatus.QUEUED, False, None),
+        (IngestionStatus.DONE, True, None),
+        (IngestionStatus.FAILED, True, "not a PDF"),
+    ],
+)
+async def test_only_a_processing_job_may_hold_a_lease(
+    session: AsyncSession,
+    status: IngestionStatus,
+    terminal: bool,
+    error: str | None,
+) -> None:
+    """`ck_ingestion_jobs_lease_matches_status`, second half.
+
+    A lease outliving its work is how a stale write gets accepted after the
+    fact: the conditional UPDATE checks the token, so a terminal job that still
+    carries one is a job a long-asleep worker can still overwrite.
+
+    Each case satisfies every other constraint, so only this one can fire.
+    """
+    document = make_document()
+    session.add(document)
+    await session.flush()
+
+    session.add(
+        IngestionJob(
+            document_id=document.id,
+            status=status,
+            # **Both timestamps come from the database clock.** Using a Python
+            # `datetime.now()` for `finished_at` broke this test on first run:
+            # the value is computed when pytest collects the parameters, while
+            # `started_at` is computed at INSERT — so `finished_at` was
+            # *earlier* and `finished_after_started` fired instead of the
+            # constraint being tested.
+            #
+            # `func.now()` is `transaction_timestamp()`, so both land on the
+            # same instant and `>=` holds. The fourth time in this project a
+            # test has broken on a constraint it was not about.
+            started_at=None if status is IngestionStatus.QUEUED else func.now(),
+            finished_at=func.now() if terminal else None,
+            error=error,
+            lease_token=new_id(),
+            lease_expires_at=datetime.now(timezone.utc) + timedelta(seconds=60),
+        )
+    )
+
+    with pytest.raises(IntegrityError, match="lease_matches_status"):
+        await session.flush()
+
+
+async def test_a_lease_token_without_an_expiry_is_refused(
+    session: AsyncSession,
+) -> None:
+    """`ck_ingestion_jobs_lease_expiry_matches_token`.
+
+    The two columns are one fact and must move together. A token with no
+    expiry never lapses, so nothing ever reclaims it — a permanent claim, which
+    is precisely what stage 2.1 exists to abolish. An expiry with no token has
+    nothing to check ownership against.
+
+    Either alone is a silent hole in the recovery path, which is why this is a
+    constraint rather than a convention.
+    """
+    document = make_document()
+    session.add(document)
+    await session.flush()
+
+    session.add(
+        make_job(
+            document_id=document.id,
+            lease_token=new_id(),
+            lease_expires_at=None,
+        )
+    )
+
+    with pytest.raises(IntegrityError, match="lease_expiry_matches_token"):
+        await session.flush()
+
+
+async def test_attempts_cannot_be_negative(session: AsyncSession) -> None:
+    """Cheap, and it catches the decrement nobody meant to write.
+
+    `attempts` is the bound on how much one document can cost, so a negative
+    value is an unbounded retry loop waiting to happen.
+    """
+    document = make_document()
+    session.add(document)
+    await session.flush()
+
+    session.add(make_job(document_id=document.id, attempts=-1))
+
+    with pytest.raises(IntegrityError, match="attempts_non_negative"):
+        await session.flush()
