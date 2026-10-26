@@ -11,6 +11,9 @@ Stage 1.3 finished the job: it returns `202` with a queued record and does
 not block. The result arrives later, through `GET /documents/{id}`, and the
 only thing this handler does with the agent is not call it.
 
+Stage 2.2 made `202` conditional. An upload of bytes the system already has
+indexed enqueues nothing, so it answers `200` — see the handler.
+
 Routes raise domain errors; `main.py` maps them to status codes. Same shape as
 the agent.
 """
@@ -53,6 +56,29 @@ async def upload_document(
     carries the document with `status: "queued"` and every count `null`,
     because at this instant that is the whole truth.
 
+    ── Both codes, from stage 2.2 ─────────────────────────────────────────────
+
+    `202` is now conditional on something actually being enqueued:
+
+        202   a new document, or another attempt at one whose last attempt
+              failed. Work is queued; the outcome arrives later at `Location`.
+        200   these exact bytes are already indexed or already in flight.
+              Nothing was created and nothing was queued.
+
+    Both are successes, and that is the point — the request was "make sure this
+    document is indexed", and in the second case it already is. A `409
+    Conflict` would report a failure for an upload that worked, which is
+    exactly what a browser retrying a timed-out `POST` would receive.
+
+    The two codes are also the *only* signal a client gets, because both carry
+    the same body. The frontend reads the status to tell the user whether it is
+    watching a new ingestion or looking at a document it already had.
+
+    **The handler does not make this decision**, it only reports it:
+    `UploadOutcome.queued` comes from the service, where the rest of the
+    ingestion policy lives. Deciding it here would put a product rule in the
+    HTTP layer and leave the worker's half of the service unable to see it.
+
     **No `AgentClientDep`.** The route no longer talks to the agent at all, and
     dropping the dependency is the honest signal — a parameter it never used
     would leave the impression that it might.
@@ -79,24 +105,29 @@ async def upload_document(
         raise BadUploadError(f"'{file.filename}' is empty (0 bytes).")
 
     service = IngestionService(session, repository)
-    record = await service.accept_upload(
+    outcome = await service.accept_upload(
         filename=file.filename or "upload.pdf",
         content=content,
         content_type=file.content_type,
     )
 
-    # `Location` points at where the outcome will appear. That is what makes
-    # this a well-formed 202 rather than a 200 with a different number: the
-    # response tells the client where to look instead of asking it to
-    # reconstruct the URL from an id in the body.
+    # `Location` points at where the outcome will appear, and it is sent with
+    # both codes. On a `202` it is what makes the response well formed — the
+    # server tells the client where to look instead of asking it to
+    # reconstruct the URL from an id in the body. On a `200` it names the
+    # document the request turned out to be about, which is the one thing the
+    # client did not know.
     #
-    # `JSONResponse` rather than returning the model, because a custom header
-    # needs the response object. The `response_model` on the decorator still
-    # documents the shape in the OpenAPI schema.
+    # `JSONResponse` rather than returning the model, because both a custom
+    # header and a conditional status code need the response object. The
+    # `response_model` on the decorator still documents the shape in the
+    # OpenAPI schema, and the shape is the same either way.
     return JSONResponse(
-        status_code=HTTPStatus.ACCEPTED,
-        content=record.model_dump(mode="json"),
-        headers={"Location": f"/documents/{record.document_id}"},
+        status_code=(
+            HTTPStatus.ACCEPTED if outcome.queued else HTTPStatus.OK
+        ),
+        content=outcome.document.model_dump(mode="json"),
+        headers={"Location": f"/documents/{outcome.document.document_id}"},
     )
 
 @router.get("/documents", response_model=DocumentListResponse)

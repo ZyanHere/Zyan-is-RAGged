@@ -34,15 +34,25 @@ So the sequence is three steps, not two, and the middle one is the queue:
 
 Each `···` is an arbitrary amount of time, possibly a process restart.
 
-── What this deliberately does not fix ─────────────────────────────────────────
+── What the later stages added to this sequence ────────────────────────────────
 
-A job whose worker dies stays `processing` forever. Nothing retries it, nothing
-reclaims it, nothing notices — and now nobody is even waiting on a request to
-find out, which makes it worse and more realistic.
+**Stage 2.1** made a claim provisional. A job whose worker dies used to stay
+`processing` forever; now the claim carries a lease and a token, the worker
+renews the lease while it works, and any worker reaps expired leases before
+claiming. Every write that finishes a job carries the token, so a worker that
+was reaped affects zero rows rather than overwriting whoever holds the job now.
 
-That is correct for now. Stage 2.1's lease, heartbeat and reaper are only
-buildable once there is a stuck row to observe. Leave it broken; make it
-visible.
+**Stage 2.2** made re-processing safe, which is what 2.1's retries required:
+point ids are derived from `(document_id, chunk_index)` and an ingestion prunes
+everything else belonging to that document, so running a job once or five times
+leaves the same index.
+
+── What this still deliberately does not fix ───────────────────────────────────
+
+**Nothing classifies failures.** Every error retries until `max_attempts` runs
+out — a corrupt PDF burns the whole budget exactly as a transient outage would.
+That is stage 2.3's trigger and it is left in place on purpose: retrying
+everything is what produces the observation 2.3 needs.
 
 ── `IngestOutcome` is gone ─────────────────────────────────────────────────────
 
@@ -58,13 +68,16 @@ client has displayed since 1.2 — so the problem that type solved has moved
 rather than returned.
 """
 
+import hashlib
 import logging
 import random
 from dataclasses import dataclass
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db.models import Document, IngestionJob, IngestionStatus
 from app.errors import AgentUnavailableError
 from app.repositories.documents import ClaimedJob, DocumentRepository
 from app.schemas.documents import DocumentRead
@@ -120,6 +133,44 @@ vanished" is a failed job with a readable reason — something an operator can
 see in the list — not a stack trace in a log nobody is reading. A worker is not
 a request; there is no caller to hand an exception to.
 """
+
+
+class UploadOutcome(NamedTuple):
+    """What an upload did, and what the HTTP layer should say about it.
+
+    ── Why a second field and not just the document ────────────────────────────
+
+    Before stage 2.2 an accepted upload always queued work, so `202 Accepted`
+    was the only honest answer and the route needed nothing but the record.
+    Deduplication adds an outcome where **nothing was written**: the bytes were
+    already indexed. `202` means *recorded, not yet done*, which would be false
+    for a document that is already done.
+
+    `queued` is the one bit the route cannot work out for itself. It cannot be
+    inferred from `document.status`, and the near-miss is worth naming: a
+    `queued` status is the state of both a brand-new upload and a duplicate of
+    something already waiting in the queue, so reading the status would answer
+    `202` for both — correct for the first and a lie about the second.
+
+    A `NamedTuple` rather than a dataclass, matching `ClaimedJob` and
+    `ReapResult` in the repository: these are results being carried one level
+    up, not entities with behaviour.
+
+    **Not an enum of three cases.** `created`, `retried` and `duplicate` are
+    genuinely three things, and the HTTP layer treats the first two
+    identically — both are "work is now queued, look here later". Adding a
+    distinction the only consumer collapses would be carrying a shape for a
+    caller that does not exist. The three cases are distinguished in the logs,
+    where they are actually read.
+    """
+
+    document: DocumentRead
+    queued: bool
+    """True when this request caused work to be enqueued.
+
+    `False` means the response is a report on a document that was already
+    here, and the route answers `200` instead of `202`.
+    """
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,22 +262,112 @@ class IngestionService:
 
     async def accept_upload(
         self, *, filename: str, content: bytes, content_type: str | None
-    ) -> DocumentRead:
+    ) -> UploadOutcome:
         """Record that a document arrived, and that it needs indexing.
 
-        Everything a request does. Two INSERTs, one blob, one COMMIT — bounded
-        work whose duration depends on the size of the upload and nothing else.
-        No agent call, no embedding, no vector store.
+        Everything a request does. Bounded work whose duration depends on the
+        size of the upload and nothing else: no agent call, no embedding, no
+        vector store.
 
-        Returns the document as it now stands: `status = "queued"`, every count
-        `null`, because nothing has been attempted yet. The caller turns that
-        into a `202`.
+        ── Three outcomes, not one — stage 2.2 ────────────────────────────────
+
+        Until now there was one: a new document, queued. The content hash makes
+        two more possible, and the difference between them is a product
+        decision rather than an implementation detail:
+
+            these bytes are new                 create, queue, 202
+            these bytes are here and the last
+              attempt failed                    queue another attempt, 202
+            these bytes are here and fine       return it; 202 would be a lie,
+                                                so 200
+
+        The caller reads `UploadOutcome.queued` to choose the status code.
+
+        **Why the third case is a success and not a `409`.** The request is
+        "make sure this document is indexed", and it is. A browser retrying a
+        timed-out upload is the common cause, and `409 Conflict` would report a
+        failure for an upload that actually worked — the exact outcome
+        idempotency exists to prevent. Nothing is created, nothing is queued,
+        and `200` rather than `202` is what says so.
+
+        **Why the second case queues a job rather than returning the failure.**
+        The bytes are identical, so it is the same document — but someone
+        re-uploading a file that failed is asking for another attempt, not for
+        the bad news again. One document, many jobs: that is what 1.2's
+        two-table split was for, and this is its first real caller. Refuse the
+        re-upload and a document whose retries were exhausted could never be
+        re-driven from the UI at all.
+
+        ── Why the hash is computed here and not passed in ────────────────────
+
+        `content_hash` is `sha256(content)` and this method already has
+        `content`, so taking the hash as a parameter would mean two arguments
+        that can contradict each other. The repository makes the same argument
+        about `byte_size`, which stopped being a parameter for exactly this
+        reason: a caller passing a stale value would produce a document whose
+        recorded size did not match its stored bytes, with nothing to catch it.
+
+        A hash that does not match its bytes is worse than a wrong size. It
+        does not look broken — it is still 64 valid hex characters — and the
+        damage is silent: that document never deduplicates against another
+        upload of the same file, and may dedupe against an unrelated one.
+
+        Deriving it here makes that unrepresentable rather than merely unlikely.
         """
-        document, job = await self._repository.create_document_with_job(
-            filename=filename,
-            content=content,
-            content_type=content_type,
-        )
+        content_hash = hashlib.sha256(content).hexdigest()
+
+        # The fast path. Someone re-uploading deliberately is the ordinary
+        # duplicate, and this makes it one SELECT with nothing written.
+        existing = await self._repository.get_by_content_hash(content_hash)
+        if existing is not None:
+            return await self._resolve_duplicate(*existing, filename=filename)
+
+        # ── The race the SELECT above cannot close ───────────────────────────
+        #
+        # Two requests carrying the same bytes can both read `None` before
+        # either writes. Only `uq_documents_content_hash` can refuse the
+        # second, so the INSERT is allowed to fail and the failure is handled
+        # rather than prevented.
+        #
+        # **Why a savepoint.** In Postgres a failed statement aborts the whole
+        # transaction: after the IntegrityError nothing further can run on this
+        # session until something rolls back, and an outer rollback would
+        # discard the lookup that has to come next. `begin_nested()` issues a
+        # SAVEPOINT, so only the failed INSERT is undone and the session stays
+        # usable.
+        #
+        # The alternative is `INSERT ... ON CONFLICT DO NOTHING`, which never
+        # raises and so needs no savepoint. It would also mean writing the
+        # three rows as Core inserts with explicit foreign keys, giving up the
+        # relationship cascade that writes document, job and upload in a
+        # single flush — a larger change, to avoid an exception on a rare path.
+        try:
+            async with self._session.begin_nested():
+                document, job = await self._repository.create_document_with_job(
+                    filename=filename,
+                    content=content,
+                    content_type=content_type,
+                    content_hash=content_hash,
+                )
+        except IntegrityError:
+            # Re-read rather than inspect the exception. If the hash is present
+            # now, we lost the race and the winner's document is the answer; if
+            # it is absent, this was a *different* constraint and the error is
+            # not ours to swallow.
+            #
+            # Discriminating on the data rather than on a constraint name in an
+            # error message means this keeps working if the constraint is
+            # renamed, and it cannot mistake one violation for another.
+            existing = await self._repository.get_by_content_hash(content_hash)
+            if existing is None:
+                raise
+
+            logger.info(
+                "upload lost the race for content_hash=%s; returning the "
+                "document the winner created",
+                content_hash[:12],
+            )
+            return await self._resolve_duplicate(*existing, filename=filename)
 
         # The invariant, inherited from 1.2 and now load-bearing for a second
         # reason: a worker in another process can only see committed rows, so
@@ -241,7 +382,60 @@ class IngestionService:
             len(content),
         )
 
-        return DocumentRead.from_rows(document, job)
+        return UploadOutcome(DocumentRead.from_rows(document, job), queued=True)
+
+    async def _resolve_duplicate(
+        self,
+        document: Document,
+        job: IngestionJob | None,
+        *,
+        filename: str,
+    ) -> UploadOutcome:
+        """These bytes are already here. Decide whether to attempt them again.
+
+        `filename` is taken only for the log line. The stored document keeps
+        the name it was first uploaded under: the bytes are the identity, and
+        renaming a document because someone re-uploaded it under a different
+        name would rewrite a record on the strength of something this stage has
+        just decided is not identifying.
+
+        **A document with no job at all takes the retry branch**, not the no-op
+        one. That state should be impossible — both rows are written in one
+        transaction — but it is representable, and a re-upload is the one
+        action that would fix it. The alternative is answering `200` for a
+        document that nothing will ever index.
+
+        **`processing` and `queued` are deliberately no-ops.** The document is
+        mid-flight; queueing a second attempt would have two workers ingest the
+        same bytes concurrently, which is the duplicate-chunk problem this
+        stage exists to remove, arriving by a new route.
+        """
+        if job is not None and job.status is not IngestionStatus.FAILED:
+            logger.info(
+                "duplicate upload of filename=%s matched document_id=%s "
+                "(status=%s); nothing queued",
+                filename,
+                document.id,
+                job.status,
+            )
+            return UploadOutcome(
+                DocumentRead.from_rows(document, job), queued=False
+            )
+
+        retry = await self._repository.create_job_for_document(document.id)
+        await self._session.commit()
+
+        logger.info(
+            "re-upload of filename=%s queued a new attempt for document_id=%s "
+            "job_id=%s (previous attempt: %s)",
+            filename,
+            document.id,
+            retry.id,
+            job.status if job else "none",
+        )
+        return UploadOutcome(
+            DocumentRead.from_rows(document, retry), queued=True
+        )
 
     # ── The worker's half ─────────────────────────────────────────────────────
 

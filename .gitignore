@@ -51,3 +51,10 @@ benchmark/results/
 frontend/.env
 frontend/.env.local
 frontend/.env.*.local
+
+# ─── Operational exports (stage 2.2) ─────────────────────────────────────────
+# `tools/qdrant_orphans.py` takes the live document list as a file, exported
+# from Postgres on the host. It is a snapshot of one moment, so a committed
+# copy would be stale the next time anyone ran the tool — and acting on a
+# stale list is how a reconciliation tool deletes live data.
+live.csv

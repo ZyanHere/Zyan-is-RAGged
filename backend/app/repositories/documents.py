@@ -127,6 +127,7 @@ class DocumentRepository:
         filename: str,
         content: bytes,
         content_type: str | None,
+        content_hash: str,
     ) -> tuple[Document, IngestionJob]:
         """Record that a document exists and that we are about to index it.
 
@@ -162,11 +163,26 @@ class DocumentRepository:
         Nothing in this call starts any work. That is the point: after it
         returns and the caller commits, the only thing that exists is a
         promise.
+
+        **`content_hash` is required, not optional — stage 2.2.** It is computed
+        by the caller, which already holds the bytes, and it is what makes this
+        INSERT capable of *failing*: `uq_documents_content_hash` refuses a
+        second document with the same hash.
+
+        That failure is a feature and the caller has to be ready for it. This
+        method does not catch it, for the same reason it does not commit: the
+        decision about what a duplicate upload means is a product decision and
+        belongs where the rest of them are. See `IngestionService.accept_upload`.
+
+        It has no default. A default of `None` would let a caller silently opt
+        out of deduplication, and the one place that writes documents would be
+        the one place able to bypass the rule the whole stage is about.
         """
         document = Document(
             filename=filename,
             byte_size=len(content),
             content_type=content_type,
+            content_hash=content_hash,
         )
         job = IngestionJob(
             document=document,
@@ -184,6 +200,64 @@ class DocumentRepository:
         await self._session.flush()
 
         return document, job
+
+    async def create_job_for_document(
+        self, document_id: UUID
+    ) -> IngestionJob:
+        """Queue another attempt at a document that already exists. Stage 2.2.
+
+        One row. No new document, no second copy of the bytes, no new identity.
+
+        ── This is the two-table split finally paying out ──────────────────────
+
+        `models.py` argues for separating identity from attempts, and the
+        argument has been theoretical since 1.2 — every document had exactly one
+        job, written in the same transaction. This is the first caller that
+        needs the other shape.
+
+        It exists because of a specific case. Someone uploads a PDF, ingestion
+        fails, they upload the same file again to make it work. The bytes are
+        identical, so `uq_documents_content_hash` says it is the same document —
+        and it *is* the same document. What is new is the attempt.
+
+        If identity and attempts shared a table, there would be no way to say
+        that: you would either reject the re-upload (and strand the user with a
+        document they cannot fix) or create a second document (and pay for the
+        same file twice, which is what this stage removes).
+
+        ── Why it does not check the document exists ──────────────────────────
+
+        The foreign key does. A bad `document_id` raises `IntegrityError` on
+        flush, which is the same answer one query earlier and one round trip
+        cheaper. The caller in `accept_upload` has just read the document
+        anyway, so a check here would re-read a row it already has.
+
+        ── The new job's state, and why every field is explicit ──────────────
+
+        `queued`, `started_at = None`, `attempts = 0`, no lease, no
+        `next_attempt_at`. A *fresh* attempt, not a continuation: the previous
+        job keeps its own `attempts` and its own error, so the history of what
+        was tried survives, which is exactly what a second table is for.
+
+        `attempts = 0` is deliberate rather than inherited. Carrying the failed
+        job's count forward would mean a re-upload started life halfway through
+        its retry budget, and a document that had exhausted it could never be
+        retried at all — a user's deliberate second attempt silently refused
+        because of what happened to the first.
+        """
+        job = IngestionJob(
+            document_id=document_id,
+            status=IngestionStatus.QUEUED,
+            # Explicit for the same reason as in `create_document_with_job`:
+            # the column has no server default, so SQLAlchemy omits it from the
+            # INSERT unless told, and `queued` with a `started_at` violates
+            # `ck_ingestion_jobs_started_at_matches_status`.
+            started_at=None,
+        )
+        self._session.add(job)
+        await self._session.flush()
+
+        return job
 
     async def claim_next_queued_job(
         self, *, lease_seconds: float
@@ -685,6 +759,53 @@ class DocumentRepository:
             select(Document, job)
             .outerjoin(job, job.document_id == Document.id)
             .where(Document.id == document_id)
+            .execution_options(populate_existing=True)
+        )
+        row = result.first()
+        return (row[0], row[1]) if row else None
+
+    async def get_by_content_hash(
+        self, content_hash: str
+    ) -> DocumentWithJob | None:
+        """The document with these exact bytes, and its latest attempt. Stage 2.2.
+
+        The read that makes an upload idempotent. `accept_upload` asks this
+        first, and when it answers, nothing is written and nothing is queued.
+
+        ── Why it returns the latest job and not just the document ────────────
+
+        Because the caller's next decision depends on it. A duplicate of a
+        document that is `done` is a no-op; a duplicate of one whose last
+        attempt `failed` is a request to try again. One query answers both
+        instead of the service fetching the document and then its job.
+
+        It is the same `DISTINCT ON` shape as `get_document_with_latest_job` —
+        deliberately, so "what is the state of this document?" has one
+        implementation however you arrive at the row.
+
+        ── Why the lookup cannot be trusted on its own ───────────────────────
+
+        This is a read, so two concurrent uploads of the same bytes can both
+        get `None` from it and both proceed to insert. The unique constraint is
+        what resolves that, and the caller handles the loser's `IntegrityError`.
+
+        Checking first is still worth it: it makes the ordinary duplicate — a
+        user re-uploading deliberately — a single SELECT with no write
+        attempted, and leaves the constraint to handle only the genuine race.
+
+        ── No index needed, and that is not an oversight ─────────────────────
+
+        `uq_documents_content_hash` is backed by a unique B-tree index, which
+        this equality lookup uses. A unique constraint is an index; adding a
+        second one on the same column would be dead weight.
+        """
+        latest = self._latest_job_subquery()
+        job = aliased(IngestionJob, latest)
+
+        result = await self._session.execute(
+            select(Document, job)
+            .outerjoin(job, job.document_id == Document.id)
+            .where(Document.content_hash == content_hash)
             .execution_options(populate_existing=True)
         )
         row = result.first()

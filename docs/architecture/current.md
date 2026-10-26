@@ -3,8 +3,8 @@
 **What the system is *today*.** Not the destination — `../curriculum.md` has
 that. Updated at the end of every stage, so it is never aspirational.
 
-**Stage:** **1.3 complete. 2.1 not started.**
-**Last updated:** 2026-10-21
+**Stage:** **2.2 complete. 2.3 not started.**
+**Last updated:** 2026-10-26
 
 ## How to read this file
 
@@ -29,7 +29,9 @@ not the thing is built yet.
 | **1.1** Working synchronous pipeline | ✅ complete | 4/4 citation tests resolve to the correct page; 3/3 bad-upload cases return 400/422 rather than 500; baseline run recorded (3 pages, 1,269 chars, 3 chunks, 4.0s ingest) |
 | **1.2** Persist what happened | ✅ complete | migration round-trips up→down→up with no autogenerate drift; 3 induced crashes → 3 detectable rows; the citation's `document_id` is byte-identical to the Postgres primary key |
 | **1.3** Ingestion out of the request cycle | ✅ complete | `202` in 38 ms, and 45 ms with the agent *paused*; a worker drained the queue and the citation still resolved to page 2; two claimers proved to take different jobs; the client reached a terminal state with nothing touching the page |
-| **2.1** Job lifecycle, leases and retries | ○ not started | its trigger is in the database — see *Deliberately left broken* |
+| **2.1** Job lifecycle, leases and retries | ✅ complete | 10 real process kills → every document terminal in 9.8 s with one worker and no intervention; the six-day-old stranded row recovered itself in 25 ms; a worker that loses its lease is proved unable to commit (`test_lease_handover.py`) |
+| **2.2** Idempotency | ✅ complete | a doubly-indexed document repaired 9 → 3 points by re-ingestion, then 3 → 3 on a repeat; orphaned points 39 → 0; 5 concurrent uploads of one file → 1 document, one `202` and four `200`; Postgres and Qdrant agree 7/7 |
+| **2.3** Dead-letter queue | ○ not started | its trigger: every failure still retries, with no classification |
 
 **Built ahead of its stage, for reasons recorded in the Evolution Map:**
 
@@ -123,7 +125,11 @@ models or embeddings.
 ✅ the queue — `ingestion_jobs` with a `queued` state, claimed by
    `SELECT … FOR UPDATE SKIP LOCKED`
 ✅ the worker — a separate process, `python -m app.worker`
-○  retries · leases · DLQ                       (2.1 – 2.3)
+✅ leases, heartbeats and a reaper; retry with exponential backoff and full
+   jitter, bounded by `max_attempts`                            (2.1)
+✅ content-hash deduplication, and a re-attempt on a failed document as a new
+   job rather than a new document                               (2.2)
+○  error classification · DLQ · replay                          (2.3)
 ○  auth · users / tenants                       (5.1 – 5.2)
 ○  quotas · rate limiting · caching              (6.x, 8.x, 9.x)
 ```
@@ -148,34 +154,40 @@ worker  claim (FOR UPDATE SKIP LOCKED)  →  COMMIT
 
 **The claim commits before the work starts**, separately from it. That is not
 tidiness: if both were one transaction, a crash would roll the claim back and
-the job would quietly return to `queued` — which is stage 2.1's job to do
-deliberately, and doing it by accident here would have destroyed 2.1's trigger.
-It also releases the database connection for the duration of the ingest, so a
-45-second job does not hold a pool slot.
+the job would quietly return to `queued`. At 1.3 that mattered because it would
+have destroyed 2.1's trigger by accident; now that the reaper exists it still
+matters, because a rollback would hide the crash entirely — the job would look
+as though it had never been attempted, and `attempts` would never grow. The
+reaper requeuing an *expired* claim is the visible version of the same
+recovery. It also releases the database connection for the duration of the
+ingest, so a 45-second job does not hold a pool slot.
 
 ✅ Mutation-tested: removing that commit fails
 `test_the_row_is_durable_before_the_agent_is_called`.
 
-⚠ **Deliberately left broken:** a job whose worker dies stays `processing`
-forever. Nothing retries it, reclaims it or notices — and since 1.3 there is no
-request open either, so the only symptom is a row nobody is looking at.
+✅ **A dead worker's job comes back.** Every claim carries a `lease_token` and
+an expiry; the worker renews it every `lease_seconds / 3` on its own session;
+every worker reaps expired leases before it claims. Every write that finishes a
+job carries the token, so a worker that was reaped affects **zero rows**
+instead of overwriting whoever holds the job now.
 
-**One such row exists**, created on purpose at the end of 1.3 by pausing the
-agent, letting a worker claim the job, and killing the worker:
+The row 1.3 left stranded on purpose — `01a153cd-13ce-7786-995f-369c0c82377e`,
+`processing` since 2026-10-19 — **recovered itself in 25 ms** the first time a
+worker ran with a reaper, with no human action. That closed 2.1's trigger and
+created 2.2's, because recovering it meant ingesting it twice.
 
-```text
-document_id  01a153cd-13ce-7786-995f-369c0c82377e
-job_id       01a153cd-13e3-733b-94ec-7588edc0366a
-```
+✅ **Re-processing is safe.** Point ids are derived from
+`(document_id, chunk_index)`, and an ingestion prunes every point of that
+document which is not one it just wrote. Running a job once or five times
+leaves the same index.
 
-It is 2.1's trigger. The Evolution Map's rule is *leave it broken; make it
-visible*.
+✅ **The client stops polling**, because jobs now reach terminal states.
 
-⚠ **It also makes the client poll forever**, because `useDocuments` polls while
-anything is non-terminal and this never becomes terminal. The UI is being
-honest — something genuinely is unfinished — but one abandoned job now costs
-perpetual background requests. A lease is what gives the client something true
-to say instead.
+⚠ **Nothing classifies failures.** A corrupt PDF retries the full
+`max_attempts` and lands in `failed` with the attempt count in its message.
+There is no dead-letter queue, no replay path, and no way to tell a transient
+outage from a permanently broken document — which is 2.3's trigger, and it is
+deliberate: 2.1 retries everything so that the observation exists.
 
 ### `agent/` :8001 — the AI application layer
 
@@ -254,11 +266,18 @@ loads `Document` entities with the ORM, and a blob column there is pulled into
 memory by any query that forgets to defer it. One that forgets would pull 25 MB
 per row to render a sidebar.
 
-⚠ **Nothing deletes these rows**, so the database now grows with the corpus
-rather than with its metadata. Accepted deliberately: stage 2.2 re-indexes
-documents, and a re-index with no stored input is a re-upload. **Object storage
-is the fix**, and its trigger is named — when the database size becomes a
-problem, or when 12.1 puts the backend and the worker on different machines.
+⚠ **Nothing deletes these rows**, so the database grows with the corpus rather
+than with its metadata. Accepted deliberately, and 2.2 made the reason concrete:
+re-ingesting a document is now the ordinary repair for a bad index, and a
+re-ingest with no stored input is a re-upload. **Object storage is the fix**,
+and its trigger is named — when the database size becomes a problem, or when
+12.1 puts the backend and the worker on different machines.
+
+✅ **The same bytes are stored once.** `documents.content_hash` is the SHA-256
+of the upload, unique, so a second upload of a file already held creates no
+document, no blob and no job — it answers `200` with the existing document.
+Three rows predating stage 1.3 carry `NULL` and are permanently exempt, which
+`docs/experiments/0002-…` explains.
 
 **Embedded Qdrant means exactly one process may hold the storage folder.** That
 is fine while the agent is the only writer — **including now that a worker
@@ -278,6 +297,32 @@ ones, and nothing queries that collection — but they are now orphan garbage
 rather than evidence, and deleting the collection is the right cleanup. Not done
 unilaterally, because deleting data is not mine to decide.
 
+### ⚠ Two stores, no transaction between them
+
+This is the structural gap in the system as it stands, and 2.2 measured its
+cost rather than fixing it.
+
+`ON DELETE CASCADE` reaches jobs and uploads. It does **not** reach Qdrant, so
+deleting a document leaves its vectors in place, searchable, attributable to
+nothing. At the start of 2.2, **39 of 54 points (72%) belonged to documents
+that no longer existed** — and a live query cited one of them, producing a
+confident answer whose source returns 404.
+
+✅ `tools/qdrant_orphans.py` reconciles the two stores and took that to **0**.
+It reports five groups (`agreed`, `orphan`, `mismatch`, `missing`, `pending`)
+and deletes only orphans; a mismatch is repaired by re-ingesting, which 2.2 made
+safe.
+
+⚠ **It is a cleanup, not a fix.** Nothing prevents the next orphan. The fix is
+a transactional outbox (Module 14), and **`DELETE /documents/{id}` is
+deliberately not built until it exists** — deleting a row and then its vectors,
+with a crash in between, recreates exactly this.
+
+It runs inside the agent image with the agent stopped, because embedded Qdrant
+holds an exclusive lock, and it takes the live document list as a **file**
+rather than a database connection, because the agent must not learn about
+Postgres.
+
 ---
 
 ## Recovering the old system
@@ -291,9 +336,36 @@ git checkout v0-chat-app
 
 ---
 
+## Decided at 2.2
+
+- **What identifies a document** — the SHA-256 of its bytes, not its filename.
+  A re-upload under a different name returns the original document, with its
+  original name, because the bytes are the identity.
+- **What a duplicate upload does** — `200 OK` with the existing document and
+  nothing queued; `202` only when work was actually enqueued. A duplicate of a
+  document whose last attempt *failed* queues a new job on the same document:
+  one document, many jobs, which is the first real payout on 1.2's two-table
+  split.
+- **How a re-ingest replaces a document** — upsert under derived ids, then
+  prune every point of that document which is not one just written. Never
+  delete first: that leaves a working document unsearchable, and permanently
+  absent if embedding then fails.
+- **`Idempotency-Key` headers are deferred.** For an upload, *the same request*
+  **is** *the same bytes*. The trigger is the first endpoint whose identity is
+  not derivable from its body.
+
+## Decided at 2.1
+
+- **How ownership of a job is proved** — a `lease_token` minted per claim and
+  carried by every completing write, so a stale worker affects zero rows.
+  Expiry alone is not enough: a re-claimed job has a *fresh* expiry, so an
+  expiry check would pass for a worker that no longer owns it.
+- **Where the reaper runs** — inside the worker loop, before each claim. No new
+  process to deploy and watch.
+
 ## Decided at 1.3
 
-Both of these were open questions in the previous version of this file.
+Both of these were open questions in an earlier version of this file.
 
 - **Where the ingestion worker lives** — `backend/` runs it, `python -m
   app.worker`, and it calls the agent over HTTP per document. Load-bearing for
@@ -311,7 +383,7 @@ Both are still running on the host rather than in containers; that is 15.1.
 
 - **Whether the agent ever needs its own datastore.** Currently no.
 - **When to write the client's tests.** They are overdue, not undecided — see
-  the frontend section. What is open is whether to do them before 2.1 or
-  alongside it.
+  the frontend section. Two stages have now passed with the condition fired and
+  nothing written, which makes this the oldest open debt in the project.
 - **Whether `tools/check_dependencies.py` is worth keeping** if nothing runs it.
   It becomes genuinely useful the moment there is CI, and dead weight otherwise.

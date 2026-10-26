@@ -1,24 +1,39 @@
 """The backend's tables.
 
-Two of them, and the split is the point of stage 1.2:
+    documents          identity. These bytes were uploaded. They exist.
+    ingestion_jobs     attempts. We tried to index them, and here is what
+                       happened — once per attempt.
+    document_uploads   the bytes themselves, added at 1.3 when the request
+                       stopped outliving the work.
 
-    documents        identity. This file was uploaded. It exists.
-    ingestion_jobs   attempts. We tried to index it, and here is what happened.
-
-Before this stage the only evidence a document existed was its chunks in
+Before stage 1.2 the only evidence a document existed was its chunks in
 Qdrant — which is a *result*, not a record of intent. A crash midway through
 left no trace that anything had been attempted, so "partially indexed" and
 "never uploaded" were indistinguishable. These tables are what makes the
 difference visible.
 
-── Why two tables ───────────────────────────────────────────────────────────
+── Why identity and attempts are separate tables ────────────────────────────
 
 A single `documents` table with a `status` column would be smaller and would
-work today. It breaks at stage 2.2, where a retry is a *second attempt at the
-same document*: the second attempt would overwrite the first, and the history
-of what was tried would be gone exactly when you need it.
+have worked for two stages. The argument against it was that a retry is a
+*second attempt at the same document*, and a status column can only hold the
+latest one — so the history of what was tried would be gone exactly when you
+need it.
 
-Identity and attempts have different lifetimes. One document, many jobs.
+**That argument stopped being theoretical at 2.2.** Re-uploading a file whose
+last attempt failed now queues a *new job on the existing document*: no second
+identity, no second copy of the bytes, no second embedding bill, and the failed
+attempt still on record with its own error and its own `attempts` count. One
+document, many jobs — with one table there would have been no way to express
+it, and the only options would have been refusing the re-upload or duplicating
+the document.
+
+── What identifies a document ───────────────────────────────────────────────
+
+Its bytes. `content_hash` is a SHA-256 with a unique constraint, added at 2.2,
+and it is what makes `POST /documents` idempotent. `filename` is a label: two
+people can upload different documents both called `report.pdf`, and one person
+can upload the same bytes twice under different names.
 """
 
 import uuid
@@ -133,10 +148,60 @@ class Document(Base):
     filename: Mapped[str] = mapped_column(Text, nullable=False)
     """The name as uploaded.
 
-    **Not unique.** Uploading the same file twice creates two documents at this
-    stage, because nothing deduplicates yet. Content hashing and idempotency
-    are stage 2.2, and a unique constraint here now would reject a legitimate
-    re-upload for the wrong reason.
+    **Not unique, and never will be.** Two people can legitimately upload
+    different documents both called `report.pdf`, and one person can upload the
+    same bytes under two names. A name is a label, not an identity.
+
+    `content_hash` below is the identity, from stage 2.2.
+    """
+
+    content_hash: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, unique=True
+    )
+    """SHA-256 of the uploaded bytes, hex. **This is what identifies a
+    document.** Stage 2.2.
+
+    ── Why the content and not the filename ───────────────────────────────────
+
+    Before this column the same file uploaded twice was two documents, two
+    stored blobs and two embedding bills. That is not a hypothetical: every
+    document in the database at the time this was added was the same 1244-byte
+    PDF, uploaded four times. See `docs/experiments/0002-stage-2-2-baseline-
+    audit.md`.
+
+    The hash makes "the same document" a fact about the bytes rather than a
+    judgement about a name, which is what lets `POST /documents` be idempotent:
+    a browser that retried a timed-out upload now gets the existing document
+    back instead of creating a second one.
+
+    ── Why nullable, when every document has bytes ────────────────────────────
+
+    Documents created before stage 1.3 have no `document_uploads` row — the
+    bytes were never stored, so they cannot be hashed now. `NOT NULL` would
+    require inventing a value for them.
+
+    Postgres treats NULLs as **distinct** in a unique index, so any number of
+    un-hashable historical rows coexist with the constraint. That is also the
+    correct meaning: we do not know whether two of them were the same file.
+
+    The migration backfills one row per hash group (the oldest) and leaves its
+    duplicates NULL, so the duplicates that predate the rule stay visible as
+    what they are rather than being deleted to satisfy a constraint invented
+    after they were written. The reasoning is in the experiment note above.
+
+    ── Why 64 characters and not Text ─────────────────────────────────────────
+
+    The length is a fact about SHA-256, not a guess about data. Everything else
+    in this file is `Text` because its length is genuinely unbounded; this is
+    the one column where a width is knowledge rather than a limit.
+
+    ── What changes at stage 5.1 ──────────────────────────────────────────────
+
+    Uniqueness becomes `(tenant_id, content_hash)`. Global uniqueness is right
+    with one tenant and **wrong** with two: one tenant uploading a public PDF
+    would collide with another's copy of it, and the second would be told it
+    already owned a document it has never seen — which is also an information
+    leak about what other tenants hold.
     """
 
     byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)

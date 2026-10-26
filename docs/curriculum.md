@@ -249,10 +249,10 @@ will never be built. That is not failure; a map is not a to-do list.
   DONE      1.1   working synchronous pipeline
   DONE      1.2   persist what happened
   DONE      1.3   ingestion out of the request cycle
+  DONE      2.1   job lifecycle, leases, retries
+  DONE      2.2   idempotency
   ────────────────────────────────────────────────────── you are here
-  NEXT      2.1   job lifecycle, leases, retries
-            2.2   idempotency
-            2.3   dead-letter queue
+  NEXT      2.3   dead-letter queue
             2.4   seeing inside
             3.1   retrieval metrics       ← blocked: needs a real document corpus
             3.2   failure attribution
@@ -280,22 +280,34 @@ the system's current state is checkable here.
 | **1.1** Working synchronous pipeline | **COMPLETE** | 4/4 citation tests hit the right page; 3/3 break-it cases; provenance confirmed end to end |
 | **1.2** Persist what happened | **COMPLETE** | Alembic round-trip clean; 3 induced crashes → 3 detectable rows `[measured]`; citation `document_id` === Postgres PK |
 | **1.3** Ingestion out of the request cycle | **COMPLETE** | `202` in 38ms with the agent paused `[measured]`; a worker drained the queue and the citation still resolved to the right page; two claimers proved to take different jobs; one stranded row created deliberately |
-| **2.1** Job lifecycle, leases and retries | **NOT STARTED** | its trigger exists — see below |
+| **2.1** Job lifecycle, leases and retries | **COMPLETE** | 10 real process kills → every document terminal in 9.8s, no intervention `[measured]`; the 1.3 stranded row recovered itself in 25ms; a worker that loses its lease is proved unable to commit |
+| **2.2** Idempotency | **COMPLETE** | a doubly-indexed document repaired 9 → 3 points by re-ingestion `[measured]`; orphaned points 39 → 0; 5 concurrent uploads of one file → 1 document; Postgres and Qdrant agree 7/7 |
 
-**Test counts** `[measured]`: 35 `rag` · 78 `backend` · 0 `agent` · 0 frontend,
-plus `tsc` and `eslint` clean. **Nothing runs any of them automatically** — see
-the note at 15.2.
+**Test counts** `[measured]`: 44 `rag` · 122 `backend` · 0 `agent` · 0
+frontend, plus `tsc` and `eslint` clean. **Nothing runs any of them
+automatically** — see the note at 15.2.
 
-**The stranded job, for anyone looking for it:**
+**The stranded job — now closed, and worth keeping the record of:**
 
 ```text
 document_id  01a153cd-13ce-7786-995f-369c0c82377e
 job_id       01a153cd-13e3-733b-94ec-7588edc0366a
-status       processing, started 2026-10-19, never finished
+status       processing, started 2026-10-19, never finished   ← the trigger
 ```
 
-A worker claimed it and was killed. Nothing has touched it since, and nothing
-will. It is stage 2.1's trigger, left in place on purpose.
+A worker claimed it and was killed. It sat there for six days, which was the
+point: it was stage 2.1's trigger, left in place on purpose.
+
+**It recovered itself in 25ms** the first time a worker ran with a reaper
+`[measured]` — `reclaimed 1 abandoned job(s)` → `claimed … attempt=2` →
+`ingestion done`, with no human action. That is the stage closing its own
+trigger, and it is the most convincing demonstration 2.1 produced.
+
+It then became **stage 2.2's** trigger, because recovering it meant ingesting
+it twice: Qdrant held six points where Postgres recorded three, each
+`chunk_index` present twice under two different random ids. Re-ingesting it
+after 2.2's deterministic ids brought it to three `[measured]`. One row, two
+stages, both triggers real rather than imagined.
 
 **Built ahead of schedule, for stated reasons:**
 
@@ -861,11 +873,31 @@ measured.
 | **Next trigger** | the retry re-ran the whole pipeline. The document now has duplicate chunks, and you paid to embed it twice |
 | **Covers** | job queues · state machines · leases · `SKIP LOCKED` · retries · backoff · jitter · at-least-once |
 
-**On the measure.** "Orphaned jobs after 10 induced crashes: 10 → 0" is a
-`[requirement]` we are setting, not a prediction. The crashes must be induced in
-a way that makes the window deterministic — at 1.2 a naive kill-at-t=5s lost a
-race against a rate limit, and the fix was to pause the agent container first so
-the window was controlled rather than hoped for. Reuse that technique.
+**On the measure — the framing was wrong, and the run proved it.**
+
+"Orphaned jobs after 10 induced crashes: 10 → 0" was written as a
+`[requirement]`. It is **not measurable as stated**, and the reason is a
+property of the design rather than of the apparatus: **every worker reaps
+before it claims**, so orphans cannot accumulate to 10 in the first place. The
+highest number observed at any instant was 1. A measure that assumes a state
+the system prevents is a measure of nothing.
+
+What was actually run and what it showed `[measured]`:
+
+> **10 real process kills** — `TerminateProcess`, no graceful shutdown, each
+> worker killed while holding a job — then **one ordinary worker**.
+> Every document reached a terminal state in **9.8 seconds** with no
+> intervention. `attempts` distribution `{1: 9, 2: 1}`.
+
+The technique still mattered and is worth reusing: the agent container is
+paused first so every ingest hangs and a kill always lands mid-job. At 1.2 a
+naive kill-at-t=5s lost a race against a rate limit.
+
+**The lesson is about writing measures, not about this one.** A target number
+can encode an assumption about the architecture — here, that orphans pile up —
+and when the architecture makes that assumption false, the honest move is to
+report what happened instead of engineering the system into the shape the
+measure expected.
 
 ### 2.2 — Idempotency · **CORE** · `[required]`
 
@@ -875,19 +907,69 @@ the window was controlled rather than hoped for. Reuse that technique.
 |---|---|
 | **Capability** | re-processing a document is safe: the index ends up the same whether a job ran once or five times |
 | **Now** | jobs retry reliably, and retries corrupt data |
-| **Problem** | after a retry the same fact is cited twice from the same page, and the Qdrant point count is double what it should be `[hypothesis — will become measured as soon as 2.1 retries anything]` |
-| **Diagnose** | compare chunk count to expected; inspect duplicate payloads |
+| **Problem** | after a retry the same fact is indexed twice from the same page, and the point count for that document is double what it should be `[measured]` — 2.1's reaper recovered the 1.3 stranded row, which ingested it a second time: Qdrant held 6 points where Postgres recorded 3, each `chunk_index` present twice under two different random ids. **A second problem was found while diagnosing the first** and is not a retry effect at all: `ON DELETE CASCADE` stops at the edge of Postgres, so deleting a document leaves its vectors behind — **39 of 54 points (72%) belonged to documents that no longer existed** `[measured]` |
+| **Diagnose** | compare Qdrant's point count per document against the `chunk_count` of its latest successful job. `chunk_index` is the sharper tool than the count: `[0,0,1,1,2,2]` says *doubly indexed*, where `6 vs 3` only says *wrong* |
 | **Root cause** | the pipeline is not idempotent: re-running it produces new rows rather than replacing old ones. Point ids are random by deliberate choice at 1.1 |
 | **Learn** | idempotency, natural keys, content addressing, deterministic ids, unique constraints, upsert, HTTP idempotency keys |
-| **Build** | SHA-256 content hash on upload → unique per tenant. Deterministic point ids (`uuid5(document_id, chunk_index)`). Delete-then-upsert per document. Idempotency keys on the HTTP layer |
-| **Verify** | upload the same file 5× concurrently; retry a job 10×. Chunk count must stay constant. Concurrency test on the content-hash uniqueness path — two simultaneous uploads of the same bytes |
-| **Done when** | duplicate chunks after repeated retries are zero; wasted embedding calls are measured and eliminated; the behaviour of a *second* upload of identical bytes is a decided and documented product question, not an accident |
+| **Build** | SHA-256 content hash on `documents`, unique. Deterministic point ids. **Upsert-then-prune**, not delete-then-upsert — see the corrections below. A reconciliation tool for the orphans. `Idempotency-Key` headers deferred with a trigger |
+| **Verify** | upload the same file 5× concurrently; re-ingest a document repeatedly. Point count must stay constant. Concurrency test on the content-hash uniqueness path — two simultaneous uploads of the same bytes |
+| **Done when** | duplicate chunks after repeated retries are zero; wasted embedding calls are **eliminated** (measuring them needs a counter, which is 2.4); the behaviour of a *second* upload of identical bytes is a decided and documented product question, not an accident |
 | **Next trigger** | some jobs fail every time — a corrupt PDF, a permanently rejected file. They retry forever, burning quota, and nobody notices |
 | **Covers** | idempotency · content addressing · unique constraints · upsert · HTTP idempotency keys |
 
 **Why the random point ids at 1.1 were correct.** Deterministic ids would have
 pre-fixed the duplicate-chunk corruption this stage exists to reproduce. The
-decision is recorded as D3; this is the stage that collects on it.
+decision is recorded as D3, and it paid out exactly as intended: by the time
+this stage ran there was a real doubly-indexed document to measure rather than
+a scenario to imagine.
+
+**Four corrections this stage made to its own plan**, each forced by something
+measured. Full write-ups in `docs/experiments/0002-…` and `0003-…`.
+
+1. **`uuid5(uuid.UUID(document_id), chunk_index)` crashes.** The engine has
+   never required `document_id` to be a UUID — `rag/tests/test_pipeline.py`
+   passes `"doc-1"`, and `pipeline.py` states that identity belongs to whoever
+   owns the durable record. A fixed namespace with the id in the *name* keeps
+   that contract. Tightening it so the id scheme could be prettier would have
+   been the engine taking back a decision it deliberately delegated.
+
+2. **Delete-then-upsert is the wrong order, and a tail delete does not work at
+   all.** Deleting first leaves a working document unsearchable until the write
+   lands, and permanently absent if embedding then fails. But upserting first
+   and deleting `chunk_index >= n` repairs *nothing* that predates the id
+   scheme — the measure showed 6 points becoming 9. **Points written under a
+   different id scheme are identifiable only by `document_id`, never by
+   index.** The fix is to prune everything that is not one of the ids just
+   written, which makes the guarantee unconditional: after a successful
+   ingestion the store holds exactly the chunks that ingestion wrote.
+
+3. **`Idempotency-Key` headers are deferred, not built.** For an upload, *the
+   same request* **is** *the same bytes*, which the content hash identifies
+   with no client cooperation and no key store. On this endpoint a key is
+   strictly weaker — two different keys carrying identical bytes would both be
+   honoured. **Trigger:** the first endpoint whose identity is not derivable
+   from its body, such as a POST that charges money, or 12.1's conversation
+   turns.
+
+4. **A duplicate upload returns `200`, not `409`.** The request is "make sure
+   this document is indexed", and it already is. A browser retrying a timed-out
+   `POST` is the common cause, and `409 Conflict` would report failure for an
+   upload that worked. A duplicate of a document whose last attempt **failed**
+   queues a new job on the *same* document — one document, many jobs, which is
+   the first real payout on 1.2's two-table split.
+
+**The orphans were not predicted by this plan at all.** They are a dual-write
+failure: Postgres and Qdrant are two stores with no transaction between them,
+and `ON DELETE CASCADE` reaches only one of them. `tools/qdrant_orphans.py`
+reconciles them and took 39 → 0, but it is a *cleanup*, not a fix — nothing yet
+prevents the next one. That is Module 14's outbox, and `DELETE /documents/{id}`
+is deliberately not built until it exists, because deleting a row and then its
+vectors recreates exactly the orphan this stage just removed.
+
+**What the orphans actually cost, which is the part worth remembering.** A live
+query answered confidently and cited a document that returns 404. Three
+quarters of the index was text from deleted documents, and retrieval quality
+measurement at 3.1 would have been scored against it.
 
 ### 2.3 — Dead-letter queue · **CORE** · `[required]`
 
@@ -1496,8 +1578,12 @@ before committing     →  UPDATE documents
 
 The vector write becomes the *uncommitted* part, and Postgres holds the commit
 point. A stale worker can still write garbage to Qdrant — what it cannot do is
-mark that garbage authoritative, and the next successful run overwrites it by
-deterministic point id (stage 2.2).
+mark that garbage authoritative, and the next successful run **both overwrites
+and removes it**: stage 2.2's point ids are derived from
+`(document_id, chunk_index)`, and the ingestion prunes every point of that
+document which is not one of the ids it just wrote. So a stale worker's output
+survives only until the next successful run of the same document, whatever ids
+it happened to use.
 
 **The transferable lesson is not "Redis plus Qdrant".** It is:
 
@@ -2455,6 +2541,78 @@ itself a deferral record** — each row says what is missing and what substitute
 Why this document was revised, and what changed. Kept so the reasoning is
 auditable rather than lost in a diff.
 
+## 2026-10-26 — Stages 2.1 and 2.2 complete; four plan corrections recorded
+
+**122 backend tests** (was 78), **44 rag** (was 35), `tsc` and `eslint` clean.
+Full write-ups in `docs/experiments/0002-stage-2-2-baseline-audit.md` and
+`0003-stage-2-2-idempotency-measures.md`.
+
+| Reconciled | Was | Now |
+|---|---|---|
+| 2.1 and 2.2's status | NOT STARTED / not written | both COMPLETE, with what they produced |
+| the stranded row | "nothing has touched it, and nothing will" | **recovered itself in 25ms**, then became 2.2's trigger |
+| 2.1's measure | "orphaned jobs 10 → 0" `[requirement]` | **not measurable as stated** — see below |
+| 2.2's problem | `[hypothesis]` | `[measured]`, with the specimen |
+| 2.2's Build | delete-then-upsert, idempotency keys | upsert-then-prune, keys deferred with a trigger |
+| test counts | 78 backend / 35 rag | 122 / 44 |
+
+**2.1's measure was unmeasurable, and the reason is architectural.** "Orphaned
+jobs after 10 induced crashes: 10 → 0" assumes orphans accumulate. They cannot:
+every worker reaps before it claims, so the highest count observable at any
+instant was 1. The run is reported as what it was — 10 real process kills, every
+document terminal in 9.8s with one ordinary worker and no intervention. **A
+target number can encode an assumption about the architecture; when the
+architecture makes it false, report what happened rather than reshaping the
+system to fit the measure.**
+
+**Four corrections 2.2 made to its own approved plan**, each forced by something
+measured rather than by review:
+
+| Correction | Found by |
+|---|---|
+| `uuid5(UUID(document_id), …)` crashes — the engine never required a UUID id | reading `test_pipeline.py` before writing code |
+| delete-then-upsert is the wrong order, **and** a tail delete repairs nothing predating the id scheme | the end-to-end measure: 6 points became **9** |
+| the orphan tool must read Postgres directly, not `GET /documents` | the endpoint caps `limit` at 200, and a truncated live list makes live documents look deletable |
+| the migration cannot hash every row | **every document in the database was the same file**; the unique index would have failed on all four |
+
+**The second one is the one worth remembering.** Every unit test passed, and six
+separate mutations of the id function were each caught by the test claiming to
+cover them. The scheme was correct and well tested. Only the end-to-end measure
+against real data found that the *replacement* step repaired nothing — which is
+the argument for this document's rule that a stage is not done until it has
+produced a number.
+
+**A problem this plan did not predict at all.** 72% of the vector store was
+points belonging to documents that no longer existed: `ON DELETE CASCADE` stops
+at the edge of Postgres. It is a dual-write failure, not a retry effect. A live
+query cited one of them — a document `GET /documents/{id}` answers 404 for.
+`tools/qdrant_orphans.py` took it 39 → 0, but it is a **cleanup, not a fix**:
+nothing prevents the next one until Module 14's outbox. `DELETE /documents/{id}`
+is deliberately still unbuilt for the same reason.
+
+**Three findings about testing**, recorded because they generalise:
+
+1. **A test can pass for a reason it does not state.** `queued_at DESC` in the
+   latest-job query had **no test capable of failing** — inside a test,
+   `session.commit()` does not advance `transaction_timestamp()`, so every row
+   shares a timestamp and the `id DESC` tiebreaker silently decided every
+   ordering. Found by mutation; fixed by making the two columns disagree.
+2. **A test written for a mechanism may not reach it.** The savepoint test
+   passed with the savepoint removed, because by the time it ran the winner's
+   row was committed and the loser took the fast path. The race window is
+   *inside one call* and cannot be hit by ordering two calls from outside.
+3. **A new constraint breaks correct tests.** `uq_documents_content_hash` broke
+   twelve tests across four files, none about uniqueness — every upload helper
+   handed each document the same bytes. **Fifth occurrence**, same cause each
+   time: the helper knew less about the schema than the schema did.
+
+**A wiring bug surfaced by the client layer.** `baseApi.ts` wrapped
+`fetchBaseQuery` without declaring `BaseQueryFn`'s `Meta` parameter, which
+defaults to `{}` — so **no endpoint in the frontend could read a response header
+or status code**, and `tsc` reported it as a missing property rather than
+missing wiring. Not specific to uploads; anything wanting `Location`, an `ETag`
+or `Retry-After` would have hit it.
+
 ## 2026-10-21 — Stage 1.3 complete; documents reconciled
 
 Built over six layers, each leaving the suite green: schema and migration,
@@ -2626,7 +2784,7 @@ its stage; collected here so they are not forgotten:
 | 20 concurrent uploads do not exhaust the 40-thread pool | 2.4 | the capacity probe — needs the fake embedder |
 | the real ingest duration for a large document | 2.4 | calibration run with the fake embedder |
 | a 120s timeout produces the Postgres/Qdrant divergence unattended | 2.4 | one upload with the delay above `AGENT_TIMEOUT` |
-| retries produce duplicate chunks | 2.2 | will become measured as soon as 2.1 retries anything |
+| ~~retries produce duplicate chunks~~ | 2.2 | **verified 2026-10-26.** 2.1's reaper recovered the 1.3 stranded row, ingesting it twice: 6 points where Postgres recorded 3, `chunk_index` `[0,0,1,1,2,2]` |
 | a poison document consumes quota unboundedly | 2.3 | feed one in and count attempts |
 | a row lock collapses throughput ~10× | 6.3 | 6.1's fix is what produces the number |
 | repeated queries are common enough to justify a cache | 9.1 | measure the repeat rate before building |
