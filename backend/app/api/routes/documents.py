@@ -14,6 +14,10 @@ only thing this handler does with the agent is not call it.
 Stage 2.2 made `202` conditional. An upload of bytes the system already has
 indexed enqueues nothing, so it answers `200` — see the handler.
 
+Stage 2.3 adds the operator's two: `GET /documents?status=failed` is the
+dead-letter queue, and `POST /documents/{id}/retry` is the only thing to do
+about an entry in it.
+
 Routes raise domain errors; `main.py` maps them to status codes. Same shape as
 the agent.
 """
@@ -25,6 +29,7 @@ from fastapi import APIRouter, File, Query, UploadFile
 from fastapi.responses import JSONResponse
 
 from app.api.deps import DocumentRepositoryDep, SessionDep
+from app.db.models import IngestionStatus
 from app.core.config import get_settings
 from app.errors import BadUploadError, NotFoundError, UploadTooLargeError
 from app.schemas.documents import (
@@ -134,6 +139,7 @@ async def upload_document(
 async def list_documents(
     repository: DocumentRepositoryDep,
     limit: int = Query(default=DEFAULT_PAGE_SIZE, gt=0, le=MAX_PAGE_SIZE),
+    status: IngestionStatus | None = Query(default=None),
 ) -> DocumentListResponse:
     """Every document, newest first, with the state of its latest attempt.
 
@@ -151,8 +157,27 @@ async def list_documents(
 
     `limit` is bounded server-side. An unbounded client-supplied limit is a
     request to build an arbitrarily large response in memory.
+
+    ── `?status=failed` is the dead-letter queue — stage 2.3 ─────────────────
+
+    Not a separate endpoint, and not a separate table. The question *"what has
+    died?"* is the same question this endpoint already answers, narrowed — so
+    it gets a filter rather than a parallel route with its own response model
+    and its own pagination to keep in step.
+
+    **Typed as `IngestionStatus`**, which is what makes an unknown value a
+    `422` from validation rather than a silently empty list. `?status=ded`
+    returning `{"items": []}` would read as "nothing has failed", which is the
+    most dangerous possible answer to that question.
+
+    It filters on the document's **latest** job. A document that failed once
+    and has since succeeded is not in the dead list — see the repository,
+    where that distinction is one word and the whole correctness of this
+    feature.
     """
-    rows = await repository.list_documents_with_latest_job(limit=limit)
+    rows = await repository.list_documents_with_latest_job(
+        limit=limit, status=status
+    )
     return DocumentListResponse(
         items=[DocumentRead.from_rows(document, job) for document, job in rows]
     )
@@ -180,3 +205,61 @@ async def get_document(
 
     document, job = found
     return DocumentRead.from_rows(document, job)
+
+
+@router.post(
+    "/documents/{document_id}/retry",
+    response_model=DocumentRead,
+    status_code=HTTPStatus.ACCEPTED,
+)
+async def retry_document(
+    document_id: UUID,
+    session: SessionDep,
+    repository: DocumentRepositoryDep,
+) -> JSONResponse:
+    """Queue another attempt at a document that is already here. Stage 2.3.
+
+    The operator's half of the dead-letter queue, and the reason the list is
+    worth having: without a way to act on an entry, a dead-letter view is a
+    list of regrets.
+
+    **`202`, like an upload**, because it means the same thing — work has been
+    recorded and has not happened yet, and the outcome appears at `Location`.
+    No `200` variant here: unlike `POST /documents`, this call *always*
+    enqueues something or fails, so there is no "nothing to do" outcome to
+    distinguish.
+
+    **`POST`, not `PUT`**, because it is not idempotent: calling it twice
+    queues two attempts. That is also why the conflict below matters — the
+    non-idempotence is bounded by refusing while one is already in flight.
+
+    ── The status codes, and what each one knows ─────────────────────────────
+
+        202   queued. The document exists and nothing was running.
+        404   no such document.
+        409   its latest attempt is `queued` or `processing`.
+
+    The `409` is the only refusal, and it is refused because the server can
+    *know* it: two workers on the same bytes is the duplicate-chunk corruption
+    stage 2.2 removed.
+
+    A permanently failed document is **not** refused. The server knows the
+    file was not a PDF when it last looked; it does not know whether OCR has
+    since been installed or the file replaced, and refusing would assert
+    something it cannot observe. See `IngestionService.retry_document`.
+
+    ── Why the body is a `DocumentRead` and not an empty 202 ────────────────
+
+    So the client can render the row immediately — `status: "queued"`,
+    `attempts: 0`, `error: null` — instead of waiting a poll interval to find
+    out whether anything happened. The same reason the upload route returns
+    one.
+    """
+    service = IngestionService(session, repository)
+    record = await service.retry_document(document_id)
+
+    return JSONResponse(
+        status_code=HTTPStatus.ACCEPTED,
+        content=record.model_dump(mode="json"),
+        headers={"Location": f"/documents/{record.document_id}"},
+    )

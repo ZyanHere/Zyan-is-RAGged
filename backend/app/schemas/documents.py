@@ -27,7 +27,12 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
-from app.db.models import Document, IngestionJob, IngestionStatus
+from app.db.models import (
+    Document,
+    FailureKind,
+    IngestionJob,
+    IngestionStatus,
+)
 
 
 class DocumentRead(BaseModel):
@@ -68,6 +73,28 @@ class DocumentRead(BaseModel):
     starts with b'just som'", "almost certainly a scanned document". The
     response carried them before; now they survive the request that produced
     them.
+    """
+
+    failure_kind: FailureKind | None = None
+    """Whether `error` could ever have succeeded on a retry. Stage 2.3.
+
+    `None` whenever `error` is `None` — the two move together, which a CHECK
+    constraint guarantees rather than a convention.
+
+    ── Why the client needs it and cannot derive it ──────────────────────────
+
+    The error message is written for a human and is not parseable. "is not a
+    valid PDF" and "could not reach the agent" are both just strings, and the
+    difference between them decides what the UI should *offer*:
+
+        permanent   say what is wrong with the file. Do not offer a retry —
+                    retrying changes nothing and the button would be a lie.
+        transient   say the service was unavailable, and offer the retry,
+                    because this one plausibly works now.
+
+    Present on non-terminal rows too. A job waiting to try again carries the
+    reason it is waiting, so "retrying after an outage" and "retrying a file
+    that will never parse" stop looking identical.
     """
 
     attempts: int = 0
@@ -128,6 +155,7 @@ class DocumentRead(BaseModel):
             characters_extracted=job.characters_extracted if job else None,
             chunk_count=job.chunk_count if job else None,
             error=job.error if job else None,
+            failure_kind=job.failure_kind if job else None,
             attempts=job.attempts if job else 0,
             next_attempt_at=job.next_attempt_at if job else None,
             finished_at=job.finished_at if job else None,

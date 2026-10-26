@@ -5,6 +5,7 @@ layer, declared in one file, translated at that layer's HTTP boundary in
 `main.py`.
 
     UploadTooLargeError   413  the upload exceeds MAX_UPLOAD_BYTES
+    ConflictError         409  the request contradicts the current state
     AgentUnavailableError 503  the agent could not be reached at all
     BackendError          500  anything of ours we did not name
 
@@ -50,6 +51,29 @@ class BadUploadError(BackendError):
 
 class UploadTooLargeError(BackendError):
     """The uploaded file exceeds the configured limit."""
+
+
+class ConflictError(BackendError):
+    """The request is well formed but contradicts the state of the thing.
+
+    A 409, and the distinction from 400 is worth keeping sharp: a 400 says
+    *this request is wrong*, a 409 says *this request would have been fine a
+    moment ago, or will be in a moment*. Retrying a 400 is pointless; retrying
+    a 409 may work.
+
+    ── Its only use at stage 2.3, and why there is only one ──────────────────
+
+    `POST /documents/{id}/retry` refuses a document whose latest job is
+    `queued` or `processing`. Queueing a second attempt would hand the same
+    bytes to two workers at once, which is the duplicate-chunk corruption
+    stage 2.2 removed, arriving by a new route.
+
+    It deliberately does **not** refuse a document that failed permanently.
+    The server knows a file was not a PDF; it does not know whether the
+    operator has since installed OCR or raised a limit, and refusing on those
+    grounds would be the server asserting the outside world has not changed.
+    Only the in-flight case is something the server can actually know.
+    """
 
 
 class AgentUnavailableError(BackendError):

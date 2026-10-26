@@ -36,6 +36,7 @@ from sqlalchemy.orm import aliased
 from app.db.models import (
     Document,
     DocumentUpload,
+    FailureKind,
     IngestionJob,
     IngestionStatus,
 )
@@ -495,7 +496,12 @@ class DocumentRepository:
         return result.rowcount == 1
 
     async def mark_job_failed(
-        self, job_id: UUID, lease_token: UUID, *, error: str
+        self,
+        job_id: UUID,
+        lease_token: UUID,
+        *,
+        error: str,
+        failure_kind: FailureKind,
     ) -> bool:
         """Record a failed attempt and why.
 
@@ -523,6 +529,11 @@ class DocumentRepository:
                 lease_token=None,
                 lease_expires_at=None,
                 error=error,
+                # Stage 2.3. Written in the same statement as `error`, because
+                # `ck_ingestion_jobs_failure_kind_matches_error` requires the
+                # two to move together — a caller cannot record one without
+                # the other even by mistake.
+                failure_kind=failure_kind,
             )
         )
         return result.rowcount == 1
@@ -533,6 +544,7 @@ class DocumentRepository:
         lease_token: UUID,
         *,
         error: str,
+        failure_kind: FailureKind,
         delay_seconds: float,
     ) -> bool:
         """Put a failed job back on the queue, to be retried after a delay.
@@ -577,6 +589,11 @@ class DocumentRepository:
                 lease_expires_at=None,
                 next_attempt_at=_db_now_plus(delay_seconds),
                 error=error,
+                # Stage 2.3, and this is the row where it earns its place: a
+                # job *waiting to retry* can now say why it is waiting.
+                # "Retrying after a provider outage" and "retrying a file that
+                # will never parse" are indistinguishable without it.
+                failure_kind=failure_kind,
             )
         )
         return result.rowcount == 1
@@ -638,6 +655,15 @@ class DocumentRepository:
                     "Abandoned: the worker holding this job stopped responding, "
                     f"and it has already been attempted {max_attempts} times."
                 ),
+                # **Transient, not permanent** — stage 2.3, and the direction
+                # is worth stating because it reads the other way at first.
+                #
+                # Nothing is wrong with this *document*. A worker died while
+                # holding it, repeatedly, which is a fact about the system.
+                # Calling it permanent would tell an operator not to bother
+                # retrying something that has never actually been judged — the
+                # document may never have reached the engine at all.
+                failure_kind=FailureKind.TRANSIENT,
             )
         )
 
@@ -714,18 +740,48 @@ class DocumentRepository:
         )
 
     async def list_documents_with_latest_job(
-        self, *, limit: int = 50
+        self, *, limit: int = 50, status: IngestionStatus | None = None
     ) -> Sequence[DocumentWithJob]:
         """Every document with the state of its most recent attempt.
 
         An **outer** join: a document with no job is wrong but not impossible,
         and silently hiding such a row would conceal exactly the kind of
         inconsistency this stage exists to make visible.
+
+        ── `status` is the dead-letter queue — stage 2.3 ──────────────────────
+
+        `status=IngestionStatus.FAILED` is the whole of the operator's view of
+        what has died. The roadmap called for moving exhausted jobs into a
+        separate table; this is that table, as a `WHERE` clause.
+
+        A dedicated table would buy nothing this schema lacks. Dead jobs
+        already cannot clog the queue — `failed` is terminal and
+        `claim_next_queued_job` only matches `queued`. Replay already exists:
+        `create_job_for_document`, built at 2.2 for the re-upload case. And it
+        would cost a duplicated foreign key, a latest-job join reading two
+        tables, and the attempt history that 1.2's two-table split exists to
+        keep. The thing a broker's DLQ isolates against — dead messages
+        blocking live ones — is a broker problem this design does not have.
+
+        ── Filtering the joined job, not any job ────────────────────────────
+
+        The `.where` goes on the **aliased latest job**, which is what makes
+        this correct. Filtering `IngestionJob.status` directly would match a
+        document that failed once and has since succeeded — so a document the
+        operator already fixed would sit in the dead list forever, and
+        retrying it would re-index something that is perfectly fine.
+
+        It also switches the join to an inner one in effect: a document whose
+        latest job is `failed` necessarily has a job, so the outer join's
+        `NULL` row cannot satisfy the filter. That is correct and worth
+        knowing — `status=None` keeps the outer join and keeps showing
+        job-less documents, which is the behaviour the unfiltered list has
+        always had.
         """
         latest = self._latest_job_subquery()
         job = aliased(IngestionJob, latest)
 
-        result = await self._session.execute(
+        query = (
             select(Document, job)
             .outerjoin(job, job.document_id == Document.id)
             .execution_options(populate_existing=True)
@@ -746,6 +802,11 @@ class DocumentRepository:
             .order_by(Document.created_at.desc(), Document.id.desc())
             .limit(limit)
         )
+
+        if status is not None:
+            query = query.where(job.status == status)
+
+        result = await self._session.execute(query)
         return [(document, j) for document, j in result.all()]
 
     async def get_document_with_latest_job(

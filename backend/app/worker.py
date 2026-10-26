@@ -226,6 +226,7 @@ async def process_one(
                 RetryPolicy(
                     max_attempts=settings.max_attempts,
                     base_seconds=settings.retry_base_seconds,
+                    max_delay_seconds=settings.max_delay_seconds,
                 ),
             )
 

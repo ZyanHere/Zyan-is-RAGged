@@ -141,26 +141,108 @@ class Settings(BaseSettings):
     where it stops being a guess.
     """
 
-    max_attempts: int = Field(default=5, gt=0)
-    """How many times a job may be claimed before the system gives up.
+    max_attempts: int = Field(default=15, gt=0)
+    """How many times a **transient** failure may be retried before giving up.
 
     Counts claims, not errors, so a job that silently kills its worker burns
     attempts just as a job that fails loudly does. That is deliberate: the
     thing being bounded is "how much can one document cost us", and a crash
-    costs the same as a rejected PDF.
+    costs the same as a timeout.
 
-    Five is small enough that a genuinely broken document cannot consume much,
-    and large enough to ride out a provider outage of several minutes once the
-    backoff is applied. The honest version of this number arrives at stage 2.3,
-    when failures are classified and transient ones can be retried more
-    patiently than permanent ones.
+    ── Why this was five, and why five was wrong ──────────────────────────────
+
+    The previous version of this docstring said five was *"large enough to ride
+    out a provider outage of several minutes once the backoff is applied"*.
+    That was a guess, and stage 2.3 measured it:
+
+        a valid document, uploaded during an outage
+        → permanently failed after 22 seconds
+
+    Not several minutes. Twenty-two seconds — which `docker compose restart
+    agent` fits comfortably inside, so an ordinary deploy destroyed every
+    document in flight and the only recovery was a human re-uploading.
+
+    **This is why a stage is not finished until it has produced a number.** The
+    reasoning in the old docstring was plausible and the arithmetic was never
+    done.
+
+    ── Where fifteen comes from, and why it was eight first ──────────────────
+
+    The target is **about five minutes** of outage survived. Eight attempts
+    was the first answer and it was wrong, by a factor of three:
+
+        8 attempts, cap 60   p10  55s    median  91s    p90 126s
+        15 attempts, cap 60  p10 233s    median 302s    p90 369s
+
+    (20,000 simulated runs of `delay_for`, which is cheap to do and was not
+    done the first time.)
+
+    **One document in ten gave up after 55 seconds** under the eight-attempt
+    policy — barely better than the 22-second budget this stage exists to fix.
+    Two live runs landed at 49.5s and 81.3s, both in that lower half, which is
+    how the error was noticed at all.
+
+    The mistake was reasoning about the *worst* case — the ceilings sum to
+    182s, which sounds like "about three minutes" — when what a document
+    actually experiences is the **sum of the draws**, and full jitter halves
+    every one of them. The spread matters more than the mean here, because the
+    documents that give up early are precisely the ones a short outage should
+    have saved.
+
+    Fifteen attempts with the 60-second cap gives ceilings of 2, 4, 8, 16, 32
+    and then 60 nine times over: a median of ~5 minutes and a p10 of ~4.
+
+    ── What fifteen attempts costs ──────────────────────────────────────────
+
+    Up to fifteen claims per document, each a short transaction and one agent
+    call that fails fast while the dependency is down. It is not fifteen
+    embedding bills: a transient failure by definition did not get far enough
+    to be charged for, and a **permanent** failure never reaches attempt two —
+    see `_classify`.
+
+    So the cost of patience is paid in cheap retries against a service that is
+    already refusing connections, and the alternative is throwing away
+    documents that would have succeeded.
+
+    It is a budget, not a guarantee. A ten-minute incident still fails
+    documents, and that is what the dead-letter list and `POST
+    /documents/{id}/retry` are for: the system should recover from a restart on
+    its own and ask for help with an outage.
+
+    ── It no longer applies to every failure ────────────────────────────────
+
+    A **permanent** failure gives up on the first attempt regardless of this
+    number — a file that is not a PDF will not become one. See `_classify` in
+    `services/ingestion.py`.
+    """
+
+    max_delay_seconds: float = Field(default=60.0, gt=0)
+    """The longest any single wait between attempts may be. Stage 2.3.
+
+    **Capped exponential backoff**, which is the standard form and which this
+    system did not have. Uncapped, the ceiling doubles forever: at eight
+    attempts the last wait would be up to 128 seconds and the budget's shape
+    would be set by one long sleep rather than by several spread-out tries.
+
+    The cap is what makes raising `max_attempts` buy *coverage* instead of
+    *latency*. Without it, more attempts mostly means a document sits
+    non-terminal for longer.
+
+    Sixty seconds, because the thing being waited on is a service restarting
+    or a rate-limit window closing, and both are measured in tens of seconds.
+    A longer cap would make the tail of the budget indistinguishable from the
+    system having forgotten about the document.
     """
 
     retry_base_seconds: float = Field(default=2.0, gt=0)
     """The first retry delay. Each subsequent attempt doubles the ceiling.
 
-    With the default: 2, 4, 8, 16, 32 seconds — about a minute of patience
-    across five attempts, which covers a container restart comfortably.
+    With the default the ceilings run 2, 4, 8, 16, 32 and then flatten at
+    `max_delay_seconds`. **How much outage that covers is not readable from
+    this number** — it depends on `max_attempts` and on the cap, and the draws
+    are random. The arithmetic lives with `max_attempts`, where it was once
+    got wrong by a factor of three by reading a sequence like this one and
+    reasoning about its sum.
 
     **The delay is a ceiling, not a value.** The service picks a random number
     between zero and it — full jitter. Without that, every worker that failed

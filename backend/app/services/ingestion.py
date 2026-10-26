@@ -47,12 +47,21 @@ point ids are derived from `(document_id, chunk_index)` and an ingestion prunes
 everything else belonging to that document, so running a job once or five times
 leaves the same index.
 
+**Stage 2.3** made the retry policy two policies. A failure is classified from
+the agent's status code — 4xx permanent, 5xx and no-response transient, with
+429 carved out — so a document that can never be indexed stops at attempt one
+while a document caught by an outage gets minutes. See `classify`.
+
 ── What this still deliberately does not fix ───────────────────────────────────
 
-**Nothing classifies failures.** Every error retries until `max_attempts` runs
-out — a corrupt PDF burns the whole budget exactly as a transient outage would.
-That is stage 2.3's trigger and it is left in place on purpose: retrying
-everything is what produces the observation 2.3 needs.
+**None of it is observable from outside.** There is no counter for jobs by
+state, no histogram of how long one takes, and every `logger.info` in this
+process is discarded — uvicorn installs no root handler, so `logging.lastResort`
+passes only WARNING and above. The `logger.warning` calls below are the entire
+operational surface of this file, and they reach a terminal nobody is watching.
+
+That is stage 2.4's trigger, and unlike the previous two it is already
+`[measured]` rather than waiting to be produced.
 
 ── `IngestOutcome` is gone ─────────────────────────────────────────────────────
 
@@ -71,14 +80,21 @@ rather than returned.
 import hashlib
 import logging
 import random
+from http import HTTPStatus
+from uuid import UUID
 from dataclasses import dataclass
 from typing import NamedTuple, Protocol
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import Document, IngestionJob, IngestionStatus
-from app.errors import AgentUnavailableError
+from app.db.models import (
+    Document,
+    FailureKind,
+    IngestionJob,
+    IngestionStatus,
+)
+from app.errors import AgentUnavailableError, ConflictError, NotFoundError
 from app.repositories.documents import ClaimedJob, DocumentRepository
 from app.schemas.documents import DocumentRead
 from app.services import agent_client
@@ -133,6 +149,61 @@ vanished" is a failed job with a readable reason — something an operator can
 see in the list — not a stack trace in a log nobody is reading. A worker is not
 a request; there is no caller to hand an exception to.
 """
+
+
+def classify(status_code: int | None) -> FailureKind:
+    """Could this failure have succeeded, given another try? Stage 2.3.
+
+    ── The whole classification is a status code, and that is the finding ────
+
+    The backend never imports `rag` — it learns what happened to a document
+    from the agent's HTTP response and nothing else. That boundary turns out
+    to already carry this distinction, because `agent/app/main.py` maps the
+    engine's error hierarchy onto status codes:
+
+        InvalidDocumentError  400   not a PDF, corrupt, encrypted
+        UploadTooLargeError   413   too big, and will stay too big
+        NoTextExtractedError  422   scanned; OCR is stage 16.2
+        EmbeddingError        502   rate limit, timeout, dead key
+        ProviderError         502
+        VectorStoreError      500   our own storage
+        AgentError            500
+        (no response)          —    the agent is down or did not answer
+
+    **4xx means the request can never succeed; 5xx means the system failed
+    you.** That is the HTTP specification's own semantics, and permanent and
+    transient map onto it without inventing anything.
+
+    `rag/errors.py` says its hierarchy is where this distinction belongs when
+    2.3 needs it. It turns out the backend does not need the hierarchy at all,
+    only the mapping the agent already performs — which is better, because it
+    keeps the backend ignorant of the engine, and that ignorance is what made
+    the 1.3 worker split possible.
+
+    ── The one carve-out, and why it is spelled out ─────────────────────────
+
+    `429 Too Many Requests` is 4xx and **transient**. It is the exception that
+    proves the rule is about *who can fix it* rather than about the number: a
+    rate limit is the server asking you to wait, not telling you the request
+    was wrong.
+
+    Nothing emits a 429 today. A provider will, and the next person to read
+    this should not have to rediscover it from an incident.
+
+    ── Why `None` rather than a sentinel code ───────────────────────────────
+
+    `None` means there was no response at all — `AgentUnavailableError`, which
+    the backend raises itself. Mapping that onto 503 and passing a number
+    would be inventing a response the agent never sent, and the caller already
+    knows the difference because it catches the exception.
+    """
+    if status_code is None:
+        return FailureKind.TRANSIENT
+    if status_code == HTTPStatus.TOO_MANY_REQUESTS:
+        return FailureKind.TRANSIENT
+    if status_code >= HTTPStatus.INTERNAL_SERVER_ERROR:
+        return FailureKind.TRANSIENT
+    return FailureKind.PERMANENT
 
 
 class UploadOutcome(NamedTuple):
@@ -194,6 +265,13 @@ class RetryPolicy:
 
     max_attempts: int
     base_seconds: float
+    max_delay_seconds: float = 60.0
+    """The longest any single wait may be. Stage 2.3.
+
+    Defaulted rather than required, so the many existing tests that construct
+    a policy with two numbers keep working and keep meaning what they meant.
+    Production passes it explicitly from `Settings`.
+    """
 
     def delay_for(self, attempt: int) -> float:
         """How long to wait before attempt number `attempt + 1`.
@@ -221,8 +299,26 @@ class RetryPolicy:
 
         The randomness means this is deliberately **not** deterministic, which
         is why the tests assert on bounds rather than on a value.
+
+        ── The cap, added at stage 2.3 ────────────────────────────────────────
+
+        Doubling has no natural end, and five attempts never reached a ceiling
+        worth capping — the largest was 16 seconds. At eight the last would be
+        128, and the budget's shape would be set by one long sleep rather than
+        by several spread-out tries.
+
+        **Capping is what makes more attempts buy coverage instead of
+        latency.** Without it, raising `max_attempts` mostly means a document
+        sits non-terminal for longer, which is the opposite of the intent.
+
+        Capped exponential backoff with full jitter is the standard form; this
+        code had the jitter and not the cap, which is the easier half to
+        remember.
         """
-        ceiling = self.base_seconds * 2 ** max(0, attempt - 1)
+        ceiling = min(
+            self.base_seconds * 2 ** max(0, attempt - 1),
+            self.max_delay_seconds,
+        )
         return random.uniform(0, ceiling)
 
 
@@ -437,6 +533,70 @@ class IngestionService:
             DocumentRead.from_rows(document, retry), queued=True
         )
 
+    async def retry_document(self, document_id: UUID) -> DocumentRead:
+        """Queue a fresh attempt at a document that is already here. Stage 2.3.
+
+        The operator's half of the dead-letter queue. The list says what died;
+        this is the only thing to *do* about it.
+
+        ── It is `create_job_for_document`, and that is the point ─────────────
+
+        Stage 2.2 built that method so a re-upload of a failed document would
+        queue another attempt rather than create a second document. Replaying
+        from the dead-letter list is the same operation reached a different
+        way, so it is the same code: one document, many jobs.
+
+        The difference is what the operator needs — the *file* is required for
+        a re-upload and they usually do not have it. The bytes are already in
+        `document_uploads`; only a row is missing.
+
+        ── Why a permanent failure is still retryable ────────────────────────
+
+        It reads wrong at first: the server decided this document can never
+        succeed, and now it will try again on request.
+
+        But what the server knows is that the file was not a PDF *when it last
+        looked*. It does not know whether OCR has since been installed, the
+        size limit raised, or the upload replaced. Refusing would be the
+        server asserting the outside world has not changed, which is not
+        something it can observe. Retrying a genuinely broken document costs
+        one claim and one 4xx — `_classify` still stops it at attempt one.
+
+        ── The one case that *is* refused ────────────────────────────────────
+
+        A document whose latest job is `queued` or `processing`. That is
+        knowable, and queueing beside it would hand the same bytes to two
+        workers at once — the duplicate-chunk corruption stage 2.2 removed,
+        arriving by a new route. `IngestionStatus.is_terminal` is the test,
+        so the rule stays spelled one way.
+        """
+        found = await self._repository.get_document_with_latest_job(document_id)
+        if found is None:
+            raise NotFoundError(f"No document with id {document_id}.")
+
+        document, job = found
+
+        if job is not None and not job.status.is_terminal:
+            raise ConflictError(
+                f"Document {document_id} is already {job.status} — a second "
+                f"attempt would index the same bytes twice. Wait for the "
+                f"current one to finish."
+            )
+
+        retry = await self._repository.create_job_for_document(document.id)
+        await self._session.commit()
+
+        logger.info(
+            "retry requested for document_id=%s job_id=%s "
+            "(previous attempt: %s, %s)",
+            document.id,
+            retry.id,
+            job.status if job else "none",
+            job.failure_kind if job and job.failure_kind else "n/a",
+        )
+
+        return DocumentRead.from_rows(document, retry)
+
     # ── The worker's half ─────────────────────────────────────────────────────
 
     async def process_job(
@@ -461,14 +621,26 @@ class IngestionService:
         if found is None:
             # The foreign key makes this impossible, so treat it as a failure
             # rather than crashing the worker on an invariant violation.
-            await self._record_failure(claimed, MISSING_UPLOAD_ERROR, retry)
+            #
+            # **Permanent since stage 2.3.** Nothing in this system ever
+            # re-creates a deleted upload row, so retrying is spending the
+            # budget on an outcome that is already decided. `_record_failure`'s
+            # docstring used to argue for retrying it anyway — *"carving out
+            # exceptions one at a time is how a rule stops being a rule"* —
+            # and that argument held exactly as long as there was no rule to
+            # carve it out of.
+            await self._record_failure(
+                claimed, MISSING_UPLOAD_ERROR, FailureKind.PERMANENT, retry
+            )
             return
 
         document, _ = found
 
         content = await self._repository.get_upload_content(claimed.document_id)
         if content is None:
-            await self._record_failure(claimed, MISSING_UPLOAD_ERROR, retry)
+            await self._record_failure(
+                claimed, MISSING_UPLOAD_ERROR, FailureKind.PERMANENT, retry
+            )
             return
 
         # Unbounded, and no longer a problem for anyone waiting. The agent
@@ -484,14 +656,23 @@ class IngestionService:
             )
         except AgentUnavailableError as exc:
             # No response at all — the agent is down, or did not answer in
-            # time. Still a failed attempt, and still worth recording.
-            await self._record_failure(claimed, str(exc), retry)
+            # time. Transient by definition: nothing was judged about this
+            # document, so nothing is known to be wrong with it.
+            #
+            # `None` rather than a stand-in status code, because inventing a
+            # 503 the agent never sent would put a fiction in the one place
+            # the classification reads from.
+            await self._record_failure(
+                claimed, str(exc), classify(None), retry
+            )
             return
 
         if status_code >= 400:
             detail = body.get("detail")
             message = detail if isinstance(detail, str) and detail else UNKNOWN_ERROR
-            await self._record_failure(claimed, message, retry)
+            await self._record_failure(
+                claimed, message, classify(status_code), retry
+            )
             return
 
         await self._record_success(claimed, body)
@@ -530,7 +711,11 @@ class IngestionService:
         logger.info("ingestion done job_id=%s", claimed.job_id)
 
     async def _record_failure(
-        self, claimed: ClaimedJob, error: str, retry: RetryPolicy
+        self,
+        claimed: ClaimedJob,
+        error: str,
+        kind: FailureKind,
+        retry: RetryPolicy,
     ) -> None:
         """Record this attempt's failure — and decide whether to try again.
 
@@ -542,25 +727,38 @@ class IngestionService:
         Now a failure is provisional. The job goes back on the queue with a
         delay, and only stops being retried when it has used its attempts.
 
-        ── Everything retries, including things that obviously will not work ───
+        ── The classification decides, not just the count — stage 2.3 ─────────
 
-        There is no classification here: a corrupt PDF is retried exactly as a
-        network blip is, which is deliberate and slightly uncomfortable.
+        A **permanent** failure gives up on the first attempt. A **transient**
+        one gets the full budget. Until this stage both got the same five
+        attempts, and the measurements that ended that are worth keeping:
 
-        Classifying failures as transient or permanent is **stage 2.3's whole
-        subject**, and its stated trigger is observing the waste — "a malformed
-        PDF retries every 30s for a day". Pre-empting that here would mean
-        arriving at 2.3 with the lesson half-learned and no evidence behind it.
+            a corrupt PDF      5 attempts over 14.6s — 4 of them could never
+                               have succeeded
+            a valid document   permanently failed after 22s of downtime, when
+                               another minute would have indexed it
 
-        The waste is bounded and cheap in the meantime: a rejected PDF fails
-        during extraction, before any embedding is paid for, so the cost of
-        retrying one is five claims and a minute of backoff.
+        The second is the expensive one, and it is the reason the budget grew
+        rather than shrank. Retrying a broken file costs four pointless claims
+        and no embedding — extraction fails before a provider is touched.
+        *Not* retrying a good document costs the document.
 
-        The same uniformity applies to `MISSING_UPLOAD_ERROR`, which genuinely
-        *cannot* succeed on a retry — nothing ever re-creates a deleted upload
-        row. It is still retried, because carving out exceptions one at a time
-        is how a rule stops being a rule, and because the case is supposed to
-        be unreachable anyway.
+        ── Where `kind` comes from ────────────────────────────────────────────
+
+        `classify`, over the status code the agent returned, computed by the
+        caller at the point of failure rather than here. This method decides
+        what to *do* about a classification; deciding what the classification
+        *is* belongs with the response that carries the evidence.
+
+        ── The rule that was carved out, and why that was always the plan ────
+
+        Stage 2.1's version of this docstring argued for retrying *everything*,
+        including `MISSING_UPLOAD_ERROR`, which genuinely cannot succeed:
+        *"carving out exceptions one at a time is how a rule stops being a
+        rule"*. That held exactly as long as there was no rule to carve them
+        out of. There is one now, so the exception is not an exception — it is
+        `FailureKind.PERMANENT`, decided by the same function that decides
+        every other case.
 
         ── Why the lease token is still required ──────────────────────────────
 
@@ -569,7 +767,13 @@ class IngestionService:
         any more than it may complete one — that would reset a healthy
         in-progress attempt back to `queued` and have it done twice.
         """
-        give_up = claimed.attempts >= retry.max_attempts
+        # Permanent failures short-circuit the budget entirely. The attempt
+        # count is not consulted, because no number of attempts changes what a
+        # file is.
+        give_up = (
+            kind is FailureKind.PERMANENT
+            or claimed.attempts >= retry.max_attempts
+        )
 
         if give_up:
             # The suffix only earns its place when retries actually happened.
@@ -585,6 +789,7 @@ class IngestionService:
                     if retried
                     else error
                 ),
+                failure_kind=kind,
             )
         else:
             delay = retry.delay_for(claimed.attempts)
@@ -592,6 +797,7 @@ class IngestionService:
                 claimed.job_id,
                 claimed.lease_token,
                 error=error,
+                failure_kind=kind,
                 delay_seconds=delay,
             )
 
@@ -607,16 +813,19 @@ class IngestionService:
 
         if give_up:
             logger.warning(
-                "ingestion failed permanently job_id=%s attempts=%d error=%s",
+                "ingestion failed permanently job_id=%s kind=%s attempts=%d "
+                "error=%s",
                 claimed.job_id,
+                kind,
                 claimed.attempts,
                 error,
             )
         else:
             logger.warning(
-                "ingestion failed job_id=%s attempt=%d of %d; retrying in "
-                "%.1fs error=%s",
+                "ingestion failed job_id=%s kind=%s attempt=%d of %d; "
+                "retrying in %.1fs error=%s",
                 claimed.job_id,
+                kind,
                 claimed.attempts,
                 retry.max_attempts,
                 delay,

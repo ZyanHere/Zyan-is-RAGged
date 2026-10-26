@@ -25,6 +25,7 @@ from app.errors import (
     AgentUnavailableError,
     BackendError,
     BadUploadError,
+    ConflictError,
     NotFoundError,
     UploadTooLargeError,
 )
@@ -103,6 +104,7 @@ app.include_router(query.router)
 #   BadUploadError         400   the caller sent something unusable
 #   NotFoundError          404
 #   UploadTooLargeError    413
+#   ConflictError          409   well formed, but not against this state
 #   AgentUnavailableError  503   our dependency is down, not us
 #   BackendError           500   registered last; catches what nothing named
 #
@@ -128,6 +130,11 @@ async def _not_found(request: Request, exc: NotFoundError):
 @app.exception_handler(UploadTooLargeError)
 async def _upload_too_large(request: Request, exc: UploadTooLargeError):
     return _error(413, str(exc))
+
+
+@app.exception_handler(ConflictError)
+async def _conflict(request: Request, exc: ConflictError):
+    return _error(409, str(exc))
 
 
 @app.exception_handler(AgentUnavailableError)

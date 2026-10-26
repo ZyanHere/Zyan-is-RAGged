@@ -103,6 +103,52 @@ class IngestionStatus(StrEnum):
         return self in (IngestionStatus.DONE, IngestionStatus.FAILED)
 
 
+class FailureKind(StrEnum):
+    """Whether a failed attempt could ever have succeeded. Stage 2.3.
+
+    Two values, and the line between them is *"would trying again change
+    anything?"* — not how serious the failure was, and not whose fault it was.
+
+        permanent   the input is the problem. Retrying runs the same bytes
+                    through the same code and gets the same answer.
+        transient   the system was the problem. The same bytes would very
+                    likely succeed in a minute.
+
+    ── Why this exists, and what it cost not to have it ───────────────────────
+
+    Stage 2.1 retried everything identically, deliberately, so that the waste
+    would be observable. Measured on 2026-10-26:
+
+        a corrupt PDF        5 attempts over 14.6s, 4 of them pointless
+        a valid document     permanently failed after 22s of downtime,
+                             when another minute would have indexed it
+
+    One policy, two opposite failures, tuned for neither. The second is the
+    expensive one: `docker compose restart agent` fits inside 22 seconds, and
+    the only recovery was a human noticing and re-uploading the file.
+
+    ── Where the classification comes from ───────────────────────────────────
+
+    The agent's HTTP status code, not the engine's exception types. The
+    backend never imports `rag` — it learns what happened from the response —
+    and that boundary already carries the distinction, because `agent/main.py`
+    maps the error hierarchy onto codes. 4xx means *this request can never
+    succeed*; 5xx means *the system failed you*. See `_classify` in
+    `services/ingestion.py`.
+
+    ── Why not more values ───────────────────────────────────────────────────
+
+    `rate_limited`, `timeout` and `quota_exhausted` are all tempting and all
+    the same decision today: wait and try again. Splitting them before any of
+    them has been measured separately would be writing a retry policy for
+    behaviour nobody has observed, which is what stages 7.1 and 7.2 are for.
+    `rag/errors.py` makes the same argument about `EmbeddingError`.
+    """
+
+    PERMANENT = "permanent"
+    TRANSIENT = "transient"
+
+
 def new_id() -> uuid.UUID:
     """A time-ordered UUID for a primary key.
 
@@ -504,6 +550,53 @@ class IngestionJob(Base):
     is password-protected", "almost certainly a scanned document, nothing was
     indexed" — and this is where they become durable instead of a response body
     nobody kept.
+
+    Set on a **requeued** job too, not only a terminal one: a job waiting to
+    retry should still say why it is waiting.
+    """
+
+    failure_kind: Mapped[FailureKind | None] = mapped_column(
+        Enum(
+            FailureKind,
+            name="failure_kind",
+            native_enum=False,
+            create_constraint=False,
+            length=16,
+            # Store the member's value ("transient"), not its Python name
+            # ("TRANSIENT"). Omitting this is a silent trap and it was walked
+            # into here: SQLAlchemy's `Enum` persists the *name* by default,
+            # so the column held uppercase strings and
+            # `ck_ingestion_jobs_failure_kind_allowed` rejected every write.
+            # `status` has carried this line since 1.2 for the same reason.
+            values_callable=lambda enum_cls: [m.value for m in enum_cls],
+        ),
+        nullable=True,
+    )
+    """Whether that error could ever have succeeded on a retry. Stage 2.3.
+
+    Written **whenever `error` is** — which is what
+    `ck_ingestion_jobs_failure_kind_matches_error` enforces — and deliberately
+    not tied to `status = 'failed'`.
+
+    ── Why it travels with the error and not with the status ──────────────────
+
+    A requeued job carries its last error while it waits, and *why* it is
+    waiting is the useful thing to say. "Retrying after a provider outage" and
+    "retrying a file that will never parse" look identical without this, and
+    only one of them is worth a user's patience.
+
+    Tying the kind to the error also makes the two impossible to drift apart:
+    a caller recording a failure has to supply both or violate a constraint.
+
+    ── The same storage decision as `status` ─────────────────────────────────
+
+    `native_enum=False` with `create_constraint=False`: a `VARCHAR` plus an
+    explicit CHECK in `__table_args__`, not a Postgres enum type. Adding a
+    third kind — if 7.1 ever justifies one — is then an ordinary migration
+    that drops and recreates a constraint, inside a transaction. `ALTER TYPE
+    … ADD VALUE` on a native enum cannot run in a transaction block at all,
+    which is the trap `status` was shaped to avoid at 1.2 and which paid off
+    when `queued` arrived at 1.3.
     """
 
     # ── Results of this attempt ───────────────────────────────────────────────
@@ -561,13 +654,21 @@ class IngestionJob(Base):
             "attempts >= 0",
             name="attempts_non_negative",
         ),
+        CheckConstraint(
+            "failure_kind IS NULL OR failure_kind IN ('permanent', 'transient')",
+            name="failure_kind_allowed",
+        ),
+        CheckConstraint(
+            "(error IS NULL) = (failure_kind IS NULL)",
+            name="failure_kind_matches_error",
+        ),
         Index(
             "ix_ingestion_jobs_expired_leases",
             "lease_expires_at",
             postgresql_where=text("status = 'processing'"),
         ),
     )
-    """Eight invariants, enforced by the database rather than by convention.
+    """Ten invariants, enforced by the database rather than by convention.
 
     **`status_allowed`** — the set of legal states, as a CHECK on a VARCHAR
     rather than a native Postgres enum type. **This is the decision paying

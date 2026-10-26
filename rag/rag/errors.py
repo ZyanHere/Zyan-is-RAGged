@@ -17,9 +17,30 @@ when the full set is visible at once:
     VectorStoreError       →  500  our own storage failed
 
 Note what is *not* here: no retry logic, no transient/permanent classification,
-no error codes. Stage 2.3 introduces that distinction when the dead-letter queue
-needs it — driven by failures you have actually observed. Adding it now would be
-guessing at which errors are worth retrying before anything has retried.
+no error codes.
+
+**Stage 2.3 introduced that distinction and it did not land here**, which is the
+more interesting outcome. The backend never imports `rag` — it learns what
+happened from the agent's HTTP response — so the mapping in the table above
+*already carried* the classification it needed:
+
+    400 / 422   the upload is the problem, and will stay the problem  → permanent
+    502 / 500   a provider or our storage failed                      → transient
+
+4xx means the request can never succeed; 5xx means the system failed you. That
+is the HTTP specification's own semantics, and the agent's status codes express
+it without this module knowing anything about retries.
+
+So the classification lives in `backend/app/services/ingestion.py::classify`,
+over a status code, and these types stay a vocabulary for *what went wrong*
+rather than *what to do about it*. Keeping the two apart is what lets the engine
+be used by something with a completely different retry policy — the stage 3.1
+evaluation harness, for instance, which should not retry at all.
+
+The one thing this hierarchy would be needed for is a *finer* policy than the
+status codes support: backing a rate limit off differently from a timeout, when
+both are `EmbeddingError` and both are 502. That needs measured provider
+behaviour and is stage 7.1.
 """
 
 
