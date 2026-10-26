@@ -18,6 +18,7 @@ import {
   type BaseQueryFn,
   type FetchArgs,
   type FetchBaseQueryError,
+  type FetchBaseQueryMeta,
 } from "@reduxjs/toolkit/query/react";
 
 const API_BASE_URL =
@@ -111,10 +112,33 @@ const rawBaseQuery = fetchBaseQuery({
   // field. The upload works because this header is absent.
 });
 
+/**
+ * `fetchBaseQuery`, with every error turned into something renderable.
+ *
+ * ── The fifth type argument, and the bug it fixes ───────────────────────────
+ *
+ * `BaseQueryFn`'s `Meta` parameter defaults to `{}`. Without it declared, the
+ * `meta` handed to every `transformResponse` in the application was typed as
+ * an empty object — so **no endpoint could read a response header or a status
+ * code**, and the compiler reported the attempt as a missing property rather
+ * than as missing wiring.
+ *
+ * Found at stage 2.2, where `uploadDocument` has to tell `200` from `202`
+ * because the server deduplicates and both responses carry the same body. It
+ * was never specific to that endpoint: anything wanting `Location`, an
+ * `ETag`, a rate-limit header or a `Retry-After` would have hit the same wall.
+ *
+ * `FetchBaseQueryMeta` is what `fetchBaseQuery` actually passes — `{ request,
+ * response }`, with `response` optional because a request that never reached
+ * the network has none. Naming it here restores the type the inner query
+ * already had and this wrapper was discarding.
+ */
 const baseQueryWithMessages: BaseQueryFn<
   string | FetchArgs,
   unknown,
-  ApiFailure
+  ApiFailure,
+  object,
+  FetchBaseQueryMeta
 > = async (args, api, extraOptions) => {
   const result = await rawBaseQuery(args, api, extraOptions);
 

@@ -73,8 +73,11 @@ export interface Answer {
  * them as one:
  *
  *   queued      recorded, nobody has picked it up. A deep queue is normal.
- *   processing   a worker is on it — or died holding it, which looks identical
- *                until stage 2.1 adds a lease.
+ *               Since stage 2.1 it also covers a job *waiting to retry* after
+ *               a failure, which `attempts` is what distinguishes.
+ *   processing   a worker holds a lease on it and is renewing it. Since 2.1 a
+ *                worker that stops renewing loses the job to a reaper, so this
+ *                no longer silently means "or died holding it".
  *
  * Collapsing them into one "in progress" badge would hide the only signal a
  * user has that nothing is draining the queue.
@@ -106,6 +109,47 @@ export type IngestionStatus = "queued" | "processing" | "done" | "failed";
  * server data, which is the duplication the client/server split exists to
  * prevent.
  */
+/**
+ * What one upload request did — the document, and whether work was queued.
+ *
+ * ── Why this exists at all ──────────────────────────────────────────────────
+ *
+ * Until stage 2.2 an upload always queued work, so the mutation's result was
+ * just the new record. Deduplication added an outcome where **nothing was
+ * written**: these exact bytes were already indexed, and the server answers
+ * `200 OK` instead of `202 Accepted`.
+ *
+ * Without that bit the dedupe is invisible and looks like a bug. A user drops
+ * a file they have uploaded before, no new row appears, and the only
+ * reasonable conclusion is that the upload failed.
+ *
+ * ── Why it is not a field on `DocumentRecord` ───────────────────────────────
+ *
+ * `alreadyIndexed` is a fact about *this response*, not about the document.
+ * The same document is "already indexed" to a second uploader and "newly
+ * queued" to the first, and it is neither when it simply appears in the list.
+ * Putting it on the record would make every list row carry a field it cannot
+ * answer.
+ */
+export interface UploadResult {
+  document: DocumentRecord;
+
+  /**
+   * True when the server recognised the bytes and queued nothing — HTTP `200`
+   * rather than `202`.
+   *
+   * It comes from the status code because both responses carry an identical
+   * body. That is deliberate on the server's side: the shape of "what is the
+   * state of this document?" should not depend on how you came to ask.
+   *
+   * Note what this does *not* distinguish: a brand-new document from a new
+   * attempt at one whose last attempt failed. Both queued work, both are
+   * `202`, and the user watches the same row for the same reason — so the
+   * distinction would be a difference the UI has no use for.
+   */
+  alreadyIndexed: boolean;
+}
+
 export interface DocumentRecord {
   documentId: string;
   filename: string;

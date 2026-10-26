@@ -2,6 +2,7 @@
 
 import { useRef } from "react";
 
+import { cn } from "@/lib/utils";
 import { useUploadDocumentMutation } from "@/services/documentsApi";
 
 /**
@@ -34,11 +35,29 @@ import { useUploadDocumentMutation } from "@/services/documentsApi";
  *
  * What is left here is the only thing this component can still truthfully say:
  * the file reached the server and is recorded.
+ *
+ * ── The one thing it gained at stage 2.2 ────────────────────────────────────
+ *
+ * The server now deduplicates by content hash, so re-uploading a file it
+ * already holds queues nothing. **Without saying so, that is indistinguishable
+ * from a failed upload**: the user drops a file, no new row appears, no error
+ * shows, and the only reasonable conclusion is that something broke.
+ *
+ * So the receipt has two forms. One promises a result is coming; the other
+ * says the document is already there and points at it. The difference comes
+ * from the HTTP status code, read in `documentsApi`.
  */
 export function UploadPanel() {
   // `data` is this component's last upload — now a receipt rather than a
   // result. `isLoading` covers only the upload itself, which is milliseconds,
   // so the spinner is honest about what it is waiting for.
+  //
+  // The filename it reports is the **stored** one, which on a duplicate is the
+  // name the document was first uploaded under rather than the name of the
+  // file just picked. That is deliberate on the server's side — the bytes are
+  // the identity, so a re-upload does not rename anything — and showing the
+  // stored name is what makes the sentence below true: it names the row the
+  // user should go and look at.
   const [uploadDocument, { isLoading, error, data: lastUpload }] =
     useUploadDocumentMutation();
 
@@ -126,14 +145,40 @@ export function UploadPanel() {
       )}
 
       {/* The receipt. Deliberately says nothing about the document's contents,
-          because at this point the server does not know them either. */}
+          because at this point the server does not know them either.
+
+          Two forms, and the distinction is the whole of stage 2.2's client
+          half: one promises a result is coming, the other says there is
+          nothing to wait for. Showing the first for a duplicate would leave
+          the user watching a row that is never going to change. */}
       {lastUpload && !isLoading && !error && (
-        <p className="rounded-lg border border-neutral-200 bg-white px-3 py-2 text-xs leading-relaxed text-neutral-500">
-          <span className="font-medium text-neutral-700">
-            {lastUpload.filename}
+        <p
+          className={cn(
+            "rounded-lg border px-3 py-2 text-xs leading-relaxed",
+            lastUpload.alreadyIndexed
+              ? "border-blue-200 bg-blue-50 text-blue-800"
+              : "border-neutral-200 bg-white text-neutral-500",
+          )}
+        >
+          <span
+            className={cn(
+              "font-medium",
+              lastUpload.alreadyIndexed ? "text-blue-900" : "text-neutral-700",
+            )}
+          >
+            {lastUpload.document.filename}
           </span>{" "}
-          is queued. Indexing happens in the background — watch its row below
-          for the result.
+          {lastUpload.alreadyIndexed ? (
+            <>
+              was already indexed — these exact bytes are on the server, so
+              nothing was uploaded again. Its row below is the one to look at.
+            </>
+          ) : (
+            <>
+              is queued. Indexing happens in the background — watch its row
+              below for the result.
+            </>
+          )}
         </p>
       )}
     </div>

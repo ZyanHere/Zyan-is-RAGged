@@ -7,7 +7,7 @@
  */
 
 import { baseApi } from "./baseApi";
-import type { DocumentRecord, IngestionStatus } from "@/types";
+import type { DocumentRecord, IngestionStatus, UploadResult } from "@/types";
 
 /**
  * Exactly what the backend returns, snake_case and all.
@@ -141,8 +141,18 @@ export const documentsApi = baseApi.injectEndpoints({
      * A component reading `pageCount` from this mutation's `data` would
      * therefore render blanks forever and look broken. The numbers belong to
      * the list row now, which is where they actually arrive.
+     *
+     * ── What changed at stage 2.2 ──────────────────────────────────────────
+     *
+     * The server deduplicates by content hash, so an upload of bytes it
+     * already holds queues nothing and answers `200 OK` rather than `202
+     * Accepted`. Both carry the same body, so **the status code is the only
+     * signal**, and this is the one place in the app that can see it.
+     *
+     * Hence `UploadResult` instead of a bare `DocumentRecord`: the document,
+     * plus the one bit a component cannot derive from it.
      */
-    uploadDocument: builder.mutation<DocumentRecord, File>({
+    uploadDocument: builder.mutation<UploadResult, File>({
       query: (file) => {
         const form = new FormData();
 
@@ -155,10 +165,29 @@ export const documentsApi = baseApi.injectEndpoints({
         return { url: "/documents", method: "POST", body: form };
       },
 
-      transformResponse: toRecord,
+      /**
+       * `meta` carries the raw `Response`, which is where the status lives.
+       *
+       * `meta` is optional in RTK Query's types and genuinely can be absent —
+       * a request that never reached the network has no response to report.
+       * `meta?.response?.status === 200` therefore treats "we do not know" as
+       * "not a duplicate", which is the safe default: it tells the user to
+       * watch the row, and the row is correct either way.
+       */
+      transformResponse: (wire: DocumentWire, meta): UploadResult => ({
+        document: toRecord(wire),
+        alreadyIndexed: meta?.response?.status === 200,
+      }),
 
       // The set of documents changed, so the list is stale. Only the list —
       // no existing document was modified, so nothing else needs refetching.
+      //
+      // Still correct for a duplicate, and worth a sentence because it looks
+      // wasteful: a `200` changed nothing, so the refetch returns what the
+      // cache already had. It is one request, and the alternative — skipping
+      // invalidation when `alreadyIndexed` — would be wrong whenever the
+      // duplicate matched a *failed* document, because that case did queue a
+      // new attempt and the row's status has changed.
       invalidatesTags: [{ type: "Document", id: "LIST" }],
     }),
   }),

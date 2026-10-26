@@ -154,14 +154,21 @@ function DocumentRow({ document }: { document: DocumentRecord }) {
         </p>
       )}
 
-      {/* `processing` with no finish time means a worker claimed it and has
-          not come back — either still working, or dead. Nothing can tell those
-          apart yet, and nothing retries; that is stage 2.1. A database CHECK
-          constraint guarantees the state cannot mean anything else. */}
+      {/* `processing` means a worker holds a lease on this job and is
+          renewing it. Since stage 2.1 that is a genuine distinction rather
+          than a hopeful one: a worker that stops renewing loses the job to a
+          reaper within a lease period, and the row returns to `queued` with
+          its `attempts` incremented.
+
+          So the message no longer hedges about a worker having died. It is
+          either working or about to be reclaimed, and both resolve without
+          anyone doing anything. Two CHECK constraints guarantee the state
+          cannot mean anything else: a `processing` job holds a lease, and a
+          lease has an expiry. */}
       {document.status === "processing" && (
         <p className="mt-1 text-xs leading-relaxed text-amber-700">
-          A worker is indexing this — or stopped partway. Nothing retries it
-          yet.
+          A worker is indexing this. If it stops, another one takes over
+          automatically.
         </p>
       )}
     </li>

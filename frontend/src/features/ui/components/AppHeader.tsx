@@ -53,7 +53,7 @@ export function AppHeader() {
           It changes when the architecture does: stage 1.3 moved ingestion out
           of the request, so "synchronous" stopped being true. */}
       <span className="ml-auto text-xs text-neutral-400">
-        stage 1.3 · queued ingestion
+        stage 2.2 · idempotent ingestion
       </span>
     </header>
   );
