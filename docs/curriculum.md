@@ -251,9 +251,9 @@ will never be built. That is not failure; a map is not a to-do list.
   DONE      1.3   ingestion out of the request cycle
   DONE      2.1   job lifecycle, leases, retries
   DONE      2.2   idempotency
+  DONE      2.3   failure classification and the dead-letter queue
   ────────────────────────────────────────────────────── you are here
-  NEXT      2.3   dead-letter queue
-            2.4   seeing inside
+  NEXT      2.4   seeing inside
             3.1   retrieval metrics       ← blocked: needs a real document corpus
             3.2   failure attribution
             3.3   answer quality gating
@@ -281,9 +281,10 @@ the system's current state is checkable here.
 | **1.2** Persist what happened | **COMPLETE** | Alembic round-trip clean; 3 induced crashes → 3 detectable rows `[measured]`; citation `document_id` === Postgres PK |
 | **1.3** Ingestion out of the request cycle | **COMPLETE** | `202` in 38ms with the agent paused `[measured]`; a worker drained the queue and the citation still resolved to the right page; two claimers proved to take different jobs; one stranded row created deliberately |
 | **2.1** Job lifecycle, leases and retries | **COMPLETE** | 10 real process kills → every document terminal in 9.8s, no intervention `[measured]`; the 1.3 stranded row recovered itself in 25ms; a worker that loses its lease is proved unable to commit |
+| **2.3** Failure classification and the DLQ | **COMPLETE** | a poison document costs **1 attempt instead of 5** `[measured]`; the retry budget measured at **302.1s and 221.1s across two runs** (median ~302s, a 37% spread from full jitter), where 22s had been fatal; `outage.pdf`, dead since this stage's trigger, replayed to `done` from the dead-letter list in one click |
 | **2.2** Idempotency | **COMPLETE** | a doubly-indexed document repaired 9 → 3 points by re-ingestion `[measured]`; orphaned points 39 → 0; 5 concurrent uploads of one file → 1 document; Postgres and Qdrant agree 7/7 |
 
-**Test counts** `[measured]`: 44 `rag` · 122 `backend` · 0 `agent` · 0
+**Test counts** `[measured]`: 44 `rag` · 179 `backend` · 0 `agent` · 0
 frontend, plus `tsc` and `eslint` clean. **Nothing runs any of them
 automatically** — see the note at 15.2.
 
@@ -914,7 +915,7 @@ measure expected.
 | **Build** | SHA-256 content hash on `documents`, unique. Deterministic point ids. **Upsert-then-prune**, not delete-then-upsert — see the corrections below. A reconciliation tool for the orphans. `Idempotency-Key` headers deferred with a trigger |
 | **Verify** | upload the same file 5× concurrently; re-ingest a document repeatedly. Point count must stay constant. Concurrency test on the content-hash uniqueness path — two simultaneous uploads of the same bytes |
 | **Done when** | duplicate chunks after repeated retries are zero; wasted embedding calls are **eliminated** (measuring them needs a counter, which is 2.4); the behaviour of a *second* upload of identical bytes is a decided and documented product question, not an accident |
-| **Next trigger** | some jobs fail every time — a corrupt PDF, a permanently rejected file. They retry forever, burning quota, and nobody notices |
+| **Next trigger** | every failure is retried identically. ~~They retry forever, burning quota~~ — **that turned out to be false**: 2.1's `max_attempts` already bounds it and a corrupt PDF costs no quota at all. The real cost is the opposite one, and 2.3 measured it |
 | **Covers** | idempotency · content addressing · unique constraints · upsert · HTTP idempotency keys |
 
 **Why the random point ids at 1.1 were correct.** Deterministic ids would have
@@ -973,27 +974,66 @@ measurement at 3.1 would have been scored against it.
 
 ### 2.3 — Dead-letter queue · **CORE** · `[required]`
 
-*Reason: A — real need. Quota is finite and the failure is unbounded.*
+*Reason: A — real need. **Not the one originally written down** — the retries are bounded and cost no quota; the cost is in the other direction. See the Problem row.*
 
 | | |
 |---|---|
 | **Capability** | a permanently broken document stops consuming resources, and an operator can see it, inspect it and replay it |
-| **Now** | infinite retries on permanently-failing jobs |
-| **Problem** | a malformed PDF retries every 30s for a day and consumes the embedding quota by itself `[hypothesis]` — verifiable by feeding one in and counting attempts |
-| **Diagnose** | retry counts per job; quota consumption attributable to failing jobs |
+| **Now** | every failure retried identically, with one budget tuned for neither kind |
+| **Problem** | **the stated problem was false, both halves, and measuring it is what showed that.** A corrupt PDF was bounded at **5 attempts over 14.6s** by 2.1's `max_attempts`, and cost **zero embedding quota** — `rag/pipeline.py` extracts before it touches a provider `[measured]`. The real cost runs the other way: a **valid** document uploaded during an outage was **permanently destroyed after 22 seconds** `[measured]`, a window `docker compose restart agent` fits inside. One policy, two opposite failures, tuned for neither |
+| **Diagnose** | feed in a corrupt PDF and count attempts; then upload a *valid* one with the dependency stopped and time how long before it is abandoned. The second is the one nobody thinks to run |
 | **Root cause** | no distinction between *transient* failure (retry) and *permanent* failure (stop) |
 | **Learn** | error classification, poison messages, DLQ, operator tooling, alerting |
-| **Build** | max attempts → move to DLQ with the last error and a classification. An endpoint to list, inspect and replay DLQ entries |
-| **Verify** | feed in a corrupt PDF, an encrypted PDF, a 0-byte file and an oversized file. Each must land in the DLQ with a correct classification, not retry forever. Regression test per input class |
-| **Done when** | wasted retries on poison input are bounded by the configured maximum; every existing error type in the codebase has a classification; the replay path is exercised, not just written |
-| **Next trigger** | all of this is happening invisibly. You only found these bugs because you went looking |
+| **Build** | classify on the agent's **HTTP status** — 4xx permanent, 5xx and no-response transient, with 429 carved out. Permanent fails at attempt 1; transient gets a budget measured in minutes, with a **cap on any single delay**. `failure_kind` on `ingestion_jobs`. The DLQ is a **query, not a table** — see below. `GET /documents?status=failed` and `POST /documents/{id}/retry` |
+| **Verify** | the classifier over the whole status table, including codes nothing emits yet. A 429 must requeue **despite being 4xx**. No single delay may exceed the cap at any attempt. And the budget must be simulated against the real `Settings`, not against a literal — see the correction below |
+| **Done when** | a permanent failure costs exactly one attempt; the transient budget is a measured number rather than a computed one; every status the agent can return has a classification; the replay path is exercised end to end, not just written |
+| **Next trigger** | all of this is happening invisibly, and 2.3 proved it the hard way. **Both of this stage's defects were found by going and looking** — a corrupt PDF fed in by hand, a valid one uploaded with the agent stopped. Nothing would have reported either. The dead-letter list is a page someone has to remember to open, there is no count of how deep it is, and every `logger.info` in the backend is still discarded `[measured]` |
 | **Covers** | DLQ · error classification · poison messages · operator tooling |
 
-**Already half-built, inadvertently.** `rag`'s error hierarchy already separates
-input errors (400/422) from provider errors (502) from storage errors (500). That
-hierarchy is the classification this stage needs — the work is deciding which are
-transient, and the ADR note in `errors.py` already says that distinction is 2.3's
-job. Do not rebuild the taxonomy; extend it.
+**Already half-built, inadvertently — and the useful half was not the one we
+expected.** `rag/errors.py` says its hierarchy is where this distinction belongs
+when 2.3 needs it. It turned out the backend does not need the hierarchy at all.
+
+The backend never imports `rag`; it learns what happened from the agent's HTTP
+response. The agent *already* maps the engine's errors onto status codes, so the
+classification arrives for free:
+
+```text
+400 / 413 / 422   permanent — the request can never succeed
+429               transient — 4xx by number, "come back later" by meaning
+500 / 502 / 503   transient — the system failed you
+(no response)     transient — nothing was judged about this document
+```
+
+That is the HTTP specification's own semantics, and keeping the backend ignorant
+of the engine is what made the 1.3 worker split possible in the first place.
+
+**The DLQ is a query, not a table.** The roadmap said *"move to DLQ"*. A separate
+table buys nothing here: dead jobs already cannot clog the queue (`failed` is
+terminal and the claim only matches `queued`), replay already exists
+(`create_job_for_document`, built at 2.2), and a separate table would duplicate
+the foreign key, make the latest-job join read two tables, and lose the attempt
+history 1.2's two-table split exists to keep. The thing a broker's DLQ isolates
+against — dead messages blocking live ones — is a broker problem this schema does
+not have.
+
+**The retry budget was got wrong by a factor of three, and the test meant to
+catch it did not.** The first attempt set `max_attempts = 8` and documented it as
+"about three minutes", reasoning from the sum of the ceilings. What a document
+actually experiences is the sum of the *draws*, and full jitter halves every one:
+the realised coverage was a **median of 91s, p10 of 55s** over 20,000 simulated
+runs. One document in ten gave up after 55 seconds.
+
+The test that was supposed to pin this asserted the ceilings of a hardcoded
+`RetryPolicy(max_attempts=8, ...)`, so it agreed with itself while the system ran
+a policy nobody had checked. It now reads `Settings()` and simulates. **Two
+lessons, both general:** a test that asserts a literal instead of the
+configuration cannot detect drift, and reasoning about a bound is not the same as
+measuring a distribution.
+
+**`Idempotency-Key`-style operator ergonomics are deliberately minimal.** One
+button, one document. Bulk replay waits for someone to have enough dead rows to
+want it.
 
 ### 2.4 — Seeing inside · **CORE** · `[required]`
 
@@ -2540,6 +2580,80 @@ itself a deferral record** — each row says what is missing and what substitute
 
 Why this document was revised, and what changed. Kept so the reasoning is
 auditable rather than lost in a diff.
+
+## 2026-10-27 — Stage 2.3 complete; the stage's own premise was wrong
+
+**179 backend tests** (was 122), 44 rag, `tsc` and `eslint` clean.
+
+**The roadmap's trigger for this stage was false, and measuring it is what
+showed that.** It said a malformed PDF *"retries every 30s for a day and
+consumes the embedding quota by itself"*. Both halves:
+
+| Claim | Measured |
+|---|---|
+| retries for a day | bounded at **5 attempts over 14.6s** — 2.1's `max_attempts` already stopped it |
+| consumes embedding quota | **zero** — `rag/pipeline.py` extracts before it reads settings or touches a provider |
+
+**The real failure runs the other way.** A *valid* document uploaded during an
+outage was **permanently destroyed after 22 seconds** — a window
+`docker compose restart agent` fits inside, with no recovery but a human
+re-uploading. This is the second stage running whose Problem row was written
+before the preceding stage existed and was invalidated by it (2.1's "orphans
+10 → 0" was the first). **A Problem row is a hypothesis with a date on it.**
+
+| Reconciled | Was | Now |
+|---|---|---|
+| 2.3's Problem | `[hypothesis]`, quota exhaustion | `[measured]`, and false — the cost is lost documents |
+| 2.3's Build | "move to DLQ" | a query, not a table; classify on HTTP status |
+| `rag/errors.py` | "2.3 introduces that distinction" | it did, and **not here** — see below |
+| `_record_failure` | argued for retrying everything | the rule it was waiting for now exists |
+| test counts | 122 backend | 179 |
+
+**The classification was already at the boundary.** `rag/errors.py` said its
+hierarchy was where transient-versus-permanent belonged. It was not needed: the
+backend never imports `rag`, and the agent already maps the engine's errors onto
+status codes. **4xx means the request can never succeed; 5xx means the system
+failed you** — the HTTP specification's own semantics, with `429` carved out as
+the one 4xx that means *come back later*. Keeping the backend ignorant of the
+engine is what made the 1.3 worker split possible, and it paid again here.
+
+**The retry budget was wrong by a factor of three, and the test written to pin
+it did not catch that.** `max_attempts = 8` was documented as "about three
+minutes" by summing the ceilings. What a document experiences is the sum of the
+*draws*, and full jitter halves every one: simulated over 20,000 runs the
+realised coverage was a **median of 91s and a p10 of 55s**. One document in ten
+gave up after 55 seconds.
+
+The test asserted the ceilings of a hardcoded `RetryPolicy(max_attempts=8, …)`,
+so it agreed with itself about a policy nobody ran. It now reads `Settings()` and
+simulates, and fails at 8, 12 and 20 attempts while passing at 15. **Two general
+lessons: a test asserting a literal instead of the configuration cannot detect
+drift, and reasoning about a bound is not measuring a distribution.**
+
+**Three findings about the apparatus, not the system:**
+
+1. **A measurement script reported "GAVE UP" when its own watch loop timed
+   out.** The database showed the document still `queued` at attempt 13, and a
+   worker later took it to `done` at attempt 14. The script now has three
+   outcomes — `done`, `failed`, `INCONCLUSIVE` — and detects host stalls
+   instead of folding them into the numbers.
+2. **A mutation-testing script aimed at an ambiguous anchor** and landed in
+   2.2's duplicate-upload path instead of 2.3's retry endpoint, reporting
+   SURVIVED for a code path the tests do not exercise. **A mutation that lands
+   somewhere unintended reads exactly like a missing test.** It now asserts each
+   anchor occurs exactly once.
+3. **That same script keyed its backups on each file's basename**, and three of
+   its five targets are called `documents.py`. Nothing was corrupted only
+   because it asserts before writing. It now keys on the full path and restores
+   in a `finally`.
+
+**A known environmental flake, recorded rather than explained away.** Roughly one
+backend run in six fails or errors on an unrelated test with a connection
+`TimeoutError`, and passes on a rerun. It is not data pollution — no test file
+leaves rows behind — and connections sit at 3 of a possible 100. It looks like
+Windows-to-Dockerised-Postgres port-forward latency. **Trigger to investigate
+properly:** if it exceeds roughly one run in five, or ever fails
+deterministically.
 
 ## 2026-10-26 — Stages 2.1 and 2.2 complete; four plan corrections recorded
 

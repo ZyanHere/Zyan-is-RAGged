@@ -3,8 +3,8 @@
 **What the system is *today*.** Not the destination — `../curriculum.md` has
 that. Updated at the end of every stage, so it is never aspirational.
 
-**Stage:** **2.2 complete. 2.3 not started.**
-**Last updated:** 2026-10-26
+**Stage:** **2.3 complete. 2.4 not started.**
+**Last updated:** 2026-10-27
 
 ## How to read this file
 
@@ -31,7 +31,8 @@ not the thing is built yet.
 | **1.3** Ingestion out of the request cycle | ✅ complete | `202` in 38 ms, and 45 ms with the agent *paused*; a worker drained the queue and the citation still resolved to page 2; two claimers proved to take different jobs; the client reached a terminal state with nothing touching the page |
 | **2.1** Job lifecycle, leases and retries | ✅ complete | 10 real process kills → every document terminal in 9.8 s with one worker and no intervention; the six-day-old stranded row recovered itself in 25 ms; a worker that loses its lease is proved unable to commit (`test_lease_handover.py`) |
 | **2.2** Idempotency | ✅ complete | a doubly-indexed document repaired 9 → 3 points by re-ingestion, then 3 → 3 on a repeat; orphaned points 39 → 0; 5 concurrent uploads of one file → 1 document, one `202` and four `200`; Postgres and Qdrant agree 7/7 |
-| **2.3** Dead-letter queue | ○ not started | its trigger: every failure still retries, with no classification |
+| **2.3** Failure classification and the DLQ | ✅ complete | a poison document costs 1 attempt instead of 5; the retry budget measured at 302.1s and 221.1s across two runs, where 22s had been fatal; the dead-letter list distinguishes the two kinds and only the recoverable one offers a retry |
+| **2.4** Seeing inside | ○ not started | its trigger is `[measured]`: every `logger.info` in the backend is discarded |
 
 **Built ahead of its stage, for reasons recorded in the Evolution Map:**
 
@@ -129,7 +130,9 @@ models or embeddings.
    jitter, bounded by `max_attempts`                            (2.1)
 ✅ content-hash deduplication, and a re-attempt on a failed document as a new
    job rather than a new document                               (2.2)
-○  error classification · DLQ · replay                          (2.3)
+✅ failure classification from the agent's status code; a permanent failure
+   stops at attempt one; the dead-letter list and a replay endpoint (2.3)
+○  structured logging · metrics · request_id across processes   (2.4)
 ○  auth · users / tenants                       (5.1 – 5.2)
 ○  quotas · rate limiting · caching              (6.x, 8.x, 9.x)
 ```
@@ -183,11 +186,26 @@ leaves the same index.
 
 ✅ **The client stops polling**, because jobs now reach terminal states.
 
-⚠ **Nothing classifies failures.** A corrupt PDF retries the full
-`max_attempts` and lands in `failed` with the attempt count in its message.
-There is no dead-letter queue, no replay path, and no way to tell a transient
-outage from a permanently broken document — which is 2.3's trigger, and it is
-deliberate: 2.1 retries everything so that the observation exists.
+✅ **Failures are classified, and the two kinds are treated oppositely.** The
+agent's HTTP status decides it — 4xx permanent, 5xx and no-response transient,
+with 429 carved out as the one 4xx that means *come back later*. A permanent
+failure stops at attempt one; a transient one gets 15 attempts with any single
+wait capped at 60 seconds. That covers a **median of ~5 minutes** of outage —
+a median and not a promise: full jitter makes the realised budget vary, and
+two measured runs gave up at 302.1s and 221.1s.
+
+✅ **An operator can see and re-drive what died.** `GET /documents?status=failed`
+is the dead-letter queue — a query, not a table — and
+`POST /documents/{id}/retry` queues a fresh attempt without needing the original
+file. The UI offers that retry only on a *transient* failure: a button on a file
+that cannot be read would teach the user the system is flaky rather than that
+their file is unreadable.
+
+⚠ **All of it is still invisible from outside.** There is no metric for the
+dead-letter depth, no alert when it grows, and **every `logger.info` in the
+backend is still discarded** `[measured]` — uvicorn installs no root handler, so
+`logging.lastResort` passes only WARNING and above. The dead-letter list is a
+page someone has to remember to open. That is 2.4's trigger.
 
 ### `agent/` :8001 — the AI application layer
 

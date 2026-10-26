@@ -2,6 +2,7 @@
 
 import { useDocuments } from "@/features/documents/useDocuments";
 import { cn } from "@/lib/utils";
+import { useRetryDocumentMutation } from "@/services/documentsApi";
 import type { DocumentRecord } from "@/types";
 
 /**
@@ -124,12 +125,20 @@ function DocumentRow({ document }: { document: DocumentRecord }) {
 
       {/* A failure is durable, so the reason belongs on screen rather than
           only in the response that carried it. Since stage 1.3 there is no
-          such response at all: this is the only place it appears. */}
-      {document.error && (
-        <p className="mt-1 text-xs leading-relaxed text-red-600">
-          {document.error}
-        </p>
+          such response at all: this is the only place it appears.
+
+          Stage 2.3 split it in two. The message alone does not say whether
+          anything can be done — "is not a valid PDF" and "could not reach the
+          agent" are both just strings — and the answer decides whether this
+          row should offer a button or an explanation. */}
+      {document.error && document.status === "failed" && (
+        <FailureNotice document={document} />
       )}
+
+      {/* A failure on a job that is still queued is a *past* attempt, not the
+          outcome. It is rendered by the retry notices below, which say when
+          the next attempt is due; showing the red terminal block here as well
+          would read as "this is over". */}
 
       {/* ── The two non-terminal states, kept apart ───────────────────────────
           They mean different things to a user, and conflating them would hide
@@ -148,9 +157,11 @@ function DocumentRow({ document }: { document: DocumentRecord }) {
 
       {document.status === "queued" && document.attempts > 0 && (
         <p className="mt-1 text-xs leading-relaxed text-amber-700">
-          Attempt {document.attempts} failed — retrying
-          {retryIn(document.nextAttemptAt)}. Nothing is lost; the document is
-          still queued.
+          Attempt {document.attempts} failed
+          {document.failureKind === "transient" &&
+            " — the service was unavailable"}
+          , retrying{retryIn(document.nextAttemptAt)}. Nothing is lost; the
+          document is still queued.
         </p>
       )}
 
@@ -172,6 +183,84 @@ function DocumentRow({ document }: { document: DocumentRecord }) {
         </p>
       )}
     </li>
+  );
+}
+
+/**
+ * What a dead document says, and whether it offers a way out.
+ *
+ * ── The whole of stage 2.3's client half ────────────────────────────────────
+ *
+ * Two failures that look identical in the database — `status: "failed"` with
+ * a string — and that need opposite things from whoever is reading:
+ *
+ *   permanent   the file is the problem. Say what is wrong with it. **No
+ *               retry button**, because retrying queues an attempt guaranteed
+ *               to fail the same way, and a button that cannot work teaches
+ *               the user the system is flaky rather than that their file is
+ *               unreadable.
+ *
+ *   transient   the system was the problem and it has probably passed. Offer
+ *               the retry, because this one plausibly works now — and the
+ *               person looking at this row usually does not have the original
+ *               file to re-upload.
+ *
+ * `failureKind` is the only thing that distinguishes them, and it cannot be
+ * derived here: the error message is prose written for a human.
+ */
+function FailureNotice({ document }: { document: DocumentRecord }) {
+  const [retry, { isLoading, error }] = useRetryDocumentMutation();
+  const recoverable = document.failureKind === "transient";
+
+  return (
+    <div
+      className={cn(
+        "mt-1 rounded border px-2 py-1.5 text-xs leading-relaxed",
+        recoverable
+          ? "border-amber-200 bg-amber-50 text-amber-800"
+          : "border-red-200 bg-red-50 text-red-700",
+      )}
+    >
+      <p>{document.error}</p>
+
+      {recoverable && (
+        <p className="mt-1 text-amber-700">
+          This was the service, not the file
+          {document.attempts > 1 && ` — ${document.attempts} attempts`}. It may
+          work now.
+        </p>
+      )}
+
+      {/* The button exists only for the recoverable case. A disabled or
+          hidden-but-present control would still suggest the action is
+          meaningful; there simply is not one for a file that cannot be read. */}
+      {recoverable && (
+        <button
+          type="button"
+          onClick={() => void retry(document.documentId)}
+          disabled={isLoading}
+          className="mt-1.5 rounded border border-amber-300 bg-white px-2 py-1 font-medium text-amber-800 transition-colors hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          {isLoading ? "Queueing…" : "Try again"}
+        </button>
+      )}
+
+      {/* A 409 means the row changed under us — someone else retried it, or
+          the list is a poll behind. The server's own words are better than a
+          generic failure, because they say which. */}
+      {error && (
+        <p className="mt-1 text-red-700">{error.message}</p>
+      )}
+
+      {/* The honest ending for a file that cannot be indexed: nothing to try,
+          and what would actually change the answer. */}
+      {!recoverable && (
+        <p className="mt-1 text-red-600">
+          Retrying will not help — the file itself cannot be read. Upload a
+          different copy, or a text-based PDF if this one is scanned.
+        </p>
+      )}
+    </div>
   );
 }
 

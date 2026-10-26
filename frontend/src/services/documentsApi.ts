@@ -7,7 +7,12 @@
  */
 
 import { baseApi } from "./baseApi";
-import type { DocumentRecord, IngestionStatus, UploadResult } from "@/types";
+import type {
+  DocumentRecord,
+  FailureKind,
+  IngestionStatus,
+  UploadResult,
+} from "@/types";
 
 /**
  * Exactly what the backend returns, snake_case and all.
@@ -40,6 +45,7 @@ interface DocumentWire {
   characters_extracted: number | null;
   chunk_count: number | null;
   error: string | null;
+  failure_kind: FailureKind | null;
   attempts: number;
   next_attempt_at: string | null;
   finished_at: string | null;
@@ -61,6 +67,7 @@ function toRecord(wire: DocumentWire): DocumentRecord {
     charactersExtracted: wire.characters_extracted,
     chunkCount: wire.chunk_count,
     error: wire.error,
+    failureKind: wire.failure_kind,
     attempts: wire.attempts,
     nextAttemptAt: wire.next_attempt_at,
     finishedAt: wire.finished_at,
@@ -190,7 +197,52 @@ export const documentsApi = baseApi.injectEndpoints({
       // new attempt and the row's status has changed.
       invalidatesTags: [{ type: "Document", id: "LIST" }],
     }),
+
+    /**
+     * Queue another attempt at a document already on the server. Stage 2.3.
+     *
+     * The operator's half of the dead-letter queue. Without it, a document
+     * that failed during an outage can only be revived by finding the
+     * original file and uploading it again — and the person looking at the
+     * list is usually not the person who has the file.
+     *
+     * ── Why it takes an id and not a file ──────────────────────────────────
+     *
+     * The bytes are already stored. Stage 1.3 put them in `document_uploads`
+     * so a `202` could outlive the request that carried them, and this is the
+     * second thing that storage buys: re-driving a document costs one row.
+     *
+     * ── The tags, and why the per-id one is included here ─────────────────
+     *
+     * `uploadDocument` invalidates only `LIST`, because the set of documents
+     * changed and no existing row did. This is the opposite: the set is the
+     * same and **one row changed** — `failed` became `queued`. Both tags are
+     * invalidated because both facts are now stale, and the per-id tag is
+     * what the detail view (when there is one) would be subscribed to.
+     *
+     * A `409` comes back when the document is already in flight. It surfaces
+     * as `error` on the mutation like any other failure, with the server's
+     * explanation, which is the honest thing to show — the button should not
+     * have been offered, and saying so is better than failing silently.
+     */
+    retryDocument: builder.mutation<DocumentRecord, string>({
+      query: (documentId) => ({
+        url: `/documents/${documentId}/retry`,
+        method: "POST",
+      }),
+
+      transformResponse: toRecord,
+
+      invalidatesTags: (_result, _error, documentId) => [
+        { type: "Document", id: documentId },
+        { type: "Document", id: "LIST" },
+      ],
+    }),
   }),
 });
 
-export const { useListDocumentsQuery, useUploadDocumentMutation } = documentsApi;
+export const {
+  useListDocumentsQuery,
+  useUploadDocumentMutation,
+  useRetryDocumentMutation,
+} = documentsApi;

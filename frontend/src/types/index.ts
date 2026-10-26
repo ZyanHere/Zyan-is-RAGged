@@ -85,6 +85,26 @@ export interface Answer {
 export type IngestionStatus = "queued" | "processing" | "done" | "failed";
 
 /**
+ * Whether a failure could ever have succeeded. Mirrors the backend's
+ * `FailureKind`. Stage 2.3.
+ *
+ *   permanent   the file is the problem, and will still be the problem
+ *   transient   the system was the problem; the same bytes would likely work
+ *
+ * ── Why the UI needs it ─────────────────────────────────────────────────────
+ *
+ * The error message is written for a human and is not parseable. "is not a
+ * valid PDF" and "could not reach the agent" are both just strings, and only
+ * one of them is worth offering a retry for.
+ *
+ * Offering a Retry button on a permanent failure would be the interface
+ * lying: the button would queue an attempt that is guaranteed to fail the
+ * same way, and the user would be left thinking the system is flaky rather
+ * than that their file is unreadable.
+ */
+export type FailureKind = "permanent" | "transient";
+
+/**
  * A document the server knows about, with the state of its latest attempt.
  *
  * **Server state.** It lives in the RTK Query cache, not in a slice — it is a
@@ -179,6 +199,18 @@ export interface DocumentRecord {
    * the upload request, so a failure you scrolled past was gone.
    */
   error: string | null;
+
+  /**
+   * Whether `error` could ever have succeeded on a retry. Stage 2.3.
+   *
+   * `null` exactly when `error` is `null` — the two move together, which a
+   * database CHECK constraint guarantees rather than a convention.
+   *
+   * Present on a *waiting* job too, not only a dead one. A document retrying
+   * after an outage and one retrying a file that will never parse are both
+   * `status: "queued"` with an error, and without this they read identically.
+   */
+  failureKind: FailureKind | null;
 
   /**
    * How many times this document has been claimed for ingestion.
