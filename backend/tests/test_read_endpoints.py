@@ -21,6 +21,21 @@ from app.services.ingestion import IngestionService, RetryPolicy
 
 PDF = b"%PDF-1.4 pretend this is a real document"
 
+
+# ── Why each upload gets distinct bytes — stage 2.2 ──────────────────────────
+#
+# `uq_documents_content_hash` means two uploads of **identical bytes** are one
+# document, and the second insert is refused. A shared `PDF` constant therefore
+# made every test that accepts more than one document fail on uniqueness while
+# testing something else entirely.
+#
+# Separate uploads are separate files, so the helpers below append a unique
+# marker. A test that wants a genuine duplicate passes the same bytes twice,
+# deliberately. The long version of this is in `test_repositories.create`.
+def _unique(pdf: bytes) -> bytes:
+    return pdf + b" " + uuid.uuid4().hex.encode()
+
+
 # These tests are about the flow, not about expiry. A long lease keeps
 # the reaper out of them; its own tests use a deliberately short one.
 LEASE = 60.0
@@ -70,9 +85,13 @@ async def seed(
     up, which is the state these endpoints must now also be able to report.
     """
     service = IngestionService(session, repo, agent or FakeAgent())
-    accepted = await service.accept_upload(
-        filename=filename, content=PDF, content_type="application/pdf"
-    )
+    accepted = (
+        await service.accept_upload(
+            filename=filename,
+            content=_unique(PDF),
+            content_type="application/pdf",
+        )
+    ).document
 
     claimed = await repo.claim_next_queued_job(lease_seconds=LEASE)
     assert claimed is not None and claimed.document_id == accepted.document_id
@@ -90,9 +109,13 @@ async def seed_queued(session, repo, filename: str):
     normal operation.
     """
     service = IngestionService(session, repo, FakeAgent())
-    return await service.accept_upload(
-        filename=filename, content=PDF, content_type="application/pdf"
-    )
+    return (
+        await service.accept_upload(
+            filename=filename,
+            content=_unique(PDF),
+            content_type="application/pdf",
+        )
+    ).document
 
 
 # ── The list ─────────────────────────────────────────────────────────────────

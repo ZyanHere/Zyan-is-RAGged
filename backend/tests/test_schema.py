@@ -720,3 +720,83 @@ async def test_attempts_cannot_be_negative(session: AsyncSession) -> None:
 
     with pytest.raises(IntegrityError, match="attempts_non_negative"):
         await session.flush()
+
+
+# ── The content hash (stage 2.2) ─────────────────────────────────────────────
+
+
+async def test_two_documents_cannot_share_a_content_hash(
+    session: AsyncSession,
+) -> None:
+    """`uq_documents_content_hash`.
+
+    This is the constraint the whole stage rests on. The application's dedupe
+    path does a SELECT first and inserts only when it finds nothing — which is
+    correct and is **not sufficient**, because two requests can both read
+    "nothing" before either writes. Only the database can refuse the second
+    one, and this test is what proves it will.
+    """
+    content_hash = "a" * 64
+
+    session.add(make_document(content_hash=content_hash))
+    await session.flush()
+
+    session.add(make_document(filename="other.pdf", content_hash=content_hash))
+
+    with pytest.raises(IntegrityError, match="uq_documents_content_hash"):
+        await session.flush()
+
+
+async def test_many_documents_may_have_no_content_hash(
+    session: AsyncSession,
+) -> None:
+    """NULLs are **distinct** in a Postgres unique index, and that is relied on.
+
+    Documents from before stage 1.3 have no stored bytes and so cannot be
+    hashed. If NULLs collided, the only way to add this constraint would have
+    been to invent a hash for them or delete them.
+
+    Worth asserting rather than assuming: `NULLS NOT DISTINCT` is a real
+    Postgres 15 option, one keyword away in the migration, and under it this
+    test fails and the schema rejects every document that predates 1.3.
+    """
+    for i in range(3):
+        session.add(make_document(filename=f"legacy-{i}.pdf", content_hash=None))
+
+    await session.flush()
+
+    count = (
+        await session.execute(
+            select(func.count())
+            .select_from(Document)
+            .where(Document.content_hash.is_(None))
+        )
+    ).scalar_one()
+    assert count == 3
+
+
+async def test_the_database_and_python_agree_on_a_hash(
+    session: AsyncSession,
+) -> None:
+    """The migration backfills with `encode(sha256(content), 'hex')`; the upload
+    route will compute `hashlib.sha256(content).hexdigest()`.
+
+    Two implementations of one value, in different languages, and nothing
+    stops them drifting except the fact that they agree. If they ever did not,
+    every pre-existing document would stop deduplicating against new uploads
+    of the same file — silently, because both values look like a valid hash.
+
+    So: hash the same bytes both ways and compare.
+    """
+    import hashlib
+
+    content = b"%PDF-1.4 the same bytes, hashed in two places"
+
+    from_postgres = (
+        await session.execute(
+            select(func.encode(func.sha256(text("CAST(:c AS bytea)")), "hex")),
+            {"c": content},
+        )
+    ).scalar_one()
+
+    assert from_postgres == hashlib.sha256(content).hexdigest()

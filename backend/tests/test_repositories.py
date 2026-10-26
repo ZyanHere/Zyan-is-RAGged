@@ -6,8 +6,11 @@ boundaries*, because that is the thing stage 1.2 exists to get right and the
 thing a unit test with a mocked session could never check.
 """
 
+import hashlib
+import uuid
+
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,11 +36,45 @@ LEASE = 60.0
 async def create(
     repo: DocumentRepository,
     filename: str = "zephyr-test.pdf",
-    content: bytes = CONTENT,
+    content: bytes | None = None,
 ):
-    """A document, its bytes and a **queued** job — what an upload produces."""
+    """A document, its bytes and a **queued** job — what an upload produces.
+
+    ── The hash is derived, never passed in ────────────────────────────────────
+
+    `content_hash` is computed here from `content`, exactly as the upload route
+    does it. A helper that let a test supply a hash unrelated to its bytes could
+    manufacture states the real system cannot reach, and the tests built on it
+    would be describing a different program.
+
+    ── Why the default content is unique per call — stage 2.2 ──────────────────
+
+    It used to be one shared constant, which was fine while nothing deduplicated
+    and became wrong the moment `uq_documents_content_hash` existed: two
+    `create(repo)` calls in one test are two uploads of **identical bytes**, and
+    the database now correctly refuses the second.
+
+    `test_two_documents_are_listed_newest_first` is the one that caught it. It
+    creates `first.pdf` and `second.pdf` — two different documents by any
+    ordinary reading — and they shared the constant. It was testing ordering,
+    broke on uniqueness, and was never wrong.
+
+    **This is the fifth time a new constraint has broken a correct test for a
+    reason it was not about.** The pattern each time: the helper knew less about
+    the schema than the schema did. So the default is now distinct per call,
+    which is also what it always meant — separate uploads are separate files.
+
+    A test that wants a *duplicate* says so by passing the same `content=`
+    twice, which reads as the deliberate choice it is.
+    """
+    if content is None:
+        content = CONTENT + b" " + uuid.uuid4().hex.encode()
+
     return await repo.create_document_with_job(
-        filename=filename, content=content, content_type="application/pdf"
+        filename=filename,
+        content=content,
+        content_type="application/pdf",
+        content_hash=hashlib.sha256(content).hexdigest(),
     )
 
 
@@ -654,3 +691,240 @@ async def test_the_reaper_leaves_live_leases_alone(
     reaped = await repo.reap_expired_leases(max_attempts=5)
 
     assert reaped.total == 0
+
+
+# ── Content hash and re-attempts (stage 2.2) ─────────────────────────────────
+
+
+async def test_a_document_is_findable_by_its_content_hash(
+    repo: DocumentRepository, session: AsyncSession
+) -> None:
+    """The read that makes an upload idempotent.
+
+    Note what it is *not*: a lookup by filename. The same bytes are the same
+    document whatever they were called, which is the whole shift this stage
+    makes.
+    """
+    content = CONTENT + b" findable"
+    document, job = await create(repo, filename="original.pdf", content=content)
+    await session.commit()
+
+    found = await repo.get_by_content_hash(hashlib.sha256(content).hexdigest())
+
+    assert found is not None
+    fetched_document, fetched_job = found
+    assert fetched_document.id == document.id
+    assert fetched_job is not None and fetched_job.id == job.id, (
+        "the lookup must return the latest job too — the caller's next "
+        "decision depends on whether it failed"
+    )
+
+
+async def test_an_unknown_hash_finds_nothing(repo: DocumentRepository) -> None:
+    """`None`, not an exception. A first upload is the ordinary case."""
+    assert await repo.get_by_content_hash("f" * 64) is None
+
+
+async def test_the_lookup_returns_the_second_job_not_the_first(
+    repo: DocumentRepository, session: AsyncSession
+) -> None:
+    """A document with two attempts must report the second one.
+
+    This is the assertion that makes the duplicate-upload decision possible:
+    "the last attempt failed" is the signal that a re-upload should queue
+    another one, and reading a stale job would answer it wrongly.
+
+    ── What this actually proves, which is not what it first appeared to ──────
+
+    It proves the **`id DESC` tiebreaker**, not recency — and that was found by
+    mutating the query, not by reading it.
+
+    Flipping `queued_at` to `ASC` in `_latest_job_subquery` left this test
+    green. Flipping `id` to `ASC` broke it. The reason is the test fixture:
+    `session.commit()` here runs inside the outer transaction the fixture rolls
+    back, so it does not start a new one — and `queued_at` defaults to
+    `now()`, which is `transaction_timestamp()`. **Every row written during one
+    test therefore shares an identical `queued_at`**, and the tiebreaker
+    decides every ordering question.
+
+    That is worth knowing beyond this test. Any test that expects two commits
+    to be ordered *in time* is relying on the tiebreaker without saying so, and
+    will keep passing if the time ordering is broken.
+
+    `test_recency_beats_the_id_tiebreaker` below is the one that pins the other
+    half, by writing `queued_at` explicitly so the two columns disagree.
+    """
+    content = CONTENT + b" two attempts"
+    document, first = await create(repo, content=content)
+    await session.commit()
+
+    second = await repo.create_job_for_document(document.id)
+    await session.commit()
+
+    found = await repo.get_by_content_hash(hashlib.sha256(content).hexdigest())
+
+    assert found is not None
+    _, latest = found
+    assert latest is not None
+    assert latest.id == second.id, "the later-minted id, not the first"
+    assert latest.id != first.id
+
+
+async def test_recency_beats_the_id_tiebreaker(
+    repo: DocumentRepository, session: AsyncSession
+) -> None:
+    """`queued_at DESC` is the primary sort; `id DESC` only breaks ties.
+
+    The two cannot be told apart by any test that lets the database supply
+    `queued_at`, because within one test every default timestamp is identical —
+    see the test above. So this one writes `queued_at` by hand and makes the
+    two columns **disagree**:
+
+        job A   minted first  (smaller uuid7)   queued_at = now
+        job B   minted second (larger uuid7)    queued_at = an hour ago
+
+    `queued_at DESC` picks A. `id DESC` picks B. Asserting A is therefore the
+    only way to show which one leads.
+
+    It matters in production rather than only in theory. A job requeued by the
+    reaper keeps its original `queued_at` while new uploads arrive with later
+    ids, so "which attempt is current?" is a question the id alone answers
+    wrongly for exactly the documents this stage cares about.
+    """
+    document, _ = await create(repo)
+    await session.commit()
+
+    # Clear the slate: this test wants exactly the two jobs it writes.
+    await session.execute(
+        text("DELETE FROM ingestion_jobs WHERE document_id = :d"),
+        {"d": document.id},
+    )
+
+    newest_but_older_id = IngestionJob(
+        document_id=document.id,
+        status=IngestionStatus.QUEUED,
+        started_at=None,
+        queued_at=func.now(),
+    )
+    session.add(newest_but_older_id)
+    await session.flush()
+
+    oldest_but_newer_id = IngestionJob(
+        document_id=document.id,
+        status=IngestionStatus.QUEUED,
+        started_at=None,
+        queued_at=func.now() - func.make_interval(0, 0, 0, 0, 1),
+    )
+    session.add(oldest_but_newer_id)
+    await session.flush()
+
+    assert oldest_but_newer_id.id > newest_but_older_id.id, (
+        "uuid7 must be time-ordered, or this test is not testing a conflict"
+    )
+
+    found = await repo.get_document_with_latest_job(document.id)
+
+    assert found is not None
+    _, latest = found
+    assert latest is not None
+    assert latest.id == newest_but_older_id.id, (
+        "the most recently queued job must win over the larger id"
+    )
+
+
+async def test_a_second_job_needs_no_second_document_or_blob(
+    repo: DocumentRepository, session: AsyncSession
+) -> None:
+    """`create_job_for_document` adds one row and nothing else.
+
+    The claim being tested is a cost claim: re-driving a document must not pay
+    for a second copy of its bytes. One `document_uploads` row before, one
+    after.
+    """
+    document, _ = await create(repo)
+    await session.commit()
+
+    job = await repo.create_job_for_document(document.id)
+    await session.commit()
+
+    assert job.status is IngestionStatus.QUEUED
+    assert job.started_at is None, "a fresh attempt has not started"
+    assert job.attempts == 0, (
+        "a new attempt starts at zero — inheriting the failed job's count "
+        "would mean a deliberate re-upload began halfway through its budget"
+    )
+    assert job.lease_token is None
+    assert job.next_attempt_at is None, "claimable now, not after a backoff"
+
+    documents = (
+        await session.execute(
+            select(func.count()).select_from(Document)
+        )
+    ).scalar_one()
+    uploads = (
+        await session.execute(
+            text("SELECT count(*) FROM document_uploads")
+        )
+    ).scalar_one()
+    jobs = (
+        await session.execute(
+            select(func.count())
+            .select_from(IngestionJob)
+            .where(IngestionJob.document_id == document.id)
+        )
+    ).scalar_one()
+
+    assert (documents, uploads, jobs) == (1, 1, 2), (
+        "one document, one blob, two attempts"
+    )
+
+
+async def test_a_second_attempt_is_claimable_like_any_other(
+    repo: DocumentRepository, session: AsyncSession
+) -> None:
+    """The new job must be ordinary, not special.
+
+    If a re-attempt needed its own code path in the worker, the two-table
+    design would have bought nothing. The proof that it does not is that the
+    unmodified claim picks it up.
+    """
+    document, first = await create(repo)
+    await session.commit()
+
+    claimed = await repo.claim_next_queued_job(lease_seconds=LEASE)
+    assert claimed is not None and claimed.job_id == first.id
+    assert await repo.mark_job_failed(
+        first.id, claimed.lease_token, error="broken on the first try"
+    )
+    await session.commit()
+
+    second = await repo.create_job_for_document(document.id)
+    await session.commit()
+
+    reclaimed = await repo.claim_next_queued_job(lease_seconds=LEASE)
+
+    assert reclaimed is not None
+    assert reclaimed.job_id == second.id
+    assert reclaimed.document_id == document.id
+    assert reclaimed.attempts == 1, "its own first attempt, not the document's"
+
+
+async def test_a_duplicate_hash_is_refused_by_the_database(
+    repo: DocumentRepository, session: AsyncSession
+) -> None:
+    """The repository does **not** guard against this, and must not.
+
+    `create_document_with_job` could check for an existing hash first and
+    refuse politely. It would also be wrong: two concurrent callers would both
+    find nothing and both proceed, so the check would create a false sense of
+    safety while the constraint did the actual work.
+
+    So the method lets the INSERT fail, and the service decides what a
+    duplicate means. This test pins that division of labour.
+    """
+    content = CONTENT + b" the very same bytes"
+    await create(repo, filename="first.pdf", content=content)
+    await session.flush()
+
+    with pytest.raises(IntegrityError, match="uq_documents_content_hash"):
+        await create(repo, filename="second.pdf", content=content)

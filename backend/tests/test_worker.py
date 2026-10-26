@@ -36,6 +36,21 @@ from app.worker import process_one, reap, run
 
 PDF = b"%PDF-1.4 pretend this is a real document"
 
+
+# ── Why each upload gets distinct bytes — stage 2.2 ──────────────────────────
+#
+# `uq_documents_content_hash` means two uploads of **identical bytes** are one
+# document, and the second insert is refused. A shared `PDF` constant therefore
+# made every test that accepts more than one document fail on uniqueness while
+# testing something else entirely.
+#
+# Separate uploads are separate files, so the helpers below append a unique
+# marker. A test that wants a genuine duplicate passes the same bytes twice,
+# deliberately. The long version of this is in `test_repositories.create`.
+def _unique(pdf: bytes) -> bytes:
+    return pdf + b" " + uuid.uuid4().hex.encode()
+
+
 # A long lease, because these tests are about the loop rather than
 # about expiry. The reaper's tests set a short one deliberately.
 def _settings(**overrides) -> Settings:
@@ -99,14 +114,20 @@ async def database(test_database_url: str):
     await db.engine.dispose()
 
 
-async def accept(database: Database, filename: str = "zephyr-test.pdf") -> uuid.UUID:
+async def accept(
+    database: Database,
+    filename: str = "zephyr-test.pdf",
+    content: bytes | None = None,
+) -> uuid.UUID:
     """Commit an upload the way the API does, and return its document id."""
     async with session_scope(database.session_factory) as session:
         service = IngestionService(session, DocumentRepository(session), FakeAgent())
         accepted = await service.accept_upload(
-            filename=filename, content=PDF, content_type="application/pdf"
+            filename=filename,
+            content=content if content is not None else _unique(PDF),
+            content_type="application/pdf",
         )
-        return accepted.document_id
+        return accepted.document.document_id
 
 
 async def read_job(database: Database, document_id: uuid.UUID):
@@ -143,7 +164,9 @@ async def test_the_worker_drives_a_queued_job_to_done(database: Database) -> Non
     different process, with no request involved anywhere.
     """
     agent = FakeAgent()
-    document_id = await accept(database)
+    # Explicit bytes, because the assertion below is byte-for-byte: the worker
+    # must ingest what was *stored*, not a placeholder it invented.
+    document_id = await accept(database, content=PDF)
 
     try:
         assert await process_one(database, SETTINGS, agent) is True

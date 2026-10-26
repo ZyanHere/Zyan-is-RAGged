@@ -40,6 +40,21 @@ from app.services.ingestion import IngestionService, RetryPolicy
 
 PDF = b"%PDF-1.4 pretend this is a real document"
 
+
+# ── Why each upload gets distinct bytes — stage 2.2 ──────────────────────────
+#
+# `uq_documents_content_hash` means two uploads of **identical bytes** are one
+# document, and the second insert is refused. A shared `PDF` constant therefore
+# made every test that accepts more than one document fail on uniqueness while
+# testing something else entirely.
+#
+# Separate uploads are separate files, so the helpers below append a unique
+# marker. A test that wants a genuine duplicate passes the same bytes twice,
+# deliberately. The long version of this is in `test_repositories.create`.
+def _unique(pdf: bytes) -> bytes:
+    return pdf + b" " + uuid.uuid4().hex.encode()
+
+
 # These tests are about the flow, not about expiry. A long lease keeps
 # the reaper out of them; its own tests use a deliberately short one.
 LEASE = 60.0
@@ -103,11 +118,23 @@ def service(session, repo, agent) -> IngestionService:
     return IngestionService(session, repo, agent)
 
 
-async def accept(svc: IngestionService, filename: str = "zephyr-test.pdf"):
-    """Only the request's half: record it, store the bytes, commit."""
-    return await svc.accept_upload(
-        filename=filename, content=PDF, content_type="application/pdf"
+async def accept(
+    svc: IngestionService,
+    filename: str = "zephyr-test.pdf",
+    content: bytes | None = None,
+):
+    """Only the request's half: record it, store the bytes, commit.
+
+    Returns the `DocumentRead`, not the whole `UploadOutcome`. Stage 2.2 added
+    `queued` to that result for the route's benefit; the tests that care about
+    it say so by calling `accept_upload` directly.
+    """
+    outcome = await svc.accept_upload(
+        filename=filename,
+        content=content if content is not None else _unique(PDF),
+        content_type="application/pdf",
     )
+    return outcome.document
 
 
 async def ingest(
@@ -115,6 +142,7 @@ async def ingest(
     repo: DocumentRepository,
     agent,
     filename: str = "zephyr-test.pdf",
+    content: bytes | None = None,
 ):
     """Accept, claim, process — and commit between each, as the system does.
 
@@ -130,7 +158,7 @@ async def ingest(
     """
     svc = IngestionService(session, repo, agent)
 
-    accepted = await accept(svc, filename)
+    accepted = await accept(svc, filename, content)
 
     claimed = await repo.claim_next_queued_job(lease_seconds=LEASE)
     assert claimed is not None, "the job just accepted should be claimable"
@@ -154,7 +182,10 @@ async def test_a_successful_ingest_is_recorded_as_done(
     session: AsyncSession, repo: DocumentRepository
 ) -> None:
     agent = FakeAgent()
-    response = await ingest(session, repo, agent)
+    # Explicit bytes, so `byte_size` below can be checked against a known
+    # number. The helper's default is unique per call, which is right for the
+    # tests that do not care what the bytes are and useless to this one.
+    response = await ingest(session, repo, agent, content=PDF)
 
     assert response.status is IngestionStatus.DONE
     assert response.chunk_count == 3
@@ -359,7 +390,9 @@ async def test_another_connection_can_see_the_job_the_instant_it_is_accepted(
     try:
         async with factory() as s:
             svc = IngestionService(s, DocumentRepository(s), FakeAgent())
-            accepted = await accept(svc, "durable.pdf")
+            # Explicit bytes: this test asserts the exact stored length, which
+            # is the proof that the blob was committed along with the job.
+            accepted = await accept(svc, "durable.pdf", PDF)
             document_id = accepted.document_id
 
             # Still inside the service's session, and deliberately *before*
