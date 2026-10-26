@@ -138,7 +138,7 @@ async def read_job(database: Database, document_id: uuid.UUID):
                 text(
                     "SELECT status, started_at IS NULL AS not_started, "
                     "       finished_at IS NULL AS not_finished, error, chunk_count, "
-                    "       attempts, next_attempt_at "
+                    "       attempts, next_attempt_at, failure_kind "
                     "  FROM ingestion_jobs WHERE document_id = :id"
                 ),
                 {"id": document_id},
@@ -195,21 +195,25 @@ async def test_an_empty_queue_is_not_an_error(database: Database) -> None:
     assert await process_one(database, SETTINGS, FakeAgent()) is False
 
 
-async def test_a_rejected_document_is_requeued_rather_than_failed(
+async def test_a_rejected_document_fails_on_the_first_attempt(
     database: Database,
 ) -> None:
-    """**Changed at stage 2.1, and this is the change.**
+    """**Changed twice now, and the second change is this one.**
 
-    This test used to assert `failed`. A 4xx ended the job outright.
+    At 1.3 a 4xx ended the job outright. At 2.1 it became provisional — the
+    job returned to `queued` with the agent's reason, because nothing yet
+    distinguished a broken file from a broken dependency.
 
-    Now the first failure is provisional: the job returns to `queued` carrying
-    the agent's reason and a `next_attempt_at` in the future. The message is
-    still the user-facing output, but it now reads as "waiting, because of
-    this" rather than "dead, because of this".
+    Stage 2.3 ends it again, deliberately and for a different reason: a
+    document that is not a PDF will not become one. Four of the five attempts
+    2.1 spent on it could never have succeeded, and the message the user reads
+    is identical either way — so the retries bought nothing and delayed the
+    answer.
 
-    The second assertion is the backoff doing its job — the delay lives in the
-    row, so the very next poll finds nothing to do rather than retrying
-    instantly in a tight loop.
+    Note what is asserted about the error: **no "gave up after N attempts"
+    suffix.** The suffix only earns its place when retries actually happened,
+    and on a permanent failure the user should read the engine's own words
+    unadorned.
     """
     document_id = await accept(database, "notes.txt")
 
@@ -218,14 +222,71 @@ async def test_a_rejected_document_is_requeued_rather_than_failed(
         assert await process_one(database, PATIENT, agent) is True
 
         job = await read_job(database, document_id)
-        assert job.status == "queued", "a first failure is not the end"
-        assert job.error == "'notes.txt' is not a PDF."
-        assert job.attempts == 1
-        assert job.not_finished is True
+        assert job.status == "failed", "a permanent failure does not wait"
+        assert job.error == "'notes.txt' is not a PDF.", (
+            "no attempt-count suffix: nothing was retried"
+        )
+        assert job.failure_kind == "permanent"
+        assert job.attempts == 1, "one claim, not five"
+        assert job.not_finished is False
 
         assert await process_one(database, PATIENT, FakeAgent()) is False, (
-            "the backoff must keep it out of the queue until its delay passes"
+            "a terminal job must not be claimable again"
         )
+    finally:
+        await cleanup(database, [document_id])
+
+
+async def test_a_rate_limit_is_retried_despite_being_4xx(
+    database: Database,
+) -> None:
+    """`429` is the exception that shows the rule is not about the number.
+
+    4xx normally means *this request is wrong*, and `classify` treats it as
+    permanent for that reason. A rate limit is the one 4xx that means *you
+    were right, come back later* — the server asking you to wait, not telling
+    you the request was bad.
+
+    Nothing in this system emits a 429 today. A provider will, and without
+    this carve-out every document in flight during a rate-limit window would
+    be permanently failed on its first attempt — a strictly worse outcome than
+    the 22-second budget this stage exists to fix.
+    """
+    document_id = await accept(database, "rate-limited.pdf")
+
+    try:
+        agent = FakeAgent(
+            status_code=429, body={"detail": "Too many requests, retry later."}
+        )
+        assert await process_one(database, PATIENT, agent) is True
+
+        job = await read_job(database, document_id)
+        assert job.status == "queued", "a rate limit is worth waiting out"
+        assert job.failure_kind == "transient"
+        assert job.attempts == 1
+    finally:
+        await cleanup(database, [document_id])
+
+
+async def test_a_storage_failure_is_transient(database: Database) -> None:
+    """A 500 from the agent is *our* infrastructure, not the document.
+
+    `VectorStoreError` is deliberately a 500 and not a 502 — Qdrant is ours,
+    not a third party — and either way the document is blameless. Classifying
+    it permanent would throw away a perfectly good upload because a disk was
+    briefly unhappy.
+    """
+    document_id = await accept(database, "storage-blip.pdf")
+
+    try:
+        agent = FakeAgent(
+            status_code=500, body={"detail": "Could not write to the collection."}
+        )
+        assert await process_one(database, PATIENT, agent) is True
+
+        job = await read_job(database, document_id)
+        assert job.status == "queued"
+        assert job.failure_kind == "transient"
     finally:
         await cleanup(database, [document_id])
 

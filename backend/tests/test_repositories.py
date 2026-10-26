@@ -14,7 +14,12 @@ from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.models import Document, IngestionJob, IngestionStatus
+from app.db.models import (
+    Document,
+    FailureKind,
+    IngestionJob,
+    IngestionStatus,
+)
 from app.repositories.documents import DocumentRepository
 
 
@@ -217,7 +222,9 @@ async def test_marking_failed_records_the_reason(
     await session.flush()
 
     message = "'notes.txt' is not a PDF. It starts with b'just som'."
-    await repo.mark_job_failed(job.id, claimed.lease_token, error=message)
+    await repo.mark_job_failed(
+        job.id, claimed.lease_token, error=message, failure_kind=FailureKind.TRANSIENT
+    )
     await session.commit()
 
     updated = await repo.get_job(job.id)
@@ -240,7 +247,9 @@ async def test_the_finish_time_comes_from_the_database(
     await session.flush()
 
     before = (await session.execute(text("SELECT now()"))).scalar_one()
-    await repo.mark_job_failed(job.id, claimed.lease_token, error="unknown")
+    await repo.mark_job_failed(
+        job.id, claimed.lease_token, error="unknown", failure_kind=FailureKind.TRANSIENT
+    )
     await session.commit()
 
     updated = await repo.get_job(job.id)
@@ -300,7 +309,10 @@ async def test_listing_returns_only_the_most_recent_attempt(
     document, first_job, first_claim = await create_and_claim(repo)
     await session.flush()
     await repo.mark_job_failed(
-        first_job.id, first_claim.lease_token, error="transient provider error"
+        first_job.id,
+        first_claim.lease_token,
+        error="transient provider error",
+        failure_kind=FailureKind.TRANSIENT,
     )
 
     await session.execute(
@@ -606,7 +618,11 @@ async def test_each_claim_mints_a_different_token(
     assert first is not None
 
     await repo.requeue_job(
-        first.job_id, first.lease_token, error="try again", delay_seconds=0
+        first.job_id,
+        first.lease_token,
+        error="try again",
+        failure_kind=FailureKind.TRANSIENT,
+        delay_seconds=0,
     )
     second = await repo.claim_next_queued_job(lease_seconds=LEASE)
 
@@ -633,6 +649,7 @@ async def test_a_requeued_job_waits_for_its_backoff(
         claimed.job_id,
         claimed.lease_token,
         error="the agent did not respond",
+        failure_kind=FailureKind.TRANSIENT,
         delay_seconds=300,
     )
 
@@ -656,7 +673,11 @@ async def test_a_requeued_job_keeps_the_reason_it_is_waiting(
     assert claimed is not None
 
     await repo.requeue_job(
-        claimed.job_id, claimed.lease_token, error="provider timeout", delay_seconds=0
+        claimed.job_id,
+        claimed.lease_token,
+        error="provider timeout",
+        failure_kind=FailureKind.TRANSIENT,
+        delay_seconds=0,
     )
 
     fetched = (
@@ -894,7 +915,10 @@ async def test_a_second_attempt_is_claimable_like_any_other(
     claimed = await repo.claim_next_queued_job(lease_seconds=LEASE)
     assert claimed is not None and claimed.job_id == first.id
     assert await repo.mark_job_failed(
-        first.id, claimed.lease_token, error="broken on the first try"
+        first.id,
+        claimed.lease_token,
+        error="broken on the first try",
+        failure_kind=FailureKind.TRANSIENT,
     )
     await session.commit()
 
@@ -928,3 +952,122 @@ async def test_a_duplicate_hash_is_refused_by_the_database(
 
     with pytest.raises(IntegrityError, match="uq_documents_content_hash"):
         await create(repo, filename="second.pdf", content=content)
+
+
+# ── The dead-letter view (stage 2.3) ─────────────────────────────────────────
+
+
+async def test_the_status_filter_reads_the_latest_job_only(
+    repo: DocumentRepository, session: AsyncSession
+) -> None:
+    """**The whole correctness of the dead-letter list is this test.**
+
+    A document that failed once and has since succeeded must not appear in
+    `status=failed`. The operator's list is a list of things to *act on*, and
+    a document someone already fixed is the one entry guaranteed to waste
+    their time — worse, retrying it re-indexes a document that is perfectly
+    fine.
+
+    The bug this guards against is a one-word difference: filtering
+    `IngestionJob.status` rather than the aliased latest job. Both compile,
+    both return rows, and the wrong one is only visibly wrong for documents
+    with more than one attempt — which is exactly the population the
+    dead-letter list is about.
+    """
+    document, first = await create(repo)
+    await session.commit()
+
+    # Attempt one fails.
+    claimed = await repo.claim_next_queued_job(lease_seconds=LEASE)
+    assert claimed is not None
+    assert await repo.mark_job_failed(
+        first.id,
+        claimed.lease_token,
+        error="the agent did not respond",
+        failure_kind=FailureKind.TRANSIENT,
+    )
+    await session.commit()
+
+    dead = await repo.list_documents_with_latest_job(
+        status=IngestionStatus.FAILED
+    )
+    assert [d.id for d, _ in dead] == [document.id], "it is dead right now"
+
+    # Attempt two succeeds.
+    second = await repo.create_job_for_document(document.id)
+    await session.commit()
+    reclaimed = await repo.claim_next_queued_job(lease_seconds=LEASE)
+    assert reclaimed is not None and reclaimed.job_id == second.id
+    assert await repo.mark_job_done(
+        second.id,
+        reclaimed.lease_token,
+        page_count=3,
+        pages_with_text=3,
+        characters_extracted=100,
+        chunk_count=3,
+    )
+    await session.commit()
+
+    dead_now = await repo.list_documents_with_latest_job(
+        status=IngestionStatus.FAILED
+    )
+    assert dead_now == [], (
+        "a document whose latest attempt succeeded is not dead, even though "
+        "it still has a failed job in its history"
+    )
+
+    done = await repo.list_documents_with_latest_job(
+        status=IngestionStatus.DONE
+    )
+    assert [d.id for d, _ in done] == [document.id]
+
+
+async def test_an_unfiltered_list_still_shows_a_document_with_no_job(
+    repo: DocumentRepository, session: AsyncSession
+) -> None:
+    """The filter must not quietly turn the outer join into an inner one.
+
+    A document with no job at all should be impossible — both rows are written
+    in one transaction — and the unfiltered list has always shown it anyway,
+    because hiding an inconsistency is how it survives.
+
+    Adding a `WHERE` on the joined job would drop such a row from *every*
+    listing if it were applied unconditionally. It is applied only when
+    `status` is given, and this pins that.
+    """
+    document = Document(
+        filename="orphaned.pdf",
+        byte_size=10,
+        content_type="application/pdf",
+        content_hash=hashlib.sha256(b"orphaned").hexdigest(),
+    )
+    session.add(document)
+    await session.commit()
+
+    everything = await repo.list_documents_with_latest_job()
+    rows = {d.id: j for d, j in everything}
+
+    assert document.id in rows, "a job-less document must still be listed"
+    assert rows[document.id] is None, "and its job must come back as None"
+
+
+async def test_the_filter_accepts_every_status(
+    repo: DocumentRepository, session: AsyncSession
+) -> None:
+    """Cheap, and it catches the filter being wired to the wrong column.
+
+    `queued` is the interesting one: it is the only status a brand-new
+    document has, so a filter that silently matched nothing would look
+    plausible on `failed` (usually empty anyway) and be obviously wrong here.
+    """
+    document, _ = await create(repo)
+    await session.commit()
+
+    queued = await repo.list_documents_with_latest_job(
+        status=IngestionStatus.QUEUED
+    )
+    assert [d.id for d, _ in queued] == [document.id]
+
+    for other in (IngestionStatus.PROCESSING, IngestionStatus.DONE,
+                  IngestionStatus.FAILED):
+        assert await repo.list_documents_with_latest_job(status=other) == []

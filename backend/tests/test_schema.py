@@ -21,6 +21,7 @@ from sqlalchemy.orm import selectinload
 from app.db.models import (
     Document,
     DocumentUpload,
+    FailureKind,
     IngestionJob,
     IngestionStatus,
     new_id,
@@ -53,15 +54,34 @@ def make_job(**overrides: object) -> IngestionJob:
     `queued` jobs pass `started_at=None` explicitly, which reads as the
     deliberate choice it is.
 
+    **Tests below construct `IngestionJob` directly only when the point is a
+    column this helper would fill in.** Everything else goes through here —
+    four tests were converted at stage 2.3 after `failure_kind_matches_error`
+    broke them, each of them asserting a *different* constraint and failing
+    because the new one fired first. That failure mode is the whole argument
+    for the helper: a test that names one constraint has to satisfy every
+    other, and only one place should know what "every other" means.
+
     **The lease defaults are conditional, and that is the point.** Stage 2.1
     added `lease_matches_status`: a `processing` job holds a lease and nothing
     else does. A flat default would therefore be wrong for three of the four
     statuses, so the helper looks at the status it ends up with — which is the
     same rule the constraint enforces, written once.
 
-    This is the third time a new constraint has broken correct tests for a
-    reason none of them was about. Centralising the "satisfy everything else"
-    knowledge here is what stops it being a fourth.
+    **`failure_kind` follows `error` — stage 2.3.** The tenth constraint says
+    the two are either both present or both absent, so a test that sets an
+    error to satisfy `failed_requires_error` now violates
+    `failure_kind_matches_error` unless the helper supplies a kind too.
+
+    `TRANSIENT` is the default because it is the uninteresting one: a test
+    naming a *kind* passes it explicitly, and every other test should not have
+    to care that the column exists.
+
+    **This is the sixth time a new constraint has broken correct tests for a
+    reason none of them was about**, and each time the cause is the same —
+    the helper knew less about the schema than the schema did. Centralising
+    the "satisfy everything else" knowledge here is what keeps the count from
+    rising faster.
     """
     merged: dict[str, object] = {
         "status": IngestionStatus.PROCESSING,
@@ -75,6 +95,11 @@ def make_job(**overrides: object) -> IngestionJob:
             "lease_expires_at",
             datetime.now(timezone.utc) + timedelta(seconds=60),
         )
+
+    # Conditional, not a flat default: a kind without an error violates the
+    # constraint just as surely as an error without a kind.
+    if merged.get("error") is not None:
+        merged.setdefault("failure_kind", FailureKind.TRANSIENT)
 
     return IngestionJob(**merged)
 
@@ -209,7 +234,7 @@ async def test_a_terminal_job_must_have_a_finish_time(
     await session.flush()
 
     session.add(
-        IngestionJob(
+        make_job(
             document_id=document.id,
             status=status,
             error="something went wrong",
@@ -470,7 +495,7 @@ async def test_a_job_past_queued_must_have_a_start_time(
     await session.flush()
 
     session.add(
-        IngestionJob(
+        make_job(
             document_id=document.id,
             status=status,
             started_at=None,
@@ -652,7 +677,12 @@ async def test_only_a_processing_job_may_hold_a_lease(
     await session.flush()
 
     session.add(
-        IngestionJob(
+        # Through the helper, even though every field is overridden here: its
+        # `setdefault`s yield to explicit values, so the lease this case
+        # deliberately forces onto a non-`processing` row survives, while
+        # `failure_kind` is still filled in for the parameter set that carries
+        # an error. That is what keeps the docstring's promise above true.
+        make_job(
             document_id=document.id,
             status=status,
             # **Both timestamps come from the database clock.** Using a Python
@@ -800,3 +830,175 @@ async def test_the_database_and_python_agree_on_a_hash(
     ).scalar_one()
 
     assert from_postgres == hashlib.sha256(content).hexdigest()
+
+
+# ── Failure classification (stage 2.3) ───────────────────────────────────────
+
+
+async def test_an_error_without_a_kind_is_refused(session: AsyncSession) -> None:
+    """`ck_ingestion_jobs_failure_kind_matches_error`, first half.
+
+    Recording *that* something failed without recording *whether it could
+    succeed* is the state stage 2.3 exists to abolish. It is also the state
+    every row was in before this stage, which is why the migration has a
+    backfill.
+
+    The constraint is what makes the classification non-optional: a caller
+    adding a new failure path cannot forget the kind, because the write fails.
+    """
+    document = make_document()
+    session.add(document)
+    await session.flush()
+
+    session.add(
+        IngestionJob(
+            document_id=document.id,
+            status=IngestionStatus.FAILED,
+            started_at=func.now(),
+            finished_at=func.now(),
+            error="not a PDF",
+            failure_kind=None,
+        )
+    )
+
+    with pytest.raises(IntegrityError, match="failure_kind_matches_error"):
+        await session.flush()
+
+
+async def test_a_kind_without_an_error_is_refused(session: AsyncSession) -> None:
+    """The same constraint, the other way, and it is not symmetry for its own sake.
+
+    A kind with no error is a classification of nothing. It would render in
+    the UI as a failure with no explanation — worse than either column being
+    absent, because the row *looks* informative.
+
+    `done` is used deliberately: this must be refused on a job that succeeded
+    just as firmly as on one that failed.
+    """
+    document = make_document()
+    session.add(document)
+    await session.flush()
+
+    session.add(
+        make_job(
+            document_id=document.id,
+            status=IngestionStatus.DONE,
+            finished_at=func.now(),
+            error=None,
+            failure_kind=FailureKind.PERMANENT,
+        )
+    )
+
+    with pytest.raises(IntegrityError, match="failure_kind_matches_error"):
+        await session.flush()
+
+
+async def test_an_unknown_failure_kind_is_rejected(session: AsyncSession) -> None:
+    """`ck_ingestion_jobs_failure_kind_allowed`.
+
+    The same argument as `status_allowed`: a VARCHAR with a CHECK rather than
+    a native Postgres enum, so adding a third kind later — if 7.1 ever
+    justifies `rate_limited` as its own thing — is an ordinary migration
+    inside a transaction.
+
+    Raw SQL, because the ORM's `Enum` type would reject the value in Python
+    before it ever reached the database, and what is being tested is that the
+    *database* refuses it. A migration or a `psql` session has no such type.
+    """
+    document = make_document()
+    session.add(document)
+    await session.flush()
+
+    with pytest.raises(IntegrityError, match="failure_kind_allowed"):
+        await session.execute(
+            text(
+                "INSERT INTO ingestion_jobs "
+                "  (id, document_id, status, started_at, finished_at, error, "
+                "   failure_kind, attempts) "
+                "VALUES (:id, :doc, 'failed', now(), now(), 'something broke', "
+                "        'maybe', 1)"
+            ),
+            {"id": new_id(), "doc": document.id},
+        )
+
+
+async def test_a_waiting_job_may_carry_a_kind(session: AsyncSession) -> None:
+    """The reason the constraint is tied to `error` and not to `status`.
+
+    A requeued job is `queued` and carries the error that sent it back. It
+    must be able to carry the kind too — otherwise the client can only say
+    "retrying", when the useful sentence is *why*: "retrying after a provider
+    outage" deserves patience in a way that "retrying a file that will never
+    parse" does not.
+
+    Had the constraint read `(status = 'failed') = (failure_kind IS NOT NULL)`
+    this row would be illegal, and the distinction would exist only on jobs
+    that had already given up — which is exactly when it stops being useful.
+    """
+    document = make_document()
+    session.add(document)
+    await session.flush()
+
+    session.add(
+        make_job(
+            document_id=document.id,
+            status=IngestionStatus.QUEUED,
+            started_at=None,
+            error="the agent did not respond",
+            failure_kind=FailureKind.TRANSIENT,
+            attempts=2,
+        )
+    )
+    await session.commit()
+
+    fetched = (
+        await session.execute(
+            select(IngestionJob).where(IngestionJob.document_id == document.id)
+        )
+    ).scalar_one()
+
+    assert fetched.status is IngestionStatus.QUEUED
+    assert fetched.failure_kind is FailureKind.TRANSIENT
+
+
+async def test_the_kind_round_trips_as_its_value_not_its_name(
+    session: AsyncSession,
+) -> None:
+    """The column holds `transient`, not `TRANSIENT`.
+
+    SQLAlchemy's `Enum` persists the member's **name** unless told otherwise,
+    and omitting `values_callable` here was a real bug during this stage: every
+    write produced uppercase strings and `failure_kind_allowed` rejected all of
+    them. `status` has carried the same line since 1.2.
+
+    Asserted through raw SQL rather than the ORM, because the ORM converts in
+    both directions and would agree with itself whatever is stored. What
+    matters is what a human running `psql` — or the migration's own `CASE` —
+    will see.
+    """
+    document = make_document()
+    session.add(document)
+    await session.flush()
+
+    session.add(
+        make_job(
+            document_id=document.id,
+            status=IngestionStatus.FAILED,
+            finished_at=func.now(),
+            error="not a PDF",
+            failure_kind=FailureKind.PERMANENT,
+        )
+    )
+    await session.commit()
+
+    stored = (
+        await session.execute(
+            text(
+                "SELECT failure_kind FROM ingestion_jobs "
+                " WHERE document_id = :doc"
+            ),
+            {"doc": document.id},
+        )
+    ).scalar_one()
+
+    assert stored == "permanent", f"stored as {stored!r}, not its value"

@@ -34,7 +34,7 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.db.models import new_id
+from app.db.models import FailureKind, new_id
 from app.repositories.documents import DocumentRepository
 
 CONTENT = b"%PDF-1.7 lease handover probe"
@@ -229,7 +229,10 @@ async def test_a_stale_worker_cannot_fail_a_job_someone_else_is_running(
         async with factory() as session:
             repo = DocumentRepository(session)
             stale = await repo.mark_job_failed(
-                a.job_id, a.lease_token, error="A thinks this failed"
+                a.job_id,
+                a.lease_token,
+                error="A thinks this failed",
+                failure_kind=FailureKind.TRANSIENT,
             )
             await session.commit()
 
