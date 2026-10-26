@@ -11,6 +11,12 @@ which is what keeps `rag` free of any chat-model dependency — and what lets th
 stage 3.1 harness import this module and measure retrieval with no LLM anywhere
 in the measurement path.
 
+**`ingest` is idempotent from stage 2.2.** Running it twice for the same
+document id leaves the index in the same state as running it once: point ids
+are derived from `(document_id, chunk_index)`, so the second run overwrites the
+first rather than adding to it, and anything the document previously held under
+other ids is pruned. That is what makes 2.1's at-least-once retries safe.
+
 **`ingest` does not mint the document id.** Identity belongs to whoever owns the
 durable record of the document, and that is not this library. At stage 1.1 the
 agent generates a uuid4 and passes it down; at stage 1.2 Postgres creates the
@@ -25,7 +31,12 @@ from rag.errors import NoTextExtractedError
 from rag.extraction import extract_pages
 from rag.models import IngestResult, RetrievedChunk
 from rag.providers.base import get_embedding_model
-from rag.vector_store import ensure_collection, search, upsert_chunks
+from rag.vector_store import (
+    delete_chunks_except,
+    ensure_collection,
+    search,
+    upsert_chunks,
+)
 
 
 def ingest(data: bytes, *, document_id: str, filename: str) -> IngestResult:
@@ -91,12 +102,31 @@ def ingest(data: bytes, *, document_id: str, filename: str) -> IngestResult:
     model = get_embedding_model()
     vectors = model.embed_documents([chunk.text for chunk in chunks])
 
-    upsert_chunks(
+    point_ids = upsert_chunks(
         chunks,
         vectors,
         embedding_model=model.model_name,
         embedding_dim=model.dimensions,
     )
+
+    # ── The other half of replacing a document - stage 2.2 ────────────────────
+    #
+    # The upsert above wrote one point per chunk under an id derived from
+    # (document_id, chunk_index), so a repeat of this run overwrites rather
+    # than appends. That alone is what 2.1's at-least-once delivery needed.
+    #
+    # It does not touch points this document has under *other* ids: chunks
+    # from a longer previous run, or - as the stage's own measurement showed -
+    # chunks written before the ids were derived at all. Pruning everything
+    # that is not one of `point_ids` covers both, and makes the guarantee
+    # unconditional: after this returns, the store holds exactly these chunks
+    # for this document.
+    #
+    # After the upsert, never before. Deleting first would leave the document
+    # unsearchable until the write landed - and if embedding failed in
+    # between, permanently absent. Duplicate chunks are a bad outcome;
+    # silently losing a working document is a worse one.
+    delete_chunks_except(document_id, keep_ids=point_ids)
 
     return IngestResult(
         document_id=document_id,

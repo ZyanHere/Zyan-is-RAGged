@@ -62,6 +62,26 @@ def test_chunk_index_is_sequential_across_the_whole_document(
 
     Stage 2.2 derives deterministic point ids from `(document_id, chunk_index)`,
     so a repeat would collide and silently overwrite a different chunk.
+
+    The half that `vector_store.py` depends on is **no repeats**. Two chunks
+    of one document sharing an index would derive the same point id, and one
+    would silently overwrite the other — losing text while the index still
+    looked healthy.
+
+    `== list(range(len(chunks)))` asserts both halves at once: every index
+    appears, and none repeats.
+
+    ── A dependency this test briefly had and no longer does ─────────────────
+
+    The first version of the replacement logic deleted `chunk_index >= n`, so
+    it needed *contiguity from 0* as well — a gap would have left orphans. The
+    stage's measurement showed that whole approach could not reach points
+    written under the old random-id scheme, and it was replaced by pruning
+    everything that is not one of the ids just written.
+
+    That version needs nothing from this module at all. Worth noting because
+    the stronger fix removed a cross-module coupling rather than adding one,
+    which is unusual enough to be worth saying out loud.
     """
     chunks = chunk_pages(pages, chunk_size=200, chunk_overlap=40, **KWARGS)
     assert [chunk.chunk_index for chunk in chunks] == list(range(len(chunks)))
@@ -105,6 +125,13 @@ def test_blank_pages_are_skipped_without_producing_empty_chunks() -> None:
 
     assert {chunk.page for chunk in chunks} == {1, 3}
     assert all(chunk.text.strip() for chunk in chunks)
+
+    # The one place a contiguous counter could plausibly go wrong: the index
+    # must follow the chunks that exist, not the pages that were walked. If a
+    # skipped page reset or reused a number, two chunks would derive the same
+    # point id and one would overwrite the other — and a document with a blank
+    # page is most scanned documents.
+    assert [chunk.chunk_index for chunk in chunks] == list(range(len(chunks)))
 
 
 def test_no_pages_yields_no_chunks() -> None:
