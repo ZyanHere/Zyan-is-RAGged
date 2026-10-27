@@ -416,6 +416,42 @@ class IngestionJob(Base):
         nullable=False,
     )
 
+    request_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    """The API request that created this attempt. Stage 2.4.
+
+    ── Why it is a column and not only a log field ────────────────────────────
+
+    The worker learns about a job by claiming a row. There is no other channel
+    from the API to the worker — no message body, no header, no shared memory —
+    so for the worker to log the id the API generated, the id has to be *in the
+    row*.
+
+    That is a consequence of 1.3's design: the queue is a table, and a table is
+    the only thing both processes can see.
+
+    ── Why on the job and not on the document ────────────────────────────────
+
+    A retry creates a **new job** carrying the **retry request's** id, so every
+    attempt is traceable to the request that caused it. On `documents` it would
+    record the first upload forever, and the one attempt you were trying to
+    explain — the third retry, at 3am — would point at a request from a week
+    earlier.
+
+    ── Why nullable, with no backfill ────────────────────────────────────────
+
+    Every job written before this stage genuinely has no request to attribute
+    it to. The 2.3 migration inferred `failure_kind` from message text because
+    the alternative was weakening a constraint for all future rows; here there
+    is no constraint and nothing to infer, so the honest value is NULL.
+
+    `String(64)` rather than `Text` for the same reason as `content_hash`: the
+    length is bounded by the middleware that produces it, and bounding it in
+    the schema is what stops an inbound header from writing an arbitrarily
+    large value into every log line.
+    """
+
     queued_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )

@@ -11,15 +11,19 @@ those land in a place that already exists.
 """
 
 import logging
-from collections.abc import AsyncIterator
+import re
+import uuid
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.routes import documents, health, query
+from app.api.routes import documents, health, query, stats
 from app.core.config import get_settings
+from app.core.logging import configure_logging, request_id_var
 from app.db.session import create_database, verify_connectivity
 from app.errors import (
     AgentUnavailableError,
@@ -29,6 +33,19 @@ from app.errors import (
     NotFoundError,
     UploadTooLargeError,
 )
+
+# At import, not in `lifespan`.
+#
+# uvicorn imports this module and only then starts the server, so configuring
+# here means the very first line this process emits is already handled —
+# including anything that fails during `lifespan` itself. Doing it inside
+# `lifespan` would leave the window where a startup failure is reported
+# through `logging.lastResort`, which is the one moment it matters most.
+#
+# It is also why this is safe to do at import where the database engine is
+# deliberately not: logging has no event loop to bind to and nothing to
+# dispose.
+configure_logging()
 
 logger = logging.getLogger(__name__)
 
@@ -86,17 +103,110 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+REQUEST_ID_HEADER = "X-Request-ID"
+
+SAFE_REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+"""What an inbound request id is allowed to look like.
+
+**This is a log-injection guard, not tidiness.** The id is written into every
+log line for the request and into a database column, so an unvalidated header
+lets a caller write our observations for us.
+
+── What this actually protects against, checked rather than assumed ──────────
+
+**Length and charset.** A 200-character inbound id is replaced with a generated
+one; verified live. Nothing else bounds it — `String(64)` would truncate or
+raise at the database, which is far too late to be the first line of defence.
+
+**Not, primarily, newlines.** The obvious threat is a value containing CRLF,
+closing the current log line and forging a convincing `ERROR` of its own. Over
+HTTP/1.1 that does not reach us: h11 parses `X-Request-ID: evil
+
+X-Injected:
+yes` as *two headers*, so the application sees `evil`. Tested with a raw
+socket.
+
+The pattern still refuses newlines, because the guard should not depend on
+which parser happens to be in front of it — but claiming CRLF is what it is
+*for* would overstate it. Length and charset are what it uniquely buys.
+
+Anything that does not match is ignored and a fresh id is generated. Rejecting
+the request instead would be worse: a malformed correlation header is not a
+reason to refuse to index someone's document.
+"""
+
+
+@app.middleware("http")
+async def attach_request_id(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
+    """Give every request an id, and put it where the logs can find it.
+
+    ── Why an inbound header is honoured at all ──────────────────────────────
+
+    So that a gateway, a load balancer or a calling service that already
+    assigned an id wins. If this always generated its own, the id in our logs
+    would be unrelated to the id in theirs, and correlation would stop at our
+    front door — which is the one place it is most often needed.
+
+    Nothing upstream sets it today. Accepting it costs one regex and means the
+    day something does, nothing has to change here.
+
+    ── Why the id is set on a `ContextVar` and not passed down ───────────────
+
+    A logging filter reads it, so no call site mentions it. `services/` and
+    `repositories/` have no idea a request id exists, which is the point: a
+    value threaded by hand through every signature goes missing from exactly
+    the line you needed.
+
+    ── Why the token is reset ────────────────────────────────────────────────
+
+    `ContextVar` values are per-context, and anyio reuses the task that runs
+    this. Without the reset, a request that finished could leave its id
+    visible to whatever runs next on that task — so a log line would carry a
+    correlation id for an unrelated request, which is worse than carrying
+    none.
+    """
+    inbound = request.headers.get(REQUEST_ID_HEADER)
+    request_id = (
+        inbound
+        if inbound and SAFE_REQUEST_ID.match(inbound)
+        # Twelve hex characters, not a full UUID. It is read by humans in log
+        # lines and typed into `grep`; 48 bits is ample to separate the
+        # requests alive at one moment, which is all correlation needs.
+        else uuid.uuid4().hex[:12]
+    )
+
+    token = request_id_var.set(request_id)
+    try:
+        response = await call_next(request)
+    finally:
+        request_id_var.reset(token)
+
+    # On the response so a caller can quote it in a bug report, and so the
+    # frontend can show it. See `expose_headers` below — without that, a
+    # browser can read this header only on a same-origin response.
+    response.headers[REQUEST_ID_HEADER] = request_id
+    return response
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=get_settings().allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Without this the header above is set and **invisible to the browser**.
+    # CORS hides every response header except a short safelist, so JavaScript
+    # reading `X-Request-ID` would get `null` with no error anywhere — the
+    # same shape of silent failure this whole stage is about.
+    expose_headers=[REQUEST_ID_HEADER, "Location"],
 )
 
 app.include_router(health.router)
 app.include_router(documents.router)
 app.include_router(query.router)
+app.include_router(stats.router)
 
 
 # ── Failures ──────────────────────────────────────────────────────────────────

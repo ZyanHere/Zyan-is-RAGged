@@ -67,6 +67,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 
 from app.core.config import Settings, get_settings
+from app.core.logging import configure_logging, request_id_var
 from app.db.session import Database, create_database, session_scope, verify_connectivity
 from app.repositories.documents import (
     ClaimedJob,
@@ -210,25 +211,46 @@ async def process_one(
         # says `processing` to every other process, and the row lock is gone.
         await session.commit()
 
-    logger.info(
-        "claimed job_id=%s document_id=%s attempt=%d",
-        claimed.job_id,
-        claimed.document_id,
-        claimed.attempts,
-    )
+    # ── Wear the request's id for the rest of this job — stage 2.4 ───────────
+    #
+    # Set *after* the claim, because the claim is what reveals which request
+    # this work belongs to, and *before* the first log line about it, so the
+    # "claimed" line below already carries it.
+    #
+    # Everything downstream — `process_job`, the heartbeat's renewals, the
+    # agent client, SQLAlchemy's own logging — is inside this block, so every
+    # record produced while the job runs carries the id without a single
+    # logging call being changed. That is the argument for a `ContextVar` over
+    # a parameter: a value threaded by hand goes missing from exactly the line
+    # that mattered.
+    #
+    # Reset in `finally`: the worker loop reuses this task for the next job,
+    # and a stale id is worse than none — it would attribute one document's
+    # failure to another document's request, sending whoever is reading the
+    # logs to the wrong story.
+    token = request_id_var.set(claimed.request_id)
+    try:
+        logger.info(
+            "claimed job_id=%s document_id=%s attempt=%d",
+            claimed.job_id,
+            claimed.document_id,
+            claimed.attempts,
+        )
 
-    async with _heartbeat(database, claimed, settings):
-        async with session_scope(database.session_factory) as session:
-            repository = DocumentRepository(session)
-            service = IngestionService(session, repository, agent)
-            await service.process_job(
-                claimed,
-                RetryPolicy(
-                    max_attempts=settings.max_attempts,
-                    base_seconds=settings.retry_base_seconds,
-                    max_delay_seconds=settings.max_delay_seconds,
-                ),
-            )
+        async with _heartbeat(database, claimed, settings):
+            async with session_scope(database.session_factory) as session:
+                repository = DocumentRepository(session)
+                service = IngestionService(session, repository, agent)
+                await service.process_job(
+                    claimed,
+                    RetryPolicy(
+                        max_attempts=settings.max_attempts,
+                        base_seconds=settings.retry_base_seconds,
+                        max_delay_seconds=settings.max_delay_seconds,
+                    ),
+                )
+    finally:
+        request_id_var.reset(token)
 
     return True
 
@@ -351,20 +373,14 @@ async def main() -> None:
     dead database and discovers it on the first job looks like a job problem
     rather than an infrastructure one.
     """
-    # Without this the worker prints nothing at all.
+    # Without this the worker prints nothing at all — the root logger has no
+    # handler, so `logging.lastResort` passes only WARNING and above.
     #
-    # Python's root logger has no handler, so `logging.lastResort` passes only
-    # WARNING and above — the same reason every `logger.info` in this codebase
-    # has been silently discarded. For the API that is merely unhelpful; for a
-    # process whose entire observable behaviour is its log, it makes the thing
-    # unusable.
-    #
-    # This is a floor, not a design. Structured JSON logs with a `request_id`
-    # threaded from the API are stage 2.4, and they replace this line.
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
-    )
+    # **Stage 2.4 replaced the `basicConfig` that used to be here**, exactly as
+    # the comment on it predicted. The format is unchanged for a terminal; what
+    # is new is that the API configures the *same* logging, so a request id is
+    # greppable across both processes.
+    configure_logging()
 
     settings = get_settings()
     database = create_database(settings)

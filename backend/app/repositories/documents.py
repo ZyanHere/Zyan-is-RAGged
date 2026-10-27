@@ -28,7 +28,7 @@ from uuid import UUID
 
 import uuid
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import func, or_, select, text, update
 from sqlalchemy.dialects.postgresql import distinct_on
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
@@ -80,6 +80,78 @@ class ReapResult(NamedTuple):
         return self.requeued + self.abandoned
 
 
+class IngestionStats(NamedTuple):
+    """One snapshot of how ingestion is doing. Stage 2.4.
+
+    ── Why these are read and not counted ────────────────────────────────────
+
+    The roadmap asked for "counters for jobs by state, a histogram for job
+    duration, a gauge for queue depth". All three are already durable facts,
+    because stage 1.3 made the queue a **table** — so a counter would be a
+    cached, partial copy of something Postgres can answer exactly.
+
+    "Partial" is the word that settles it. A counter lives in one process. Run
+    two workers and each has its own; sum them and a queue-depth gauge counts
+    the same rows twice. The only correct source for a fact about the queue is
+    the queue.
+
+    What is genuinely *not* here, and so needs instrumenting when something
+    aggregates: API request rate and duration per endpoint, and agent-call
+    latency separately from total job duration. Both are stage 10.1's work.
+    """
+
+    claimable: int
+    """Queued and claimable **now** — the real backlog."""
+
+    waiting_for_retry: int
+    """Queued, but held back by `next_attempt_at`. Stage 2.1's backoff.
+
+    Separate from `claimable` deliberately. Lumped together they would say
+    "eight jobs waiting" when nothing is wrong and nothing is stuck: those
+    eight are deliberately asleep. Reading that as a backlog is how someone
+    goes looking for a worker that is not missing.
+    """
+
+    in_flight: int
+    done: int
+    failed: int
+
+    failed_permanent: int
+    failed_transient: int
+    """The dead-letter list, split by stage 2.3's classification.
+
+    The split is the actionable part. A pile of `permanent` failures is a
+    corpus problem — someone is uploading scans. A pile of `transient` ones is
+    an infrastructure problem, and every one of them is worth replaying.
+    """
+
+    oldest_queued_age_seconds: float | None
+    """How long the longest-waiting queued job has been waiting.
+
+    **The number that distinguishes a busy system from a stopped one**, and
+    the reason depth alone is not enough. A queue of 300 draining steadily is
+    healthy; a queue of 3 that has not moved in an hour is an outage. Depth
+    reports the first as worse.
+
+    `None` when nothing is queued.
+    """
+
+    duration_p50_seconds: float | None
+    duration_p95_seconds: float | None
+    """Percentiles over `finished_at - started_at` for successful jobs.
+
+    From `percentile_cont`, which interpolates over the real distribution —
+    where an in-process histogram would need buckets guessed in advance, and
+    guessing them wrong is invisible until the day the answer matters.
+
+    **Over all history**, which is the floor rather than the goal: as the
+    table grows these stop describing *now*. The trigger for windowing them is
+    the first time someone looks at p95 and cannot tell whether it reflects
+    today. Deferred rather than guessed at, because the useful window is a
+    thing to learn from use.
+    """
+
+
 class ClaimedJob(NamedTuple):
     """What a worker gets when it successfully claims a job. Stage 1.3.
 
@@ -113,6 +185,23 @@ class ClaimedJob(NamedTuple):
     the moment of failure, when another query would be one more thing to fail.
     """
 
+    request_id: str | None
+    """The API request that created this attempt. Stage 2.4.
+
+    **The whole correlation mechanism arrives here.** The API wrote this on the
+    row; the claim reads it back; the worker sets it on a `ContextVar` for the
+    duration of the job. Every line the worker then logs carries the id the API
+    minted, and `grep` spans both processes.
+
+    On the claim rather than fetched afterwards for the same reason as
+    `attempts`: it comes back from the `UPDATE … RETURNING` that *performed*
+    the claim, so it is true by construction. A second read could see a
+    different row — one a reaper had already given to someone else.
+
+    `None` for every job written before 2.4, and for anything created outside a
+    request.
+    """
+
 
 class DocumentRepository:
     """Persistence for documents and their ingestion attempts."""
@@ -129,6 +218,7 @@ class DocumentRepository:
         content: bytes,
         content_type: str | None,
         content_hash: str,
+        request_id: str | None,
     ) -> tuple[Document, IngestionJob]:
         """Record that a document exists and that we are about to index it.
 
@@ -192,6 +282,10 @@ class DocumentRepository:
             # SQLAlchemy would otherwise omit it from the INSERT. Passing None
             # is what writes NULL — see the column's docstring.
             started_at=None,
+            # Stage 2.4. Required rather than defaulted, for the same reason
+            # `failure_kind` is: a caller that forgets produces a job nobody
+            # can trace, and the gap is invisible until an incident.
+            request_id=request_id,
         )
         upload = DocumentUpload(document=document, content=content)
 
@@ -203,7 +297,7 @@ class DocumentRepository:
         return document, job
 
     async def create_job_for_document(
-        self, document_id: UUID
+        self, document_id: UUID, *, request_id: str | None
     ) -> IngestionJob:
         """Queue another attempt at a document that already exists. Stage 2.2.
 
@@ -254,6 +348,11 @@ class DocumentRepository:
             # INSERT unless told, and `queued` with a `started_at` violates
             # `ck_ingestion_jobs_started_at_matches_status`.
             started_at=None,
+            # **This attempt's request, not the document's first.** A replay
+            # from the dead-letter list carries the id of the request that
+            # asked for the replay, which is what makes "why did attempt three
+            # happen?" answerable.
+            request_id=request_id,
         )
         self._session.add(job)
         await self._session.flush()
@@ -369,6 +468,7 @@ class DocumentRepository:
                     IngestionJob.document_id,
                     IngestionJob.lease_token,
                     IngestionJob.attempts,
+                    IngestionJob.request_id,
                 )
             )
         ).one_or_none()
@@ -381,6 +481,7 @@ class DocumentRepository:
             document_id=claimed.document_id,
             lease_token=claimed.lease_token,
             attempts=claimed.attempts,
+            request_id=claimed.request_id,
         )
 
     async def renew_lease(
@@ -871,6 +972,90 @@ class DocumentRepository:
         )
         row = result.first()
         return (row[0], row[1]) if row else None
+
+    async def ingestion_stats(self) -> IngestionStats:
+        """Everything "is ingestion healthy?" needs, in one round trip.
+
+        ── Why one statement and not several ─────────────────────────────────
+
+        Not for speed — these are cheap. For **consistency**: separate queries
+        see different instants, so a job can be counted as `queued` by the
+        first and as `processing` by the second, and the totals disagree with
+        each other in a way that looks like a bug in the counting rather than
+        a job doing its work.
+
+        One statement is one snapshot.
+
+        ── `FILTER` rather than `CASE WHEN … THEN 1 END` ─────────────────────
+
+        Same result, and `FILTER` says what it means: it applies to the
+        aggregate rather than hiding the condition inside the value being
+        aggregated. It also works on `percentile_cont`, which the `CASE` form
+        does not do cleanly for an ordered-set aggregate.
+
+        ── Raw SQL, which this file otherwise avoids ─────────────────────────
+
+        The ORM has no expression for an ordered-set aggregate with a filter,
+        and writing one through `func.percentile_cont(...).within_group(...)`
+        produces something longer and harder to read than the SQL it emits.
+        The query is also the thing stage 10.1's Prometheus collector will
+        call, so it is better off legible.
+        """
+        row = (
+            await self._session.execute(
+                text(
+                    """
+                    SELECT
+                      count(*) FILTER (
+                        WHERE status = 'queued'
+                          AND (next_attempt_at IS NULL OR next_attempt_at <= now())
+                      ) AS claimable,
+                      count(*) FILTER (
+                        WHERE status = 'queued' AND next_attempt_at > now()
+                      ) AS waiting_for_retry,
+                      count(*) FILTER (WHERE status = 'processing') AS in_flight,
+                      count(*) FILTER (WHERE status = 'done')       AS done,
+                      count(*) FILTER (WHERE status = 'failed')     AS failed,
+                      count(*) FILTER (
+                        WHERE status = 'failed' AND failure_kind = 'permanent'
+                      ) AS failed_permanent,
+                      count(*) FILTER (
+                        WHERE status = 'failed' AND failure_kind = 'transient'
+                      ) AS failed_transient,
+                      max(extract(epoch FROM (now() - queued_at)))
+                        FILTER (WHERE status = 'queued') AS oldest_queued_age,
+                      percentile_cont(0.5) WITHIN GROUP (
+                        ORDER BY extract(epoch FROM (finished_at - started_at))
+                      ) FILTER (WHERE status = 'done') AS p50,
+                      percentile_cont(0.95) WITHIN GROUP (
+                        ORDER BY extract(epoch FROM (finished_at - started_at))
+                      ) FILTER (WHERE status = 'done') AS p95
+                    FROM ingestion_jobs
+                    """
+                )
+            )
+        ).one()
+
+        return IngestionStats(
+            claimable=row.claimable,
+            waiting_for_retry=row.waiting_for_retry,
+            in_flight=row.in_flight,
+            done=row.done,
+            failed=row.failed,
+            failed_permanent=row.failed_permanent,
+            failed_transient=row.failed_transient,
+            oldest_queued_age_seconds=(
+                float(row.oldest_queued_age)
+                if row.oldest_queued_age is not None
+                else None
+            ),
+            duration_p50_seconds=(
+                float(row.p50) if row.p50 is not None else None
+            ),
+            duration_p95_seconds=(
+                float(row.p95) if row.p95 is not None else None
+            ),
+        )
 
     async def get_job(self, job_id: UUID) -> IngestionJob | None:
         """One attempt by id, as the database currently has it.

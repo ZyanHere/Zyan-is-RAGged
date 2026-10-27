@@ -52,16 +52,21 @@ the agent's status code — 4xx permanent, 5xx and no-response transient, with
 429 carved out — so a document that can never be indexed stops at attempt one
 while a document caught by an outage gets minutes. See `classify`.
 
+**Stage 2.4** made all of it visible. Both processes configure the same
+logging, so the `logger.info` calls below — the accept, the dedupe decision,
+the retry request — reach a handler for the first time; before it, every one of
+them was discarded in the API process while working fine in the worker. Each
+also carries the `request_id` of the request that caused the work, put there by
+a filter rather than by any call site here.
+
 ── What this still deliberately does not fix ───────────────────────────────────
 
-**None of it is observable from outside.** There is no counter for jobs by
-state, no histogram of how long one takes, and every `logger.info` in this
-process is discarded — uvicorn installs no root handler, so `logging.lastResort`
-passes only WARNING and above. The `logger.warning` calls below are the entire
-operational surface of this file, and they reach a terminal nobody is watching.
+**Nothing aggregates.** `GET /stats` answers "how is the pipeline doing?" when
+someone asks, and there is no history, no rate and no alert when the answer
+gets worse. A snapshot is a thing you have to think to look at.
 
-That is stage 2.4's trigger, and unlike the previous two it is already
-`[measured]` rather than waiting to be produced.
+That is stage 10.1's trigger, and the gap is deliberate: a rate is only worth
+emitting once something stores and graphs it.
 
 ── `IngestOutcome` is gone ─────────────────────────────────────────────────────
 
@@ -94,6 +99,7 @@ from app.db.models import (
     IngestionJob,
     IngestionStatus,
 )
+from app.core.logging import request_id_var
 from app.errors import AgentUnavailableError, ConflictError, NotFoundError
 from app.repositories.documents import ClaimedJob, DocumentRepository
 from app.schemas.documents import DocumentRead
@@ -444,6 +450,11 @@ class IngestionService:
                     content=content,
                     content_type=content_type,
                     content_hash=content_hash,
+                    # Read here rather than taken as a parameter: the id
+                    # belongs to the request, and the request is ambient. A
+                    # parameter would put it in the signature of every method
+                    # between the route and the row.
+                    request_id=request_id_var.get(),
                 )
         except IntegrityError:
             # Re-read rather than inspect the exception. If the hash is present
@@ -518,7 +529,9 @@ class IngestionService:
                 DocumentRead.from_rows(document, job), queued=False
             )
 
-        retry = await self._repository.create_job_for_document(document.id)
+        retry = await self._repository.create_job_for_document(
+            document.id, request_id=request_id_var.get()
+        )
         await self._session.commit()
 
         logger.info(
@@ -583,7 +596,9 @@ class IngestionService:
                 f"current one to finish."
             )
 
-        retry = await self._repository.create_job_for_document(document.id)
+        retry = await self._repository.create_job_for_document(
+            document.id, request_id=request_id_var.get()
+        )
         await self._session.commit()
 
         logger.info(
