@@ -781,3 +781,93 @@ async def test_the_reaper_does_not_disturb_a_working_worker(
         assert job.attempts == 1, "the job must not have been done twice"
     finally:
         await cleanup(database, [document_id])
+
+
+# ── Correlation across the process boundary (stage 2.4) ──────────────────────
+
+
+async def test_the_worker_wears_the_requests_id_while_it_works(
+    database: Database,
+) -> None:
+    """**The stage's headline, as a test.**
+
+    The API minted an id and wrote it on the row. The worker claims the row in
+    a different process, and from that moment every line it logs must carry
+    that id — without any logging call being changed, because a value threaded
+    by hand goes missing from exactly the line that mattered.
+
+    Asserted on the `ContextVar` seen *by the agent client*, which is as deep
+    as this job's call stack goes. If the id is visible there it is visible to
+    the logging filter, which runs on the handler above everything.
+    """
+    from app.core.logging import request_id_var
+
+    seen: list[str | None] = []
+
+    class ObservingAgent(FakeAgent):
+        async def ingest_document(self, **kwargs) -> tuple[int, dict]:
+            # Deep inside the job: the id must already be in scope here.
+            seen.append(request_id_var.get())
+            return await super().ingest_document(**kwargs)
+
+    token = request_id_var.set("req-from-the-api")
+    try:
+        document_id = await accept(database)
+    finally:
+        request_id_var.reset(token)
+
+    try:
+        assert await process_one(database, SETTINGS, ObservingAgent()) is True
+
+        assert seen == ["req-from-the-api"], (
+            "the worker ran the job without the request's id in scope — every "
+            "line it logged is uncorrelated"
+        )
+    finally:
+        await cleanup(database, [document_id])
+
+
+async def test_the_id_does_not_survive_into_the_next_job(
+    database: Database,
+) -> None:
+    """A stale id is worse than none.
+
+    The worker loop reuses one task for every job. Without the reset, the
+    second job would log under the first job's request id — attributing one
+    document's failure to another document's request, and sending whoever is
+    reading the logs to the wrong story entirely.
+
+    A missing id says "I do not know". A wrong one says something false.
+    """
+    from app.core.logging import request_id_var
+
+    token = request_id_var.set("req-first-upload")
+    try:
+        first = await accept(database, "first.pdf")
+    finally:
+        request_id_var.reset(token)
+
+    # The second upload has no request context at all, as a script or a
+    # scheduler would not.
+    second = await accept(database, "second.pdf")
+
+    try:
+        assert await process_one(database, SETTINGS, FakeAgent()) is True
+        assert request_id_var.get() is None, (
+            "the id leaked out of the job it belonged to"
+        )
+
+        seen: list[str | None] = []
+
+        class ObservingAgent(FakeAgent):
+            async def ingest_document(self, **kwargs) -> tuple[int, dict]:
+                seen.append(request_id_var.get())
+                return await super().ingest_document(**kwargs)
+
+        assert await process_one(database, SETTINGS, ObservingAgent()) is True
+
+        assert seen == [None], (
+            "the second job inherited the first job's request id"
+        )
+    finally:
+        await cleanup(database, [first, second])

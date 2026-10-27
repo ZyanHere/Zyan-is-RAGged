@@ -42,6 +42,7 @@ async def create(
     repo: DocumentRepository,
     filename: str = "zephyr-test.pdf",
     content: bytes | None = None,
+    request_id: str | None = None,
 ):
     """A document, its bytes and a **queued** job — what an upload produces.
 
@@ -71,6 +72,15 @@ async def create(
 
     A test that wants a *duplicate* says so by passing the same `content=`
     twice, which reads as the deliberate choice it is.
+
+    ── `request_id` defaults to None — stage 2.4 ──────────────────────────────
+
+    Not to a generated value. `None` is what the column holds for every job
+    written before 2.4 and for anything a worker or a script creates outside a
+    request, so it is the honest default and the one most tests should see.
+
+    A test about correlation passes one explicitly, which makes the id visible
+    in the test that depends on it rather than hidden in this helper.
     """
     if content is None:
         content = CONTENT + b" " + uuid.uuid4().hex.encode()
@@ -80,6 +90,7 @@ async def create(
         content=content,
         content_type="application/pdf",
         content_hash=hashlib.sha256(content).hexdigest(),
+        request_id=request_id,
     )
 
 
@@ -779,7 +790,7 @@ async def test_the_lookup_returns_the_second_job_not_the_first(
     document, first = await create(repo, content=content)
     await session.commit()
 
-    second = await repo.create_job_for_document(document.id)
+    second = await repo.create_job_for_document(document.id, request_id=None)
     await session.commit()
 
     found = await repo.get_by_content_hash(hashlib.sha256(content).hexdigest())
@@ -865,7 +876,7 @@ async def test_a_second_job_needs_no_second_document_or_blob(
     document, _ = await create(repo)
     await session.commit()
 
-    job = await repo.create_job_for_document(document.id)
+    job = await repo.create_job_for_document(document.id, request_id=None)
     await session.commit()
 
     assert job.status is IngestionStatus.QUEUED
@@ -922,7 +933,7 @@ async def test_a_second_attempt_is_claimable_like_any_other(
     )
     await session.commit()
 
-    second = await repo.create_job_for_document(document.id)
+    second = await repo.create_job_for_document(document.id, request_id=None)
     await session.commit()
 
     reclaimed = await repo.claim_next_queued_job(lease_seconds=LEASE)
@@ -994,7 +1005,7 @@ async def test_the_status_filter_reads_the_latest_job_only(
     assert [d.id for d, _ in dead] == [document.id], "it is dead right now"
 
     # Attempt two succeeds.
-    second = await repo.create_job_for_document(document.id)
+    second = await repo.create_job_for_document(document.id, request_id=None)
     await session.commit()
     reclaimed = await repo.claim_next_queued_job(lease_seconds=LEASE)
     assert reclaimed is not None and reclaimed.job_id == second.id
@@ -1071,3 +1082,69 @@ async def test_the_filter_accepts_every_status(
     for other in (IngestionStatus.PROCESSING, IngestionStatus.DONE,
                   IngestionStatus.FAILED):
         assert await repo.list_documents_with_latest_job(status=other) == []
+
+
+# ── Correlation (stage 2.4) ──────────────────────────────────────────────────
+
+
+async def test_a_replay_carries_the_replay_request_not_the_upload(
+    repo: DocumentRepository, session: AsyncSession
+) -> None:
+    """**The reason `request_id` is on the job and not on the document.**
+
+    One document, two attempts, two requests. If the id lived on `documents`
+    it would record the original upload forever — so the question a replay
+    exists to answer, *"who asked for attempt two and why?"*, would point at a
+    request from days earlier.
+    """
+    document, first = await create(repo, request_id="req-upload")
+    await session.commit()
+
+    second = await repo.create_job_for_document(
+        document.id, request_id="req-replay"
+    )
+    await session.commit()
+
+    assert first.request_id == "req-upload"
+    assert second.request_id == "req-replay"
+    assert second.document_id == document.id, "same document, different request"
+
+
+async def test_a_job_created_outside_a_request_has_no_id(
+    repo: DocumentRepository, session: AsyncSession
+) -> None:
+    """`None` is a legal, meaningful value — not a gap to be filled.
+
+    Jobs written before stage 2.4, and anything a script or a future scheduler
+    creates, have no request to attribute. Generating a placeholder would be
+    worse than the null: it would look like a real id, and whoever searched the
+    logs for it would find nothing with no way to tell whether the lines were
+    missing or the id was invented.
+    """
+    _, job = await create(repo, request_id=None)
+    await session.commit()
+
+    assert job.request_id is None
+async def test_the_claim_returns_the_request_that_created_the_job(
+    repo: DocumentRepository, session: AsyncSession
+) -> None:
+    """The API writes it; the worker must get it back.
+
+    This is the whole mechanism in one test. The queue is a table, so the row
+    is the *only* channel between the two processes — and the claim is an
+    `UPDATE … RETURNING`, so the value the worker receives comes from the
+    statement that performed the claim rather than from a second read that
+    could see a different row.
+    """
+    document, job = await create(repo, request_id="req-upload-1")
+    await session.commit()
+
+    claimed = await repo.claim_next_queued_job(lease_seconds=LEASE)
+
+    assert claimed is not None
+    assert claimed.job_id == job.id
+    assert claimed.request_id == "req-upload-1", (
+        "the worker cannot log the API's request id unless the claim returns it"
+    )
+
+
