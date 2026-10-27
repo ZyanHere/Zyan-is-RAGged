@@ -20,10 +20,19 @@ Two deliberate differences from `agent/app/core/config.py`:
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+_DEFAULT_COLLECTION = "documents"
+"""The collection a normally-configured process writes to.
+
+Named rather than repeated because two validators and a default refer to it,
+and a safeguard that compares against a literal typed twice is a safeguard
+that stops working the day one of them changes.
+"""
 
 
 class Settings(BaseSettings):
@@ -48,9 +57,39 @@ class Settings(BaseSettings):
     )
 
     # ── Embeddings ────────────────────────────────────────────────────────────
-    # No default: a missing key must fail immediately with a named field,
-    # rather than surfacing as a confusing 401 from Google on first upload.
-    google_api_key: str
+
+    embedding_provider: Literal["gemini", "fake"] = "gemini"
+    """Which embedder to build. Stage 2.5.
+
+    **`Literal`, so an unknown value is refused at load** rather than falling
+    through to a default. A typo — `EMBEDDING_PROVIDER=feke` — must not
+    silently give you Gemini and a quota bill during a load test, nor silently
+    give you the fake and an index of meaningless vectors. Both failures are
+    silent in opposite directions, which is the worst kind of pair.
+
+    `"gemini"` is the default and the fake is strictly opt-in. See
+    `_check_fake_provider_is_contained` below for what opting in refuses to do.
+    """
+
+    fake_embed_delay_ms: int = Field(default=0, ge=0)
+    """Milliseconds the fake provider sleeps **per batch of 100 texts**.
+
+    Zero by default, which makes the fake usable as a *fast* deterministic
+    embedder in ordinary tests as well as a slow one in a load test.
+
+    Per batch, not per text, because the real provider costs one round trip per
+    batch — see `providers/fake.py`.
+    """
+
+    # Optional since stage 2.5, and the reason matters: importing `rag` and
+    # running the fake provider must not require a Google API key. A capacity
+    # probe that needs a paid credential to measure queueing would defeat its
+    # own purpose.
+    #
+    # The "fail immediately with a named field" property it used to have is
+    # restored by `_check_gemini_has_a_key` below, with a better message than
+    # pydantic's — one that says which provider needed it.
+    google_api_key: str | None = None
 
     # Changing either of these invalidates every vector already stored and
     # forces a full re-ingest. Both are written into every chunk's payload so a
@@ -69,7 +108,7 @@ class Settings(BaseSettings):
     # and `qdrant_path` is ignored.
     qdrant_url: str | None = None
 
-    qdrant_collection: str = "documents"
+    qdrant_collection: str = _DEFAULT_COLLECTION
 
     # ── Chunking ──────────────────────────────────────────────────────────────
     chunk_size: int = Field(default=1200, gt=0)
@@ -79,6 +118,60 @@ class Settings(BaseSettings):
     # How many chunks retrieval returns. Lives in config rather than as a
     # function default because stage 4.6 tunes it as a measured experiment.
     top_k: int = Field(default=5, gt=0)
+
+    @model_validator(mode="after")
+    def _check_gemini_has_a_key(self) -> Self:
+        """A missing key must fail at load, not as a 401 on the first upload.
+
+        This was pydantic's job until `google_api_key` became optional at 2.5
+        so the fake provider could run without one. Doing it here keeps the
+        early failure and improves the message: pydantic would say the field
+        is required, which is confusing once it is only required *sometimes*.
+        """
+        if self.embedding_provider == "gemini" and not self.google_api_key:
+            raise ValueError(
+                "GOOGLE_API_KEY is required when EMBEDDING_PROVIDER is "
+                "'gemini' (the default). Get one free at "
+                "https://aistudio.google.com/apikey — or set "
+                "EMBEDDING_PROVIDER=fake to run without a provider at all, "
+                "which produces meaningless vectors and is only for load "
+                "testing."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_fake_provider_is_contained(self) -> Self:
+        """The fake provider must never write to the real collection.
+
+        **This is the refusal that matters most**, because the failure it
+        prevents is silent and permanent. Fake vectors are a hash of the text
+        and carry no meaning; mixed into a real index they are
+        indistinguishable from the outside, and nothing goes wrong until
+        somebody asks a question and gets a confident answer assembled from
+        noise.
+
+        Every other safeguard is detective — `model_name` is written into each
+        payload so the damage is *findable* afterwards. This one is
+        preventive, and it is the only one that stops the damage happening.
+
+        Refusing at config load rather than at write time is deliberate: by the
+        time `upsert_chunks` runs, a document has already been read, chunked
+        and embedded, and the failure would arrive after the expensive part. It
+        also means a misconfigured process never starts, rather than starting
+        and failing on its first upload.
+        """
+        if (
+            self.embedding_provider == "fake"
+            and self.qdrant_collection == _DEFAULT_COLLECTION
+        ):
+            raise ValueError(
+                f"EMBEDDING_PROVIDER=fake would write meaningless vectors "
+                f"into '{_DEFAULT_COLLECTION}', which is the default "
+                f"collection and almost certainly holds real documents. Set "
+                f"QDRANT_COLLECTION to something else — 'loadtest' is the "
+                f"convention — before using the fake provider."
+            )
+        return self
 
     @model_validator(mode="after")
     def _check_chunk_geometry(self) -> Self:

@@ -3,7 +3,7 @@
 **What the system is *today*.** Not the destination — `../curriculum.md` has
 that. Updated at the end of every stage, so it is never aspirational.
 
-**Stage:** **2.4 complete. 2.5 not started.**
+**Stage:** **2.5 complete. 3.1 not started** (blocked on a real corpus).
 **Last updated:** 2026-10-27
 
 ## How to read this file
@@ -33,7 +33,7 @@ not the thing is built yet.
 | **2.2** Idempotency | ✅ complete | a doubly-indexed document repaired 9 → 3 points by re-ingestion, then 3 → 3 on a repeat; orphaned points 39 → 0; 5 concurrent uploads of one file → 1 document, one `202` and four `200`; Postgres and Qdrant agree 7/7 |
 | **2.3** Failure classification and the DLQ | ✅ complete | a poison document costs 1 attempt instead of 5; the retry budget measured at 302.1s and 221.1s across two runs, where 22s had been fatal; the dead-letter list distinguishes the two kinds and only the recoverable one offers a retry |
 | **2.4** Seeing inside | ✅ complete | app log lines reaching a handler in the API process 0 → all; one upload traced across both processes by a single `grep`; an induced failure reconstructed from logs with no database access; the health question is one request |
-| **2.5** A provider you can drive | ○ not started | split out of 2.4; carries three measurements deferred since 1.3 |
+| **2.5** A provider you can drive | ✅ complete | the agent's threadpool knee confirmed at exactly 40; `/health` found degraded 438× under load and fixed; async response latency 3.1× better, completion latency 20× worse with one worker |
 
 **Built ahead of its stage, for reasons recorded in the Evolution Map:**
 
@@ -267,7 +267,8 @@ chatbot sits in the measurement path.
 ```text
 ✅ extraction (pypdf, 1-based pages, refuses a PDF with no text layer)
 ✅ chunking (fixed size + overlap, never spanning a page boundary)
-✅ embedding behind a seam (one provider: Gemini; a second arrives at 2.5)
+✅ embedding behind a seam (Gemini, and a `fake` provider for load testing
+   — opt-in, refuses the default collection, labels every vector it writes)
 ✅ indexing and retrieval (Qdrant, embedded mode)
 ○  reranking · context assembly · grounding      (4.x, 17.x)
 ○  evaluation                                    (3.1)

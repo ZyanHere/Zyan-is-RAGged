@@ -253,8 +253,9 @@ will never be built. That is not failure; a map is not a to-do list.
   DONE      2.2   idempotency
   DONE      2.3   failure classification and the dead-letter queue
   DONE      2.4   seeing inside
+  DONE      2.5   a provider you can drive
   ────────────────────────────────────────────────────── you are here
-  NEXT      2.5   a provider you can drive   ← split out of 2.4
+  NEXT      3.1   retrieval metrics       ← blocked: needs a real corpus
             3.1   retrieval metrics       ← blocked: needs a real document corpus
             3.2   failure attribution
             3.3   answer quality gating
@@ -282,10 +283,10 @@ the system's current state is checkable here.
 | **1.2** Persist what happened | **COMPLETE** | Alembic round-trip clean; 3 induced crashes → 3 detectable rows `[measured]`; citation `document_id` === Postgres PK |
 | **1.3** Ingestion out of the request cycle | **COMPLETE** | `202` in 38ms with the agent paused `[measured]`; a worker drained the queue and the citation still resolved to the right page; two claimers proved to take different jobs; one stranded row created deliberately |
 | **2.1** Job lifecycle, leases and retries | **COMPLETE** | 10 real process kills → every document terminal in 9.8s, no intervention `[measured]`; the 1.3 stranded row recovered itself in 25ms; a worker that loses its lease is proved unable to commit |
-| **2.4** Seeing inside | **COMPLETE** | app log lines reaching a handler in the API process **0 → all** `[measured]`; one upload traced across both processes by a single `grep`; an induced failure reconstructed from logs with no database access; the health question is **one request, 18 ms**, down from three queries seeing three different instants |
-| **2.5** A provider you can drive | **NOT STARTED** | split out of 2.4; carries three measurements deferred since 1.3 |
-| **2.3** Failure classification and the DLQ | **COMPLETE** | a poison document costs **1 attempt instead of 5** `[measured]`; the retry budget measured at **302.1s and 221.1s across two runs** (median ~302s, a 37% spread from full jitter), where 22s had been fatal; `outage.pdf`, dead since this stage's trigger, replayed to `done` from the dead-letter list in one click |
 | **2.2** Idempotency | **COMPLETE** | a doubly-indexed document repaired 9 → 3 points by re-ingestion `[measured]`; orphaned points 39 → 0; 5 concurrent uploads of one file → 1 document; Postgres and Qdrant agree 7/7 |
+| **2.3** Failure classification and the DLQ | **COMPLETE** | a poison document costs **1 attempt instead of 5** `[measured]`; the retry budget measured at **302.1s and 221.1s across two runs** (median ~302s, a 37% spread from full jitter), where 22s had been fatal; `outage.pdf`, dead since this stage's trigger, replayed to `done` from the dead-letter list in one click |
+| **2.4** Seeing inside | **COMPLETE** | app log lines reaching a handler in the API process **0 → all** `[measured]`; one upload traced across both processes by a single `grep`; an induced failure reconstructed from logs with no database access; the health question is **one request, 18 ms**, down from three queries seeing three different instants |
+| **2.5** A provider you can drive | **COMPLETE** | the threadpool knee confirmed **at exactly 40** `[measured]` — the claim the queue was built on, checked at last; `/health` found degraded **438×** under load and fixed in one word; async response latency 3.1× better and **completion latency 20× worse**, which is 12.2's trigger measured |
 
 **Test counts** `[measured]`: 44 `rag` · 224 `backend` · 0 `agent` · 0
 frontend, plus `tsc` and `eslint` clean. **The frontend figure has been zero
@@ -656,6 +657,23 @@ minutes; concurrent uploads make the API unresponsive"*, and the measure read
 *"p95 upload response: 240s → <200ms. API availability during bulk ingest:
 degraded → unaffected"*.
 
+> **Settled at 2.5.** Neither number was right, and the shape of the claim was
+> wrong too — **one number cannot express it**. Measured at 40 concurrent
+> uploads with a calibrated 3.2-second embed delay:
+>
+> | | sync | async |
+> |---|---|---|
+> | response p50 | 3.937s | **1.251s** |
+> | completion p50 | 3.937s | **77.0s** |
+>
+> Response latency improved 3.1×, not 1200×, and is nowhere near 200 ms —
+> forty multipart bodies still have to be read. **Completion latency got 20×
+> worse**, because the synchronous path has forty workers (the threadpool) and
+> the asynchronous path has one. That is stage 12.2's trigger, measured.
+>
+> "API availability: degraded → unaffected" was closest to true, and only
+> after 2.5 fixed the `/health` route that made it false.
+
 Three problems.
 
 **1. The four minutes is not reproducible in this architecture** `[hypothesis,
@@ -665,11 +683,28 @@ refuted by analysis]`. The embedding provider batches 100 texts per call. A
 a provider that is slow or throttled, not a document that is large. Building
 toward a 240s "before" number would have meant *manufacturing* it.
 
-**2. "Concurrent uploads make the API unresponsive" is probably false as
-written** `[hypothesis]`. The agent's ingest route is a plain `def`, so FastAPI
-runs it on a threadpool and the event loop stays free. That pool holds 40 threads
-`[measured]`. Twenty concurrent uploads use twenty of them. The curriculum's own
-"upload 20 documents at once" is *below the ceiling it was supposed to expose*.
+**2. "Concurrent uploads make the API unresponsive" was probably false as
+written** — and **stage 2.5 measured it, finding the hypothesis right about the
+number and wrong about the conclusion.**
+
+The reasoning was: the agent's ingest route is a plain `def`, so FastAPI runs
+it on a threadpool and the event loop stays free. That pool holds 40 threads
+`[measured]`. Twenty concurrent uploads use twenty of them, so the
+curriculum's own "upload 20 documents at once" is *below the ceiling it was
+supposed to expose*.
+
+**The ceiling is exactly 40** `[measured]` — N=40 completes in one wave, N=60
+takes two and doubles p95. The queue was built on that claim and nobody had
+checked it until 2.5.
+
+But "the API stays responsive" was **false**, for a reason the analysis missed:
+`/health` is *also* a plain `def`, so it shares the pool it was supposed to be
+insulated from. Under 40 concurrent uploads it went from **8 ms to 3508 ms**,
+and the poller managed two samples in four seconds because each took three and
+a half. One word — `async def` — took it back to 7 ms.
+
+The lesson is narrower and more useful than the original claim: an event loop
+being free does not make an endpoint responsive if the endpoint is not on it.
 
 **3. The problem that was never written down** — part observed, part expected:
 
@@ -681,11 +716,19 @@ on timeout:   backend records `failed`, returns 503        ← test-covered
               → a document the database calls failed, that answers queries
 ```
 
-**The middle line is a `[hypothesis]`.** 1.2 demonstrated the same divergence by
+**The middle line was a `[hypothesis]`**, and it is one of the three
+measurements this stage deferred. 1.2 demonstrated the same divergence by
 *killing* a process, and that run is recorded — but a timeout firing against a
-still-running agent has never been observed, and the two are not the same event.
-One is induced by an operator; the other would happen unattended, which is
-exactly why it is the stronger argument for this stage *if it holds*.
+still-running agent had never been observed, and the two are not the same
+event. One is induced by an operator; the other happens unattended.
+
+**Stages 2.2 and 2.3 changed the question before 2.5 could answer it**, and
+that is recorded rather than quietly measured as written. The divergence still
+occurs, and it now *self-heals*: the retry upserts under deterministic ids and
+prunes everything else for the document. If every retry fails,
+`tools/qdrant_orphans.py` surfaces the remainder in its `pending` group. The
+live question is therefore **"does it still self-heal, and does the tool catch
+the case where it does not?"** — see `docs/experiments/0006-…`.
 
 What **is** established, independent of that: work is lost on any restart (three
 `processing` rows exist right now), there is no retry without re-uploading the
@@ -860,11 +903,28 @@ trigger you have quietly prevented is a stage you cannot learn from.
 
 Goal: the pipeline recovers from its own failures without a human.
 
-**Audit verdict:** correctly sequenced, and 2.1–2.3 were already well specified.
-Each gains `Capability`, `Done when` and evidence labels. **2.4 changed
-materially**: the fake embedder is removed from its Build (already built), and
-its trigger is now stronger because a concrete observability failure has been
-measured.
+**Audit verdict** (2026-10-24): correctly sequenced, and 2.1–2.3 were already
+well specified. Each gains `Capability`, `Done when` and evidence labels.
+
+**Complete as of 2026-10-27**, and the module is worth reading as a sequence
+rather than five entries, because each stage's trigger was manufactured by the
+one before it:
+
+```text
+1.3 left a worker dead holding a job        →  2.1 leases and reaps it
+2.1's reaper ingested that job twice        →  2.2 makes ingestion idempotent
+2.2's retries ran on failures that could    →  2.3 classifies them
+    never succeed
+2.3's defects were only found by looking    →  2.4 makes the system observable
+2.4 could not measure latency without       →  2.5 a provider you can drive
+    burning quota
+```
+
+**Three of the five had Problem rows that were false by the time they were
+built**, each invalidated by its immediate predecessor — 2.1's "orphans 10 →
+0", 2.3's "retries for a day, burning quota", 2.4's "every `logger.info` in
+this codebase". That is the module's most transferable lesson, and it is now a
+rule in the front matter: **a Problem row is a hypothesis with a date on it.**
 
 ### 2.1 — Job lifecycle, leases and retries · **CORE** · `[required]`
 
@@ -1098,13 +1158,13 @@ which as written was two stages wearing one number.*
 |---|---|
 | **Capability** | ingestion can be made slow, or fast, or failing, on purpose — so load and latency are things you measure rather than estimate |
 | **Now** | observability, and no way to produce the conditions worth observing |
-| **Problem** | every latency question about this system is unanswerable without spending real embedding quota and real wall-clock time, so none of them has been answered `[measured]` — three such questions have been deferred since 1.3 |
+| **Problem** | every latency question about this system is unanswerable without spending real embedding quota `[measured]` — **demonstrated by accident during this stage**: the attempt to calibrate the fake delay against one real call was rate-limited on its *second* request, and again on the first request of a second, spaced attempt. Two calls is enough to exhaust the free tier's per-minute cap |
 | **Diagnose** | try to answer "what is p95 upload latency under 20 concurrent uploads?" and notice the first obstacle is not the harness |
 | **Root cause** | the only embedding provider is a paid, rate-limited, variable-latency third party |
 | **Learn** | test doubles at a seam, load generation, percentiles under concurrency, capacity vs latency, the difference between a probe and a benchmark |
 | **Build** | the `FAKE` embedding provider behind the existing seam — deterministic hashed vectors, a configurable per-batch delay, explicit opt-in, a startup warning, `fake-embedding` in every payload, and a refusal if pointed at the production collection. Then the capacity probe |
 | **Verify** | the fake provider cannot become the default by accident, and cannot write to the production collection. A probe run is reproducible twice within a stated tolerance |
-| **Done when** | the three measurements deferred from 1.3 have numbers; the probe's own overhead is measured and stated; no real quota was spent getting them |
+| **Done when** | the three measurements deferred from 1.3 have numbers; the probe's own overhead is measured and stated (89 req/s, an order of magnitude above anything observed); no real quota was spent getting them |
 | **Next trigger** | the system is reliable and observable, and the answers are still often wrong |
 | **Covers** | test doubles · load generation · percentiles · capacity |
 
@@ -2633,6 +2693,91 @@ itself a deferral record** — each row says what is missing and what substitute
 
 Why this document was revised, and what changed. Kept so the reasoning is
 auditable rather than lost in a diff.
+
+## 2026-10-27 — Stage 2.5 complete; a claim from 1.1 finally checked
+
+**64 rag tests** (was 44), 224 backend, `tsc` and `eslint` clean. Full write-up
+in `docs/experiments/0006-stage-2-5-capacity.md`.
+
+**The stage's premise was demonstrated by accident, before any of it ran.** The
+first act was to calibrate the fake delay against one real Gemini call. The
+*second* request was rate-limited — `429 RESOURCE_EXHAUSTED`, per-minute free
+tier — and so was the first request of a second attempt made 45 seconds later.
+Two calls is enough. Every latency number this project could have measured
+against the real provider would have been a measure of the quota.
+
+**The threadpool knee is exactly 40, and nobody had checked.** The agent route's
+docstring has claimed since 1.1 that exhausting its pool "is part of what earns
+the queue at stage 1.3". The queue was built on it four stages ago:
+
+| N | wall | response p50 | |
+|---|---|---|---|
+| 10 | 5.56s | 1.954s | |
+| 40 | 4.02s | 3.937s | one wave |
+| 60 | 7.98s | 4.432s | two waves, p95 7.884s |
+
+**`/health` was being starved by ingestion, 438×, and this stage fixed it.**
+Under 40 concurrent uploads it went from 8 ms to **3508 ms** — and the poller
+got two samples in four seconds, because each took three and a half. Both
+`/health` routes are plain `def`, so they run in the *same* worker threadpool
+that `POST /documents` occupies for an entire ingest.
+
+One word — `async def` — took it to **7 ms** and the sample count from 2 to 33.
+The rule has two halves and both matter: **a route that does no I/O should be
+`async def`; a route that blocks should be `def`.** The upload route is
+deliberately the second half and stays as it is.
+
+This also corrects 1.3's audit, which reasoned that "the event loop stays free"
+meant the API stayed responsive. The loop *was* free. The endpoint was not on
+it.
+
+**1.3's withdrawn measure is settled, and one number could never have
+expressed it.**
+
+| at N=40 | sync | async |
+|---|---|---|
+| response p50 | 3.937s | **1.251s** — 3.1× better |
+| completion p50 | 3.937s | **77.0s** — 20× worse |
+
+"p95 240s → <200ms" was wrong in both directions. Response latency improved
+3.1×, not 1200×, and is nowhere near 200 ms — forty multipart bodies still have
+to be read. **Completion latency got twenty times worse**, because the
+synchronous path has forty workers (the threadpool) and the asynchronous path
+has one. **Stage 12.2's trigger, measured:** until there is more than one
+worker, the queue is a latency regression for anyone waiting on a *result*.
+
+| Reconciled | Was | Now |
+|---|---|---|
+| 1.3's measure | "p95 240s → <200ms" | two numbers, neither of them that |
+| 1.3's audit, point 2 | "the API stays responsive" `[hypothesis]` | the pool bound was right, the conclusion was wrong |
+| 1.3's audit, point 3 | timeout divergence `[hypothesis]` | the question changed shape at 2.2; recorded rather than measured as written |
+| the agent route's docstring | predicted a knee | confirmed at 40, and the `/health` miss recorded beside it |
+| test counts | 44 rag | 64 |
+
+**The implementation was recovered, not rewritten.** Two stale bytecode files
+survived in `rag/rag/providers/__pycache__/` from the version deleted during
+1.3 preparation, and Python keeps docstrings as bytecode constants.
+Disassembly returned the design, its reasoning and all four constants exactly.
+Re-application rather than invention, as this stage's entry promised.
+
+**Three mutation findings**, one of which removed a test rather than adding
+one:
+
+1. **A claim measurement did not support.** The salt-vs-concatenation mutation
+   survived; investigating showed the two texts share digest blocks at
+   *different offsets*, so no components align and the vectors are uncorrelated
+   either way. The docstring claimed otherwise. The salt is still right, for
+   unambiguity rather than a measured defect, and **the test that claimed to
+   detect it was deleted with the reason recorded in its place** — a test that
+   passes for a different reason than it states is the 2.4 logging mistake
+   again.
+2. **The seam branch had no test.** `if False:` in place of the provider check
+   passed everything. The central claim of the stage — that the seam would pay
+   out — was unasserted, the same shape as 2.4's `expose_headers` gap.
+3. **A timing test charged CPU to the sleep.** Hashing 100 × 768-dimension
+   vectors is ~80 ms of real work. It now subtracts a zero-delay baseline and
+   takes the **minimum** of three runs, because scheduling noise only ever
+   makes a timing measurement larger.
 
 ## 2026-10-27 — Stage 2.4 complete; 2.5 split out
 

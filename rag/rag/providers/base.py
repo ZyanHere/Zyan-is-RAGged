@@ -26,8 +26,11 @@ nothing errors, results are just quietly worse. Encoding the distinction in the
 interface makes it impossible to get wrong by accident.
 """
 
+import logging
 from functools import lru_cache
 from typing import Protocol
+
+logger = logging.getLogger(__name__)
 
 
 class EmbeddingModel(Protocol):
@@ -60,16 +63,65 @@ def get_embedding_model() -> EmbeddingModel:
     """Build the configured embedding model once and reuse it.
 
     Provider selection is driven by config, not by an import at the call site.
-    Stage 2.4's fake embedder — a local function returning a deterministic
-    vector after a configurable sleep — plugs in here as one more branch, and no
-    caller changes.
+
+    **This function is where stage 2.5 collected on the seam.** For four
+    stages it returned Gemini unconditionally — a seam in shape only — and
+    the claim was that adding a second provider would change this function
+    and nothing else. It did: the branch below is the entire diff outside
+    the new provider's own file. No caller, no route, no test of the
+    pipeline had to know.
+
+    ── Why the warning is here and not in a startup hook ─────────────────
+
+    `lru_cache` means this body runs exactly once per process, which is
+    precisely the shape a startup announcement needs — and it needs no
+    `lifespan`. The agent does not have one (see
+    `docs/architecture/current.md`), and adding one sideways to carry a
+    warning is how an unrelated concern gets attached to a stage.
+
+    The cost of that choice is stated rather than hidden: the warning fires
+    on first *use*, not at boot, so a process configured with the fake
+    provider that never embeds anything never announces itself. Acceptable,
+    because a process that never embeds cannot write a fake vector either.
     """
     # Imported inside the function so adding a provider never costs an import
-    # for the providers you are not using.
+    # for the providers you are not using. That is load-bearing now rather than
+    # tidy: a top-level import of `gemini` would pull the Google SDK into every
+    # process that only wants the fake one.
     from rag.config import get_settings
-    from rag.providers.gemini import GeminiEmbeddingModel
 
     settings = get_settings()
+
+    if settings.embedding_provider == "fake":
+        from rag.providers.fake import FakeEmbeddingModel
+
+        # `warning`, not `info`, and the reason is a fact about this codebase
+        # rather than a style preference. Stage 2.4 gave the backend and the
+        # worker a root log handler; **the agent still has none**, so
+        # `logging.lastResort` is what carries this line — and lastResort
+        # passes WARNING and above only. An `info` would be invisible in
+        # exactly the process that most needs to announce itself.
+        logger.warning(
+            "EMBEDDING_PROVIDER=fake \u2014 vectors are hashes of the text and "
+            "carry no meaning. Retrieval results are nonsense by design. "
+            "collection=%s delay=%dms per batch",
+            settings.qdrant_collection,
+            settings.fake_embed_delay_ms,
+        )
+
+        return FakeEmbeddingModel(
+            dimensions=settings.embedding_dim,
+            delay_ms=settings.fake_embed_delay_ms,
+        )
+
+    from rag.providers.gemini import GeminiEmbeddingModel
+
+    # `google_api_key` is `str | None` since 2.5, and this is the only place
+    # that could dereference a `None`. It cannot be one: `Settings` refuses to
+    # build without a key when the provider is Gemini, so reaching this line
+    # means one exists. The assertion is for the type checker, not the program.
+    assert settings.google_api_key is not None
+
     return GeminiEmbeddingModel(
         api_key=settings.google_api_key,
         model=settings.embedding_model,

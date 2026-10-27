@@ -4,16 +4,20 @@ The only file in `rag` that imports a vendor SDK. Vendor exceptions are
 translated to `EmbeddingError` here, so nothing outside this module ever
 imports `google.genai`.
 
+**`l2_normalise` used to live here** and moved to `_vectors.py` at stage 2.5,
+when a second provider needed it. Having the fake import it from this module
+would have dragged the Google SDK into a provider that exists to avoid
+touching Google at all — see that module's docstring.
+
 See docs/decisions/0002-embedding-provider.md for why Gemini at 768 dimensions.
 """
-
-import math
 
 from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
 
 from rag.errors import EmbeddingError
+from rag.providers._vectors import l2_normalise
 
 # Gemini accepts a limited number of inputs per embed call. Batching keeps a
 # 300-page document from becoming one enormous request that times out, while
@@ -92,7 +96,7 @@ class GeminiEmbeddingModel:
                         f"EMBEDDING_DIM is {self.dimensions}. Every stored "
                         f"vector must match the collection exactly."
                     )
-                vectors.append(_l2_normalise(values))
+                vectors.append(l2_normalise(values))
 
         return vectors
 
@@ -118,28 +122,3 @@ class GeminiEmbeddingModel:
                 f"EMBEDDING_MODEL in agent/.env. Provider said: {exc}"
             )
         return EmbeddingError(f"Gemini embedding request failed: {exc}")
-
-
-def _l2_normalise(vector: list[float]) -> list[float]:
-    """Scale a vector to unit length.
-
-    **Not optional at 768 dimensions.** `gemini-embedding-001` returns
-    unit-length vectors only at its native 3072 dimensions. Ask for a truncated
-    output — which decision 0002 does, for a 4x smaller and faster index — and
-    the result is no longer normalised, because chopping off dimensions removes
-    part of the length.
-
-    Cosine similarity divides by both vectors' magnitudes, so in principle it
-    tolerates that. In practice Qdrant normalises once at insertion for speed
-    and assumes what it stored was sensible, and inconsistent magnitudes across
-    the corpus distort scores in ways that are invisible — no error, just
-    quietly worse ranking. Normalising here, at the seam, means every vector
-    that reaches the index is unit length regardless of provider.
-
-    The zero guard is for defence, not realism: a zero-length vector has no
-    direction to preserve, and dividing by zero would poison the index with NaN.
-    """
-    magnitude = math.sqrt(sum(value * value for value in vector))
-    if magnitude == 0.0:
-        return vector
-    return [value / magnitude for value in vector]

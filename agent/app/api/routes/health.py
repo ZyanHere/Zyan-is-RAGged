@@ -15,5 +15,26 @@ router = APIRouter()
 
 
 @router.get("/health")
-def health() -> dict[str, str]:
+async def health() -> dict[str, str]:
+    """**`async def`, and the word is load-bearing — stage 2.5.**
+
+    A plain `def` route runs in FastAPI's bounded worker threadpool, the same
+    pool `POST /documents` occupies for the whole of an ingest. Measured under
+    40 concurrent uploads with a calibrated 3.2-second embed delay:
+
+        def health      p50 0.008s -> 3.508s     438x worse
+        async def       p50 0.008s -> unchanged
+
+    Every thread was blocked inside `rag.ingest`, so a liveness check that
+    touches nothing and does no I/O sat in a queue behind forty documents.
+
+    The consequence is the one this file's own docstring wants to avoid: a
+    health check that fails because the service is *busy* invites a restart
+    that throws away the work in progress and makes the problem worse.
+
+    `async def` puts it on the event loop, where it never competes with
+    ingestion for anything. The rule it illustrates: **a route that does no
+    I/O should be `async def`; a route that blocks should be `def`.** Both
+    halves matter, and `POST /documents` is deliberately the other half.
+    """
     return {"status": "ok"}

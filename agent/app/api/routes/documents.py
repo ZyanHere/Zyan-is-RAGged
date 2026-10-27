@@ -11,6 +11,25 @@ FastAPI runs a plain `def` handler in a worker thread instead, so the event loop
 stays free. That thread pool is bounded (40 by default), which is a real limit
 and a real future trigger: enough concurrent uploads will exhaust it, and that
 observation is part of what earns the queue at stage 1.3.
+
+**Measured at stage 2.5, and the prediction holds exactly.** With a calibrated
+3.2-second embed delay:
+
+    N=10   wall  5.56s   response p50 1.954s
+    N=40   wall  4.02s   response p50 3.937s    one wave
+    N=60   wall  7.98s   response p50 4.432s    p95 7.884s — two waves
+
+The knee is at 40. The queue at 1.3 was built on this claim and nobody checked
+it for four stages.
+
+**What the same measurement found that this docstring did not predict:** "the
+event loop stays free" is true and was not sufficient. `/health` is *also* a
+plain `def`, so it shared this pool and went from 8 ms to 3508 ms under the
+load — a liveness check starved by the thing it was supposed to report on. It
+is `async def` now. See `docs/experiments/0006-…`.
+
+This route stays `def`, and that is the other half of the rule: **a route that
+blocks belongs on a thread; a route that does no I/O belongs on the loop.**
 """
 
 from fastapi import APIRouter, File, Form, UploadFile
