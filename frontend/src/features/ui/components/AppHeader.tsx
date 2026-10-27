@@ -1,5 +1,6 @@
 "use client";
 
+import { PipelineStatus } from "@/features/ui/components/PipelineStatus";
 import { sidebarOpened } from "@/features/ui/uiSlice";
 import { useAppDispatch } from "@/store/hooks";
 
@@ -48,13 +49,20 @@ export function AppHeader() {
 
       <h1 className="text-sm font-medium text-neutral-500">myRAG</h1>
 
-      {/* A deliberate reminder of what this build actually is, so nobody —
-          including me — mistakes a curriculum stage for a finished product.
-          It changes when the architecture does: stage 1.3 moved ingestion out
-          of the request, so "synchronous" stopped being true. */}
-      <span className="ml-auto text-xs text-neutral-400">
-        stage 2.3 · classified failures
-      </span>
+      {/* Stage 2.4. Renders nothing when the queue is empty and nothing has
+          failed — a permanent "0 failed" is a badge you learn to ignore, and
+          the day it says 3 you would not notice. */}
+      <div className="ml-auto flex items-center gap-3">
+        <PipelineStatus />
+
+        {/* A deliberate reminder of what this build actually is, so nobody —
+            including me — mistakes a curriculum stage for a finished product.
+            It changes when the architecture does: stage 1.3 moved ingestion
+            out of the request, so "synchronous" stopped being true. */}
+        <span className="text-xs text-neutral-400">
+          stage 2.4 · seeing inside
+        </span>
+      </div>
     </header>
   );
 }

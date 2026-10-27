@@ -3,7 +3,7 @@
 **What the system is *today*.** Not the destination — `../curriculum.md` has
 that. Updated at the end of every stage, so it is never aspirational.
 
-**Stage:** **2.3 complete. 2.4 not started.**
+**Stage:** **2.4 complete. 2.5 not started.**
 **Last updated:** 2026-10-27
 
 ## How to read this file
@@ -32,7 +32,8 @@ not the thing is built yet.
 | **2.1** Job lifecycle, leases and retries | ✅ complete | 10 real process kills → every document terminal in 9.8 s with one worker and no intervention; the six-day-old stranded row recovered itself in 25 ms; a worker that loses its lease is proved unable to commit (`test_lease_handover.py`) |
 | **2.2** Idempotency | ✅ complete | a doubly-indexed document repaired 9 → 3 points by re-ingestion, then 3 → 3 on a repeat; orphaned points 39 → 0; 5 concurrent uploads of one file → 1 document, one `202` and four `200`; Postgres and Qdrant agree 7/7 |
 | **2.3** Failure classification and the DLQ | ✅ complete | a poison document costs 1 attempt instead of 5; the retry budget measured at 302.1s and 221.1s across two runs, where 22s had been fatal; the dead-letter list distinguishes the two kinds and only the recoverable one offers a retry |
-| **2.4** Seeing inside | ○ not started | its trigger is `[measured]`: every `logger.info` in the backend is discarded |
+| **2.4** Seeing inside | ✅ complete | app log lines reaching a handler in the API process 0 → all; one upload traced across both processes by a single `grep`; an induced failure reconstructed from logs with no database access; the health question is one request |
+| **2.5** A provider you can drive | ○ not started | split out of 2.4; carries three measurements deferred since 1.3 |
 
 **Built ahead of its stage, for reasons recorded in the Evolution Map:**
 
@@ -201,11 +202,28 @@ file. The UI offers that retry only on a *transient* failure: a button on a file
 that cannot be read would teach the user the system is flaky rather than that
 their file is unreadable.
 
-⚠ **All of it is still invisible from outside.** There is no metric for the
-dead-letter depth, no alert when it grows, and **every `logger.info` in the
-backend is still discarded** `[measured]` — uvicorn installs no root handler, so
-`logging.lastResort` passes only WARNING and above. The dead-letter list is a
-page someone has to remember to open. That is 2.4's trigger.
+✅ **It is observable now.** Both processes configure the same logging —
+`app/core/logging.py`, JSON when stderr is not a TTY — so nothing is silently
+discarded. A `request_id` minted per request is carried on a `ContextVar`,
+written to the **job row** (the only channel to the worker), and read back by
+the claim, so one `grep` returns the accept, the claim, every retry and the
+outcome across both processes.
+
+✅ **`GET /stats` answers "is ingestion healthy?" in one request**, from one SQL
+statement. Queue depth separated into claimable and waiting-for-backoff,
+in-flight, the dead-letter split by 2.3's classification, and duration
+percentiles. `oldest_queued_age` is the one that distinguishes a busy queue
+from a stopped one, and the header shows a `stalled` badge from it.
+
+⚠ **Nothing aggregates or alerts.** `/stats` is a snapshot someone has to ask
+for; there is no history, no rate, and no page when the dead-letter count
+grows. Prometheus and Grafana are 10.1, and the SQL `/stats` runs is what its
+collector should call.
+
+⚠ **The agent is outside the correlation.** The chain is API → worker → agent,
+and the id stops at the worker — the agent configures no logging of its own.
+**Trigger:** a failure whose cause is inside the agent and cannot be attributed
+from the worker's side.
 
 ### `agent/` :8001 — the AI application layer
 
@@ -229,11 +247,16 @@ the fake provider, since it was part of the same out-of-sequence detour. Worth
 rebuilding — it is about twenty lines and mirrors the backend's `SELECT 1` — but
 it needs its own reason and its own stage rather than arriving sideways.
 
-⚠ **Related, and worse:** uvicorn installs no root log handler, so
-`logging.lastResort` passes only WARNING and above and **every `logger.info` in
-this codebase is silently discarded** — the backend's own "database pool ready"
-has never appeared in a log. A one-line `logging.basicConfig` fixes the floor;
-real structured logging is Evolution Map 2.4.
+⚠ **The agent logs nothing it configures.** Stage 2.4 gave the backend and
+the worker a shared logging configuration; the agent still has none, so
+`logging.lastResort` passes only WARNING and above there and its `logger.info`
+lines go nowhere.
+
+It is the same defect the backend had — measured at 2.4 as 31 worker lines
+against 0 from the API — and it is left in place for the same reason the
+`lifespan` above is: it needs its own stage rather than arriving sideways. The
+practical cost today is that a request id stops at the worker, because the
+agent has nowhere to put it.
 
 ### `rag/` — the engine, as a library
 
@@ -244,7 +267,7 @@ chatbot sits in the measurement path.
 ```text
 ✅ extraction (pypdf, 1-based pages, refuses a PDF with no text layer)
 ✅ chunking (fixed size + overlap, never spanning a page boundary)
-✅ embedding behind a seam (one provider: Gemini; a second arrives at 2.4)
+✅ embedding behind a seam (one provider: Gemini; a second arrives at 2.5)
 ✅ indexing and retrieval (Qdrant, embedded mode)
 ○  reranking · context assembly · grounding      (4.x, 17.x)
 ○  evaluation                                    (3.1)

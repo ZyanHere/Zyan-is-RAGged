@@ -151,6 +151,55 @@ export type FailureKind = "permanent" | "transient";
  * Putting it on the record would make every list row carry a field it cannot
  * answer.
  */
+/**
+ * A snapshot of the ingestion pipeline. Mirrors the backend's
+ * `IngestionStatsResponse`. Stage 2.4.
+ *
+ * ── Why the client needs any of this ────────────────────────────────────────
+ *
+ * Stage 2.3 built a dead-letter list and told nobody to open it. Both of that
+ * stage's defects were found by going and looking, and a page you have to
+ * remember to visit is a page you visit after someone complains.
+ *
+ * A count in the header is the cheapest possible fix: the number is either
+ * zero and invisible, or it is not and you can see it without having asked.
+ */
+export interface IngestionStats {
+  /** Queued and claimable now — the real backlog. */
+  claimable: number;
+
+  /**
+   * Queued, but held back by stage 2.1's backoff.
+   *
+   * Kept apart from `claimable` because these are waiting *on purpose*.
+   * Together they would report a backlog when nothing is stuck.
+   */
+  waitingForRetry: number;
+
+  /**
+   * How long the longest-waiting queued job has waited. `null` when empty.
+   *
+   * **The number that says whether the queue is draining.** Depth alone
+   * cannot: 300 jobs moving steadily is healthy, 3 that have not moved in an
+   * hour is an outage, and depth reports the first as worse.
+   */
+  oldestQueuedAgeSeconds: number | null;
+
+  inFlight: number;
+  done: number;
+
+  /** What has given up, split by whether a retry could change anything. */
+  deadLetter: {
+    total: number;
+    permanent: number;
+    transient: number;
+  };
+
+  /** `null` until something has succeeded — not `0`, which reads as instant. */
+  durationP50Seconds: number | null;
+  durationP95Seconds: number | null;
+}
+
 export interface UploadResult {
   document: DocumentRecord;
 

@@ -252,8 +252,9 @@ will never be built. That is not failure; a map is not a to-do list.
   DONE      2.1   job lifecycle, leases, retries
   DONE      2.2   idempotency
   DONE      2.3   failure classification and the dead-letter queue
+  DONE      2.4   seeing inside
   ────────────────────────────────────────────────────── you are here
-  NEXT      2.4   seeing inside
+  NEXT      2.5   a provider you can drive   ← split out of 2.4
             3.1   retrieval metrics       ← blocked: needs a real document corpus
             3.2   failure attribution
             3.3   answer quality gating
@@ -281,11 +282,16 @@ the system's current state is checkable here.
 | **1.2** Persist what happened | **COMPLETE** | Alembic round-trip clean; 3 induced crashes → 3 detectable rows `[measured]`; citation `document_id` === Postgres PK |
 | **1.3** Ingestion out of the request cycle | **COMPLETE** | `202` in 38ms with the agent paused `[measured]`; a worker drained the queue and the citation still resolved to the right page; two claimers proved to take different jobs; one stranded row created deliberately |
 | **2.1** Job lifecycle, leases and retries | **COMPLETE** | 10 real process kills → every document terminal in 9.8s, no intervention `[measured]`; the 1.3 stranded row recovered itself in 25ms; a worker that loses its lease is proved unable to commit |
+| **2.4** Seeing inside | **COMPLETE** | app log lines reaching a handler in the API process **0 → all** `[measured]`; one upload traced across both processes by a single `grep`; an induced failure reconstructed from logs with no database access; the health question is **one request, 18 ms**, down from three queries seeing three different instants |
+| **2.5** A provider you can drive | **NOT STARTED** | split out of 2.4; carries three measurements deferred since 1.3 |
 | **2.3** Failure classification and the DLQ | **COMPLETE** | a poison document costs **1 attempt instead of 5** `[measured]`; the retry budget measured at **302.1s and 221.1s across two runs** (median ~302s, a 37% spread from full jitter), where 22s had been fatal; `outage.pdf`, dead since this stage's trigger, replayed to `done` from the dead-letter list in one click |
 | **2.2** Idempotency | **COMPLETE** | a doubly-indexed document repaired 9 → 3 points by re-ingestion `[measured]`; orphaned points 39 → 0; 5 concurrent uploads of one file → 1 document; Postgres and Qdrant agree 7/7 |
 
-**Test counts** `[measured]`: 44 `rag` · 179 `backend` · 0 `agent` · 0
-frontend, plus `tsc` and `eslint` clean. **Nothing runs any of them
+**Test counts** `[measured]`: 44 `rag` · 224 `backend` · 0 `agent` · 0
+frontend, plus `tsc` and `eslint` clean. **The frontend figure has been zero
+for four stages** and is now the oldest debt in the project — 2.4 added a
+stalled-queue indicator whose threshold logic is exactly the kind of thing that
+rots unnoticed. **Nothing runs any of them
 automatically** — see the note at 15.2.
 
 **The stranded job — now closed, and worth keeping the record of:**
@@ -326,8 +332,9 @@ stages, both triggers real rather than imagined.
    dict exists** — conversation persistence was deferred by ADR 0001 and never
    built. Corrected.
 4. The fake embedder was listed as arriving at 2.4 and again at 11.1. It was
-   built early, then **removed again** — see the change log. It arrives at 2.4,
-   and 11.1 now refers back rather than rebuilding it.
+   built early, then **removed again** — see the change log. It arrives at
+   **2.5** (split out of 2.4 on 2026-10-27), and 11.1 refers back rather than
+   rebuilding it.
 5. **The frontend appears nowhere in this document**, and it is 23 TypeScript
    files with Redux Toolkit, RTK Query and zero tests. Added as a cross-cutting
    concern.
@@ -378,13 +385,16 @@ an observation about concurrency.
 
 ### Structured logging and correlation IDs
 
-Still **2.4**, and the trigger is now stronger than when it was written.
-Discovered during 1.3 preparation `[measured]`: uvicorn configures no root log
-handler, so `logging.lastResort` passes only WARNING and above and **every
-`logger.info` in this codebase has been silently discarded** — including the
-backend's own "database pool ready". A one-line `basicConfig` was added to the
-agent to make its startup line visible. That is a floor, not a design; 2.4 is
-where logging becomes real.
+**Done at 2.4.** The trigger was discovered during 1.3 preparation
+`[measured]`: uvicorn configures no root log handler, so `logging.lastResort`
+passes only WARNING and above and every `logger.info` was silently discarded —
+including the backend's own "database pool ready".
+
+It was half-fixed at 1.3 by a `basicConfig` in the worker, which the row above
+did not say for two stages. Measured at the start of 2.4: **31 app INFO lines
+from the worker, 0 from the API.** Both processes now share
+`app/core/logging.py`, and the remaining gap is the **agent**, which still
+configures nothing — see `docs/architecture/current.md`.
 
 ### The frontend
 
@@ -1043,30 +1053,73 @@ want it.
 |---|---|
 | **Capability** | you can answer "is ingestion healthy right now?" in seconds, and follow one upload across two processes |
 | **Now** | a reliable pipeline you cannot observe |
-| **Problem** | two things, both concrete. You cannot answer "is ingestion healthy?" without hand-written SQL. And **every `logger.info` in this codebase is currently discarded** `[measured]` — uvicorn installs no root handler, so `logging.lastResort` passes only WARNING and above, and the backend's own "database pool ready" has never once appeared in a log |
-| **Diagnose** | try to answer the health question and time yourself. Then grep a backend log for a line you know the code emits |
+| **Problem** | two things, both concrete. You cannot answer "is ingestion healthy?" without hand-written SQL — and the three queries it takes see **three different instants**, so the totals disagree with each other. And **every `logger.info` in the API process is discarded** `[measured]` — 31 lines observed from the worker, **0** from the API, because 1.3 gave the worker a `basicConfig` and uvicorn never touches the root logger. ~~every `logger.info` in this codebase~~: half of that was fixed at 1.3 and the row said otherwise for two stages. The expensive part is *which* lines: **the entire dedupe and replay story from 2.2 and 2.3 logs at INFO in the API**, so a duplicate upload, a lost race and an operator clicking Retry are all invisible |
+| **Diagnose** | grep the API's log for a line you know the code emits — `"database pool ready"` is the shortest path to the finding. Then try to answer the health question, and notice it is not the wall time that hurts but needing the schema and a shell in the container |
 | **Root cause** | no logging configuration, no structured output, and no correlation across the API/worker boundary |
 | **Learn** | structured logging, correlation IDs, counters vs gauges vs histograms, the RED method. **Learn the distinction now:** `request_id` is *yours* — one inbound API call, propagated by you into the job row. `trace_id` / `span_id` are the tracing system's, and arrive at 10.2. Conflating them is why people bolt on tracing later and find it useless |
-| **Build** | real logging configuration. JSON logs with a `request_id` threaded API → worker. Counters for jobs by state, a histogram for job duration, a gauge for queue depth. `/metrics`. **Also: the fake embedder**, behind the provider seam — and with it, the capacity probe and the deferred 1.3 measurements listed below |
-| **Verify** | induce a failure and trace it end to end using only the correlation id. Assert, in a test, that a log line the code emits actually reaches a handler — the bug above would have been caught by one such test |
-| **Done when** | an induced failure is diagnosable from logs alone in seconds; a `request_id` from an upload response appears on the worker's log lines for that job; no log statement in the codebase is silently discarded |
+| **Build** | `dictConfig` on the root logger, JSON when not a TTY. A `request_id` minted per request, carried on a `ContextVar`, written to the **job row** — the only channel to the worker — and read back by the claim. **`GET /stats` as JSON over one SQL statement, not counters**: the queue is a table, so jobs-by-state and job duration are already durable facts, and an in-process counter would be a partial copy that double-counts across workers. Prometheus exposition waits for 10.1, where something scrapes. ~~the fake embedder and capacity probe~~ → **stage 2.5** |
+| **Verify** | induce a failure and reconstruct it end to end from logs alone. Assert, in a test, that a line the code emits reaches a handler — and **not with `caplog`**, which attaches its own and would pass against the broken configuration. Assert the snapshot is one statement, by counting SQL |
+| **Done when** | an induced failure is diagnosable from logs alone; a `request_id` from an upload response appears on the worker's lines for that job; no log statement is silently discarded; the health question is one request |
 | **Next trigger** | the system is reliable, and the answers are still often wrong. You have no idea how often, or which part is at fault |
 | **Covers** | structured logging · correlation IDs · metrics · RED |
 
-**This stage inherits three deferrals from 1.3**, all of which need the fake
-embedder and none of which block anything before now:
+**Why the metrics are read and not counted.** The three things this row
+originally named — counters by state, a duration histogram, a queue-depth gauge
+— are all already in Postgres, because **1.3 made the queue a table**. A
+counter would be a cached copy, and *partial*: it lives in one process, so with
+two workers a summed queue-depth gauge counts the same rows twice. The only
+correct source for a fact about the queue is the queue.
 
-| Deferred from 1.3 | What to do here |
+What is genuinely not in the database — API request rate and duration per
+endpoint, agent-call latency apart from total job duration — needs an
+aggregator to be worth emitting, and that is 10.1.
+
+**`oldest_queued_age` is the number worth remembering from this stage.** Depth
+cannot distinguish a busy system from a stopped one: 300 jobs draining steadily
+is healthy, 3 that have not moved in an hour is an outage, and depth reports
+the first as worse.
+
+**The mutation finding, because it generalises.** The test written to prove
+"a log line reaches a handler" was written specifically to avoid `caplog`, with
+a docstring explaining that pytest attaches its own root handler — and then it
+walked the hierarchy, found pytest's handler, and passed with the original bug
+reintroduced. **Writing a warning about a trap is not the same as avoiding
+it.** The fix asks whether one of *our* handlers is on the path, identified by
+a filter only we install.
+
+Full write-up: `docs/experiments/0005-stage-2-4-seeing-inside.md`.
+
+### 2.5 — A provider you can drive · **CORE** · `[required]`
+
+*Reason: B — a teaching experiment that is also a real need. Split out of 2.4,
+which as written was two stages wearing one number.*
+
+| | |
 |---|---|
-| upload p50/p95 under concurrent load | the capacity probe, against the async architecture — and against the synchronous one, which is a `git checkout` away, for the before/after pair |
+| **Capability** | ingestion can be made slow, or fast, or failing, on purpose — so load and latency are things you measure rather than estimate |
+| **Now** | observability, and no way to produce the conditions worth observing |
+| **Problem** | every latency question about this system is unanswerable without spending real embedding quota and real wall-clock time, so none of them has been answered `[measured]` — three such questions have been deferred since 1.3 |
+| **Diagnose** | try to answer "what is p95 upload latency under 20 concurrent uploads?" and notice the first obstacle is not the harness |
+| **Root cause** | the only embedding provider is a paid, rate-limited, variable-latency third party |
+| **Learn** | test doubles at a seam, load generation, percentiles under concurrency, capacity vs latency, the difference between a probe and a benchmark |
+| **Build** | the `FAKE` embedding provider behind the existing seam — deterministic hashed vectors, a configurable per-batch delay, explicit opt-in, a startup warning, `fake-embedding` in every payload, and a refusal if pointed at the production collection. Then the capacity probe |
+| **Verify** | the fake provider cannot become the default by accident, and cannot write to the production collection. A probe run is reproducible twice within a stated tolerance |
+| **Done when** | the three measurements deferred from 1.3 have numbers; the probe's own overhead is measured and stated; no real quota was spent getting them |
+| **Next trigger** | the system is reliable and observable, and the answers are still often wrong |
+| **Covers** | test doubles · load generation · percentiles · capacity |
+
+**It was built once already and removed as out of sequence**, during 1.3 prep.
+The design is settled, so this is re-applying a known one rather than
+inventing it — which is also why it is a small stage despite carrying three
+inherited measurements.
+
+**The three deferrals from 1.3 land here:**
+
+| Deferred from 1.3 | What to do |
+|---|---|
+| upload p50/p95 under concurrent load | the capacity probe against the async architecture — and against the synchronous one, which is a `git checkout` away, for the before/after pair |
 | whether either `/health` degrades under load | the same probe's two pollers, on separate connection pools |
 | does a 120s timeout really produce the Postgres/Qdrant divergence? | one upload with the delay above `AGENT_TIMEOUT` |
-
-**The fake embedder was built early once and removed as out of sequence.** Its
-design is settled — deterministic hashed vectors, per-batch delay, explicit
-opt-in, a startup warning, `fake-embedding` in every payload, and a config
-refusal if it is pointed at the production collection. Rebuilding it here is
-re-applying a known design, not inventing one.
 ---
 
 # MODULE 3 — Measurement: stop guessing
@@ -1894,7 +1947,7 @@ visualisation**, not their introduction. The two are not duplicated.
 | | |
 |---|---|
 | **Capability** | "is the system healthy?" is answered by looking at one screen |
-| **Now** | metrics emitted at 2.4, never aggregated |
+| **Now** | metrics **queryable** at 2.4 via `GET /stats` (JSON over one SQL statement), never aggregated and never scraped. The exposition format was deliberately left to this stage, because a wire format with no consumer drifts — the SQL `/stats` runs is what this stage's collector should call |
 | **Problem** | answering "is the system healthy?" takes ten minutes and several terminals |
 | **Diagnose** | time yourself answering it |
 | **Root cause** | metrics exist but are not aggregated or visualised |
@@ -1943,7 +1996,7 @@ visualisation**, not their introduction. The two are not duplicated.
 **Audit verdict:** correctly sequenced but **duplicated against 1.3** in the
 previous version, and its Build line referred to a tool that now exists.
 
-> **11.1 is an upgrade, not a first build.** The capacity probe arrives at 2.4 —
+> **11.1 is an upgrade, not a first build.** The capacity probe arrives at 2.5 —
 > a script that answers one question about one scenario. 11.1 replaces it with a
 > reusable instrument, and it must justify doing so against the five questions,
 > like any other test infrastructure:
@@ -2580,6 +2633,73 @@ itself a deferral record** — each row says what is missing and what substitute
 
 Why this document was revised, and what changed. Kept so the reasoning is
 auditable rather than lost in a diff.
+
+## 2026-10-27 — Stage 2.4 complete; 2.5 split out
+
+**224 backend tests** (was 179), 44 rag, `tsc` and `eslint` clean. Full
+write-up in `docs/experiments/0005-stage-2-4-seeing-inside.md`.
+
+**The trigger was half stale, for the third stage running.** 2.4's Problem row
+said *"every `logger.info` in this codebase is discarded"*. Stage 1.3 had
+already fixed half of it — the worker got a `basicConfig` — and the row said
+otherwise for two stages. Counted before starting: **31 app INFO lines from the
+worker, 0 from the API.**
+
+The accurate version is sharper: the API could not be watched at all, and the
+lines being lost were **the entire dedupe and replay story from 2.2 and 2.3**.
+A duplicate upload, a lost race and an operator clicking Retry were invisible
+in the one process a user talks to.
+
+**A Problem row is a hypothesis with a date on it, and the stage immediately
+before it is the most likely thing to have changed its truth.** That is now
+three for three — 2.1's "orphans 10 → 0", 2.3's "retries for a day", 2.4's
+"every logger.info".
+
+| Reconciled | Was | Now |
+|---|---|---|
+| 2.4's Problem | "every `logger.info` in this codebase" | the API process only; the worker was fixed at 1.3 |
+| 2.4's Build | counters, a histogram, a gauge, `/metrics` | one SQL statement behind `GET /stats`; exposition deferred to 10.1 |
+| 2.4's scope | + fake embedder + capacity probe + 3 deferred measurements | **split: 2.5** |
+| 10.1's Now | "metrics emitted at 2.4" | queryable, not emitted — and why the format waited |
+| test counts | 179 backend | 224 |
+
+**The metrics are read, not counted, and that follows from 1.3.** The queue is
+a table, so jobs-by-state, queue depth and job duration are already durable
+facts. A counter would be a cached copy and a *partial* one: it lives in one
+process, so two workers summed would count the same rows twice. The only
+correct source for a fact about the queue is the queue.
+
+**`oldest_queued_age` is the number worth taking from this stage.** Depth
+cannot distinguish a busy system from a stopped one — 300 jobs draining is
+healthy, 3 that have not moved in an hour is an outage, and depth reports the
+first as worse.
+
+**Four findings about testing, all from mutation:**
+
+1. **The headline test was compromised by the exact trap it documented.** It
+   was written to avoid `caplog`, with a docstring explaining that pytest
+   attaches its own root handler — then walked the hierarchy, found pytest's
+   handler, and passed with the original bug reintroduced. **Writing a warning
+   about a trap is not the same as avoiding it.**
+2. **One claim had no test at all.** Emptying `expose_headers` survived
+   everything: CORS hides all but a safelist, so JavaScript reading
+   `X-Request-ID` would get `null` with no error anywhere — the most
+   characteristically silent failure in a stage about silent failures.
+3. **A security claim was overstated and checking corrected it.** The inbound
+   id regex was described as stopping CRLF log forgery; tested with a raw
+   socket, h11 splits such a header into two before the application sees it.
+   What the regex uniquely buys is length and charset.
+4. **A `NamedTuple` refused to be built incomplete**, catching a field the
+   `RETURNING` fetched and the constructor dropped — eight tests failed with a
+   `TypeError` naming it, rather than silently carrying `None`.
+
+**Scope split, and why.** As written 2.4 was logging + request_id + metrics +
+the fake embedder + a capacity probe + three deferred 1.3 measurements —
+roughly double any previous stage. The observability half shipped; the rest is
+**2.5**, with its own trigger: *you cannot run a load experiment without a
+provider you can drive.* Keeping them apart keeps this stage's measure clean —
+"diagnosable from logs alone" is a different claim from "p95 under 20
+concurrent uploads", and entangled, neither would be finished until both were.
 
 ## 2026-10-27 — Stage 2.3 complete; the stage's own premise was wrong
 
