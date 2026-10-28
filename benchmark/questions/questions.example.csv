@@ -1,0 +1,6 @@
+id,document,question,gold_pages,gold_answer,type,answerable
+acl-001,acl-dpr-2020.pdf,By how much does DPR outperform Lucene-BM25 on top-20 passage retrieval accuracy?,1,"9%-19% absolute",numeric,true
+rfc-001,rfc9110-http-semantics.pdf,What does the 404 status code indicate?,138,"The origin server did not find a current representation for the target resource, or is unwilling to disclose that one exists.",definition,true
+rfc-002,rfc9110-http-semantics.pdf,What makes an HTTP request method idempotent?,73,"Multiple identical requests with that method have the same intended effect on the server as a single such request.",definition,true
+rfc-003,rfc9110-http-semantics.pdf,Which HTTP status code means the client has sent too many requests in a given time?,,,near_miss,false
+ood-001,,What is the maximum operating depth of the Trieste submersible?,,,out_of_domain,false
