@@ -16,7 +16,7 @@ import logging
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from app.api.routes import documents, health, query
+from app.api.routes import documents, health, query, retrieve
 from app.errors import AgentError, ProviderError, UploadTooLargeError
 from rag import (
     EmbeddingError,
@@ -37,6 +37,10 @@ app = FastAPI(
 app.include_router(health.router)
 app.include_router(documents.router)
 app.include_router(query.router)
+# Retrieval without generation — stage 3.1's evaluation harness. Registered
+# here and needing nothing else: the error table below already covers every
+# failure it can produce, which is the claim this file's docstring makes.
+app.include_router(retrieve.router)
 
 
 # ── Failures ──────────────────────────────────────────────────────────────────
