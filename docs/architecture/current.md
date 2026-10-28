@@ -3,7 +3,13 @@
 **What the system is *today*.** Not the destination — `../curriculum.md` has
 that. Updated at the end of every stage, so it is never aspirational.
 
-**Stage:** **2.5 complete. 3.1 not started** (blocked on a real corpus).
+**Stage:** **2.5 complete. 3.1 not started**, and now blocked on two things
+rather than one: 30–50 hand-written questions (the long pole — four real
+documents are committed at `benchmark/documents/`, one short of the stage's
+5–10), and a decision on how the harness reads the index at all. Embedded
+Qdrant holds an exclusive lock inside the agent's named volume, the agent's
+only retrieval route generates an answer, and `docker-compose.yml` has named
+this exact problem since 1.3.
 **Last updated:** 2026-10-27
 
 ## How to read this file

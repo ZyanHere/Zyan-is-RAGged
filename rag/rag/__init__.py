@@ -7,6 +7,7 @@ Public surface:
 
     ingest(data, document_id=..., filename=...)   index one document
     retrieve(question, top_k=...)                 find supporting chunks
+    retrieve_many(questions, top_k=...)           the same, in one embed request
     count_chunks()                                how many chunks exist
     document_chunk_counts()                       how many, per document
     delete_chunks_except(document_id, ...)        prune a document's old chunks
@@ -26,7 +27,7 @@ from rag.errors import (
     VectorStoreError,
 )
 from rag.models import Chunk, IngestResult, Page, RetrievedChunk
-from rag.pipeline import ingest, retrieve
+from rag.pipeline import ingest, retrieve, retrieve_many
 from rag.vector_store import (
     count_chunks,
     delete_chunks_except,
@@ -37,6 +38,13 @@ __all__ = [
     # operations
     "ingest",
     "retrieve",
+    # Batched retrieval - stage 3.1.
+    #
+    # Exported rather than left for the harness to assemble, because the only
+    # other way to embed a batch of questions is to reach into
+    # `rag.providers`, and the docstring above says that reaching in means the
+    # surface is missing something. This is the surface widening deliberately.
+    "retrieve_many",
     "count_chunks",
     # maintenance and audit - stage 2.2
     #

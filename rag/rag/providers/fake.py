@@ -103,6 +103,18 @@ class FakeEmbeddingModel:
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
         return self._embed(texts)
 
+    def embed_queries(self, texts: list[str]) -> list[list[float]]:
+        """Stage 3.1. Symmetric with `embed_documents`, like everything here.
+
+        The real provider gained this because its rate limit counts requests,
+        so fifty questions had to become one. There is no limit to respect
+        here, and this provider is symmetric anyway — so the method exists to
+        keep the fake a *drop-in* substitute, which is the one property every
+        decision in this file serves. A fake that no longer satisfies the
+        protocol is a measurement apparatus that cannot be swapped in.
+        """
+        return self._embed(texts)
+
     def embed_query(self, text: str) -> list[float]:
         return self._embed([text])[0]
 

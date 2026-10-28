@@ -9,6 +9,14 @@ when a second provider needed it. Having the fake import it from this module
 would have dragged the Google SDK into a provider that exists to avoid
 touching Google at all — see that module's docstring.
 
+**`embed_queries` arrived at stage 3.1**, and `_embed` needed no change to
+support it. The free tier's limit counts requests rather than texts — stage
+2.5 recorded the refusal, *"Embed content requests per minute limit exceeded
+on Free Tier"*, one request after a hundred vectors had been accepted — and
+the batching that makes a document cheap had no equivalent on the query side.
+A question went out alone, so the evaluation harness's thirty to fifty
+questions cost thirty to fifty requests. They now cost one.
+
 See docs/decisions/0002-embedding-provider.md for why Gemini at 768 dimensions.
 """
 
@@ -41,9 +49,18 @@ class GeminiEmbeddingModel:
         """Embed chunks for storage."""
         return self._embed(texts, task_type="RETRIEVAL_DOCUMENT")
 
+    def embed_queries(self, texts: list[str]) -> list[list[float]]:
+        """Embed several questions in one request. Stage 3.1.
+
+        The same batching as `embed_documents` — up to `_MAX_BATCH` texts per
+        round trip — and the same ordering contract: `result[i]` belongs to
+        `texts[i]`, which `_embed` enforces per batch.
+        """
+        return self._embed(texts, task_type="RETRIEVAL_QUERY")
+
     def embed_query(self, text: str) -> list[float]:
         """Embed a question for searching."""
-        return self._embed([text], task_type="RETRIEVAL_QUERY")[0]
+        return self.embed_queries([text])[0]
 
     def _embed(self, texts: list[str], *, task_type: str) -> list[list[float]]:
         """Embed a list of strings, in batches, preserving order.

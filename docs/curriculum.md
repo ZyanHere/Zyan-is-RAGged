@@ -1197,12 +1197,18 @@ you will ever say depends on it.
 prerequisite that will block you** and a set of illustrative numbers that read
 as measurements.
 
-> ### Blocker: 3.1 needs real documents, and the project has none
+> ### Blocker: 3.1 needs real documents and real questions
 >
-> `[measured]` The only documents in this repository are synthetic PDFs
-> generated in-memory by `rag/tests/fixtures/pdf_builder.py` — single column, no
-> tables, no headers, no images. That file's own docstring says it: *"It is
-> emphatically not an evaluation corpus."*
+> **Half resolved, 2026-10-28.** Four real documents are in the repository at
+> `benchmark/documents/` with hashes and measured properties — 563 pages of
+> two-column academic layout, OCR'd scan, technical reference and tax forms.
+> See `docs/experiments/0001`. **The questions are not**, and they are the
+> larger half.
+>
+> `[measured]` Until then the only documents in this repository were synthetic
+> PDFs generated in-memory by `rag/tests/fixtures/pdf_builder.py` — single
+> column, no tables, no headers, no images. That file's own docstring says it:
+> *"It is emphatically not an evaluation corpus."*
 >
 > An eval set built on them would produce flattering numbers that mean nothing,
 > and worse, it would hide exactly the failures Module 4 exists to fix — because
@@ -1214,8 +1220,22 @@ as measurements.
 > two-column, something with a table that matters. This is an afternoon of
 > finding files, and it gates the most important module in the document.
 >
-> **Decision needed:** which corpus. Public standards documents and papers are
-> the easy answer; anything you actually care about reading is the better one.
+> **What remains:**
+>
+> 1. **One more document.** Four are committed and the stage asks for 5–10. The
+>    dense-tables candidate — a BLS news release — answers an automated request
+>    with 403, and a browser fetches it in one click.
+> 2. **30–50 questions**, each with a gold answer and the page or pages that
+>    contain it. This is the long pole, and it is reading work rather than
+>    engineering work.
+>
+> **One discipline that only became visible once the documents were real:**
+> write the questions from the PDFs, not from the extracted text. Questions
+> written against `pypdf` output systematically avoid the pages where
+> extraction already fails — which are precisely the failures this instrument
+> is being built to find. A corpus chosen for its layout problems, measured
+> with a question set that routes around them, would be the synthetic-fixture
+> mistake rebuilt out of real documents.
 
 ### 3.1 — Retrieval metrics · **CORE** · `[required]`
 
@@ -2693,6 +2713,91 @@ itself a deferral record** — each row says what is missing and what substitute
 
 Why this document was revised, and what changed. Kept so the reasoning is
 auditable rather than lost in a diff.
+
+## 2026-10-28 — 3.1 prerequisites: batched query embedding, and four real documents
+
+**73 rag tests** (was 64), 224 backend, six mutations caught. No stage is
+complete; this is 3.1's prerequisite work and nothing here measures retrieval
+quality.
+
+**A ten-file embedding-infrastructure plan was designed, reviewed in part, and
+then abandoned — and the evidence that killed it had been in `0006` the whole
+time.** The plan was a persistent SQLite embedding cache with a five-part
+task-aware key, an opt-in pacing and bounded-retry wrapper, structured
+retry-after metadata on `EmbeddingError`, and four new settings. It was
+justified by "fifty eval questions cost fifty Gemini requests".
+
+Stage 2.5's recorded 429 says what the limit actually counts:
+
+```text
+sample 1:  3482.0 ms (100 vectors)
+sample 2:  FAILED — 429 RESOURCE_EXHAUSTED
+           "Embed content requests per minute limit exceeded on Free Tier"
+```
+
+**Requests, not texts.** A hundred vectors went through in one accepted
+request. `_embed` has always batched a hundred texts per round trip; only
+`embed_documents` had a door to it. Opening that door is one Protocol member
+and two three-line methods, and it takes an eval run from fifty requests to
+**one**.
+
+| | Requests |
+|---|---|
+| ingest the corpus (~2,000 chunks) | ~20, once |
+| one eval run, 50 questions, batched | **1** |
+| one eval run before this change | 50 |
+
+So the cache would have saved **one request per run**, and the pacing wrapper
+would have duplicated stage 2.3's existing 15-attempt capped-jitter retry on
+the only path that makes more than one request — while multiplying with it,
+15 × N, which is the retry storm 2.3's cap exists to prevent. Both are
+deferred with triggers: a measured 429 on a *batched* query request, or a 429
+during ingest that 2.3's policy fails to absorb.
+
+**The transferable lesson is not "I over-engineered".** It is that the
+measurement which refutes a design is often already written down, in an
+experiment note from the previous stage, and the refutation was in the
+*wording* of a quoted error rather than in any number beside it. The premise
+was never checked against the sentence that had already answered it.
+
+**Built:** `embed_queries` on the embedding Protocol and both providers;
+`retrieve_many` in `pipeline.py`, all-or-nothing on input and validating
+before it spends a request. **Not** `embed_batch(texts, task_type=...)`, which
+is smaller and hands the document/query asymmetry back to the caller as a
+parameter — the exact mistake `providers/base.py` says the two-method
+interface exists to prevent, and it would have been offered first to the one
+caller whose job is detecting the invisible degradation it causes.
+
+**Four `.gitignore` rules were ignoring 3.1's primary artifact.**
+`benchmark/documents/`, `questions/`, `gold/` and `results/`, left from the
+pre-pivot product era — against this module's own instruction that the eval set
+*"is version-controlled … treat it with the same care as the source code"*.
+Narrowed to `benchmark/runs/`.
+
+**Four of seven corpus candidates committed** (563 pages, 19 MB) with SHA-256s
+and re-measured properties. Committed as bytes rather than fetched from URLs,
+and the re-measurement sharpened that argument: three of the four returned
+figures identical to September's, proving those URLs had not changed in that
+window and nothing about the next one — while the fifth candidate is rewritten
+monthly by construction. The BLS release returns **403** to an automated
+request; a browser fetches it in one click, and that was not worked around.
+
+**Two things remain before a baseline exists**, and the roadmap's Module 3
+blocker is rewritten to say so: one more document, and 30–50 questions. A
+discipline that only became visible once the documents were real is recorded
+with them — **write the questions from the PDFs, not from the extracted
+text**, because questions written against `pypdf` output systematically avoid
+the pages where extraction already fails, which are exactly the failures the
+instrument is being built to find.
+
+**A blocker found while planning, not yet decided:** the harness cannot read
+the index. `docker-compose.yml` has said so since 1.3 in its own words —
+*"anything on the host — the stage 3.1 evaluation harness, for instance —
+cannot read it directly"*. Embedded Qdrant holds an exclusive lock inside a
+named volume, and the agent's only retrieval route is `POST /query`, which
+calls a chat model. Three ways out, all of which need `retrieve_many`: a
+retrieval-only route on the agent, running the harness inside the container,
+or adding a Qdrant service and setting `QDRANT_URL`.
 
 ## 2026-10-27 — Stage 2.5 complete; a claim from 1.1 finally checked
 

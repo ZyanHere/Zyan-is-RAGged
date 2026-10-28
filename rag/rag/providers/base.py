@@ -24,6 +24,27 @@ the finding, and it produces different vectors accordingly. Embedding both sides
 the same way measurably degrades retrieval, and the mistake is invisible —
 nothing errors, results are just quietly worse. Encoding the distinction in the
 interface makes it impossible to get wrong by accident.
+
+**Why there are now three.** Stage 3.1 added `embed_queries`, for an asymmetry
+in *cost* rather than in meaning. Gemini's free tier counts **requests, not
+texts** — stage 2.5's refusal said so in as many words, *"Embed content
+requests per minute limit exceeded on Free Tier"*, having accepted a hundred
+vectors in the request immediately before it. `_embed` has always batched a
+hundred texts per round trip; only the document side had a door to it. So the
+eval set's thirty to fifty questions cost thirty to fifty requests, against a
+corpus that indexes in about twenty.
+
+**The shape of that addition mattered more than the addition.** The tempting
+version was one method instead of three:
+
+    def embed_batch(self, texts: list[str], *, task_type: str) -> ...
+
+Smaller, more general, and it undoes the paragraph above — it hands the task
+type back to the caller as a parameter, which is precisely the mistake this
+interface exists to make impossible, offered to the one caller whose entire
+job is detecting the invisible degradation it would cause. So the task type
+stays chosen by the method *name*. **There is no neutral way to embed a list of
+text through this seam, and that is deliberate.**
 """
 
 import logging
@@ -53,8 +74,31 @@ class EmbeddingModel(Protocol):
         """Embed chunks for storage. Returns one vector per input, in order."""
         ...
 
+    def embed_queries(self, texts: list[str]) -> list[list[float]]:
+        """Embed several questions for searching. One vector per input, in order.
+
+        Stage 3.1. The batched counterpart of `embed_query`, and it exists for
+        cost rather than for meaning — see the module docstring.
+
+        **Order is the entire contract**, exactly as it is for
+        `embed_documents`: `result[i]` belongs to `texts[i]`. An implementation
+        that deduplicates, reorders, or returns a subset produces a measurement
+        that is wrong about which question means what, and nothing errors.
+
+        There is no `embed_document` singular, and that asymmetry is real
+        rather than an oversight: chunks only ever arrive as a list, so it
+        would have no caller. Questions genuinely arrive both ways — retrieval
+        has one, the evaluation harness has fifty.
+        """
+        ...
+
     def embed_query(self, text: str) -> list[float]:
-        """Embed a question for searching."""
+        """Embed a question for searching.
+
+        Kept rather than derived from `embed_queries`, so the unwrapping does
+        not land in `pipeline.retrieve` as a bare `[0]` on the most-read line
+        in retrieval.
+        """
         ...
 
 

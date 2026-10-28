@@ -41,11 +41,17 @@ yarn-error.log*
 Thumbs.db
 desktop.ini
 
-# ─── Benchmark data (populated separately, not committed) ─────────────────────
-benchmark/documents/
-benchmark/questions/
-benchmark/gold/
-benchmark/results/
+# ─── Benchmark output (stage 3.1) ────────────────────────────────────────────
+# Ad-hoc eval runs only. The documents, the questions, the gold answers and any
+# committed baseline are version-controlled on purpose: Module 3 of
+# docs/curriculum.md is explicit that the eval set is "a primary artifact of
+# this project, not a side experiment ... it is version-controlled".
+#
+# Four rules here previously ignored all of it — benchmark/documents/,
+# questions/, gold/ and results/ — left over from the pre-pivot product era,
+# when the benchmark was an experiment rather than the instrument every later
+# claim depends on.
+benchmark/runs/
 
 # Frontend env (must not be committed)
 frontend/.env

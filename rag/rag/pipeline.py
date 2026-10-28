@@ -162,3 +162,93 @@ def retrieve(question: str, *, top_k: int | None = None) -> list[RetrievedChunk]
         top_k = get_settings().top_k
 
     return search(vector, top_k=top_k)
+
+
+def retrieve_many(
+    questions: list[str], *, top_k: int | None = None
+) -> list[list[RetrievedChunk]]:
+    """Find supporting chunks for several questions, in one embedding request.
+
+    Returns one result list per question, in the order the questions were
+    given. Evidence rather than answers, exactly as `retrieve` does.
+
+    ── Why this exists ───────────────────────────────────────────────────────
+
+    Gemini's free tier counts **requests, not texts**. Stage 2.5 recorded the
+    refusal verbatim — *"Embed content requests per minute limit exceeded on
+    Free Tier"* — one request after a hundred vectors had been accepted in a
+    single call. `embed_query` sends one text per request, so stage 3.1's
+    thirty to fifty eval questions cost thirty to fifty requests: more than
+    the entire corpus costs to index, because chunks batch a hundred at a time
+    and questions did not. This is one request.
+
+    ── All-or-nothing, and before anything is spent ──────────────────────────
+
+    A single unusable question refuses the whole batch rather than being
+    skipped, and the refusal happens before the embedder is touched.
+
+    Skipping is the tempting alternative and it is worse than it looks: it
+    returns a result list shorter than the question list, and a caller
+    computing recall over `zip(questions, results)` would then attribute every
+    metric after the skipped question to the wrong question — silently, with
+    no error and a plausible-looking number at the end. Refusing makes that
+    unreachable from this layer.
+
+    This is only the input half of the guarantee. A question that fails
+    *during* retrieval must stop a baseline being published at all, and that
+    is the harness's contract rather than this function's.
+
+    ── Duplicates are embedded twice ─────────────────────────────────────────
+
+    Deduplicating is the obvious optimisation, it saves nothing at this size,
+    and it is the single most likely way to break the ordering contract above.
+    A duplicate question in a hand-written eval set is a mistake worth seeing,
+    not a cost worth engineering around.
+
+    Args:
+        questions: One or more questions. Surrounding whitespace is stripped.
+        top_k: Chunks per question. Defaults to the configured `top_k`, and
+            applies to every question in the batch.
+
+    Returns:
+        One list of chunks per question, best first, in question order.
+
+    Raises:
+        ValueError: any question is empty or whitespace, naming which.
+        EmbeddingError: the provider failed.
+        VectorStoreError: storage failed.
+    """
+    cleaned = [question.strip() for question in questions]
+
+    # Every question judged before any is embedded, for the same reason
+    # `retrieve` validates before reading settings: a caller's mistake must
+    # not arrive as a provider error, and here it must not arrive having
+    # already spent a request.
+    blank = [index for index, question in enumerate(cleaned) if not question]
+    if blank:
+        raise ValueError(
+            f"Cannot retrieve for an empty question. Questions at index "
+            f"{blank} are empty or whitespace, and the whole batch is refused "
+            f"rather than skipped — a result list shorter than its question "
+            f"list silently misaligns every metric computed from the pair."
+        )
+
+    # After validation, so an empty batch and a batch of empty strings do not
+    # mean the same thing. Before `ensure_collection`, so no questions is no
+    # round trip.
+    if not cleaned:
+        return []
+
+    ensure_collection()
+
+    # The one request this function exists for.
+    vectors = get_embedding_model().embed_queries(cleaned)
+
+    if top_k is None:
+        top_k = get_settings().top_k
+
+    # One search per question. Searching is local to Qdrant and is not what
+    # the rate limit counts, so there is nothing to batch here — and a
+    # comprehension preserves the order the contract depends on by
+    # construction.
+    return [search(vector, top_k=top_k) for vector in vectors]
